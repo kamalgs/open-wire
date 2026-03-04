@@ -1,0 +1,76 @@
+name: Push to main
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  benchmark:
+    defaults:
+      run:
+        working-directory: ./async-nats
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v4 # v4 uses caching of Go out of the box
+        with:
+          go-version: '1.22'
+      - name: Install nats-server
+        run: go install github.com/nats-io/nats-server/v2@main
+
+      - name: Install gunplot
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gnuplot
+
+      - name: Install stable Rust on ubuntu-latest
+        id:   install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache the build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
+      - name: Build the package # for caching
+        run: cargo build --all-targets
+
+      - name: Run benchmarks
+        env:
+          RUST_LOG: trace
+        run: cargo bench nats
+      - name: Archive benchmarks
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks-report
+          path: target/criterion
+
+  check_features:
+    defaults:
+      run:
+        working-directory: ./async-nats
+    name: check feature flags (ubuntu-latest / stable)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+      - name: Install stable Rust on ubuntu-latest
+        id:   install-rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Restore cached build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
+          save-if: false # we only build docs, so we don't have the full build to be cached.
+      - name: Install cargo hack
+        run: cargo install cargo-hack
+      - name: Check lint
+        run: cargo hack check --feature-powerset --at-least-one-of aws-lc-rs,ring --no-dev-deps -p async-nats

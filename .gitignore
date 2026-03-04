@@ -1,0 +1,13 @@
+**/.idea
+target/
+Cargo.lock
+.helix
+.DS_Store
+
+# nixago: ignore-linked-files
+/treefmt.toml
+
+# Local build config
+.cargo/config.toml
+mise.toml
+.mise.toml
