@@ -563,10 +563,25 @@ impl LeafConn {
         ))
     }
 
-    /// Send CONNECT JSON to the hub.
-    pub(crate) async fn send_connect(&mut self, info: &ConnectInfo) -> io::Result<()> {
-        let json = serde_json::to_string(info)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    /// Send a leaf node CONNECT to the hub.
+    ///
+    /// The hub distinguishes leaf nodes from regular clients by the absence
+    /// of a `lang` field — regular clients always include `lang`, leaf nodes
+    /// don't. We send a minimal JSON that the hub recognizes as a leaf.
+    pub(crate) async fn send_leaf_connect(
+        &mut self,
+        name: &str,
+        headers: bool,
+    ) -> io::Result<()> {
+        let json = serde_json::json!({
+            "verbose": false,
+            "pedantic": false,
+            "headers": headers,
+            "no_responders": true,
+            "name": name,
+            "version": "0.1.0",
+            "protocol": 1,
+        });
         let line = format!("CONNECT {json}\r\n");
         self.stream.write_all(line.as_bytes()).await
     }

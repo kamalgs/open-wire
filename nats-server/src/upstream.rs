@@ -15,8 +15,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 use async_nats::header::HeaderMap;
-use async_nats::{ConnectInfo, Protocol};
-
 use crate::protocol::{LeafConn, LeafOp};
 use crate::server::ServerState;
 
@@ -72,20 +70,8 @@ impl Upstream {
             }
         }
 
-        // 2. Send CONNECT + PING
-        let connect_info = ConnectInfo {
-            verbose: false,
-            pedantic: false,
-            lang: "rust".to_string(),
-            version: "0.1.0".to_string(),
-            protocol: Protocol::Dynamic,
-            echo: false,
-            headers: true,
-            no_responders: true,
-            tls_required: false,
-            ..Default::default()
-        };
-        leaf.send_connect(&connect_info).await?;
+        // 2. Send CONNECT (leaf-style, no `lang` field) + PING
+        leaf.send_leaf_connect("rust-leaf", true).await?;
         leaf.send_ping().await?;
         leaf.flush().await?;
 
@@ -108,6 +94,9 @@ impl Upstream {
                 }
                 Some(LeafOp::Ok) => {
                     // Some hubs send +OK after CONNECT
+                }
+                Some(LeafOp::Info(_)) => {
+                    // Hub may re-send INFO after CONNECT
                 }
                 Some(other) => {
                     return Err(
