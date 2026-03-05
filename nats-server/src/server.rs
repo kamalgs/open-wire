@@ -104,23 +104,18 @@ impl LeafServer {
         }
     }
 
-    /// Connect to the upstream hub if configured.
+    /// Connect to the upstream hub if configured, using the leaf node protocol.
     async fn connect_upstream(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ref hub_url) = self.config.hub_url {
-            info!(url = %hub_url, "connecting to upstream hub");
-            match async_nats::ConnectOptions::new()
-                .no_echo()
-                .connect(hub_url)
-                .await
-            {
-                Ok(client) => {
-                    let upstream = Upstream::new(client, Arc::clone(&self.state));
+            info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
+            match Upstream::connect(hub_url, Arc::clone(&self.state)).await {
+                Ok(upstream) => {
                     *self.state.upstream.write().await = Some(upstream);
                     info!("connected to upstream hub");
                 }
                 Err(e) => {
                     error!(error = %e, "failed to connect to upstream hub");
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
         }

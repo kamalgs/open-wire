@@ -2,7 +2,7 @@
 //
 // Usage:
 //   cargo run --example leaf_server -- --port 4222
-//   cargo run --example leaf_server -- --port 4222 --hub nats://localhost:4111
+//   cargo run --example leaf_server -- --port 4222 --hub nats://localhost:7422
 //   cargo run --example leaf_server -- --port 4222 --ws-port 4223
 
 use nats_server::{LeafServer, LeafServerConfig};
