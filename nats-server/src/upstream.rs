@@ -15,6 +15,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, warn};
 
 use async_nats::header::HeaderMap;
+
+use crate::client_conn::ClientMsg;
+use crate::nats_proto;
 use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter};
 use crate::server::ServerState;
 
@@ -23,8 +26,8 @@ pub(crate) enum UpstreamCmd {
     Subscribe(String),
     Unsubscribe(String),
     Publish {
-        subject: String,
-        reply: Option<String>,
+        subject: Bytes,
+        reply: Option<Bytes>,
         headers: Option<HeaderMap>,
         payload: Bytes,
     },
@@ -192,8 +195,8 @@ impl Upstream {
     #[allow(dead_code)]
     pub(crate) async fn publish(
         &self,
-        subject: String,
-        reply: Option<String>,
+        subject: Bytes,
+        reply: Option<Bytes>,
         headers: Option<HeaderMap>,
         payload: Bytes,
     ) -> Result<(), async_nats::Error> {
@@ -278,10 +281,10 @@ async fn run_leaf_writer(
 async fn process_cmd(writer: &mut LeafWriter, cmd: &UpstreamCmd) -> std::io::Result<()> {
     match cmd {
         UpstreamCmd::Subscribe(subject) => {
-            writer.send_leaf_sub(subject).await?;
+            writer.send_leaf_sub(subject.as_bytes()).await?;
         }
         UpstreamCmd::Unsubscribe(subject) => {
-            writer.send_leaf_unsub(subject).await?;
+            writer.send_leaf_unsub(subject.as_bytes()).await?;
         }
         UpstreamCmd::Publish {
             subject,
@@ -314,8 +317,10 @@ fn handle_hub_op(
             headers,
             payload,
         } => {
+            // SAFETY: NATS subjects are always ASCII
+            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let subs = state.subs.read().unwrap();
-            let matches = subs.match_subject(&subject);
+            let matches = subs.match_subject(subject_str);
             if matches.is_empty() {
                 return Ok(());
             }
@@ -325,7 +330,7 @@ fn handle_hub_op(
                 if let Some(handle) = conns.get(&sub.conn_id) {
                     let msg = ClientMsg {
                         subject: subject.clone(),
-                        sid: sub.sid,
+                        sid_bytes: nats_proto::sid_to_bytes(sub.sid),
                         reply: reply.clone(),
                         headers: headers.clone(),
                         payload: payload.clone(),
@@ -366,14 +371,4 @@ fn parse_hub_addr(url: &str) -> Result<String, Box<dyn std::error::Error>> {
         // Default leafnode port
         Ok(format!("{stripped}:7422"))
     }
-}
-
-/// A message to be delivered to a local client connection.
-#[derive(Debug)]
-pub(crate) struct ClientMsg {
-    pub subject: String,
-    pub sid: u64,
-    pub reply: Option<String>,
-    pub headers: Option<HeaderMap>,
-    pub payload: Bytes,
 }

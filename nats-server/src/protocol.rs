@@ -5,13 +5,18 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufWriter, ReadHalf, WriteHalf};
 
 use async_nats::connection::AsyncReadWrite;
-use async_nats::header::{HeaderMap, HeaderName, IntoHeaderValue};
-use async_nats::subject::Subject;
-use async_nats::{ClientOp, ConnectInfo, ServerInfo};
+use async_nats::header::HeaderMap;
+use async_nats::ServerInfo;
+
+use crate::nats_proto::{self, MsgBuilder};
+
+// Re-export parsed op types so the rest of the crate uses nats_proto's types.
+pub(crate) use crate::nats_proto::ClientOp;
+pub(crate) use crate::nats_proto::LeafOp;
 
 /// Server-side connection wrapper.
 /// Uses split read/write halves so the writer is wrapped in a BufWriter.
@@ -21,6 +26,7 @@ pub(crate) struct ServerConn {
     reader: ReadHalf<Box<dyn AsyncReadWrite>>,
     writer: BufWriter<WriteHalf<Box<dyn AsyncReadWrite>>>,
     read_buf: BytesMut,
+    msg_builder: MsgBuilder,
 }
 
 impl ServerConn {
@@ -30,6 +36,7 @@ impl ServerConn {
             reader,
             writer: BufWriter::with_capacity(64 * 1024, writer),
             read_buf: BytesMut::with_capacity(64 * 1024),
+            msg_builder: MsgBuilder::new(),
         }
     }
 
@@ -51,49 +58,42 @@ impl ServerConn {
         headers: Option<&HeaderMap>,
         payload: &[u8],
     ) -> io::Result<()> {
-        self.write_msg(subject, sid, reply, headers, payload).await?;
+        self.write_msg(subject.as_bytes(), sid, reply.map(|r| r.as_bytes()), headers, payload)
+            .await?;
         self.flush().await
     }
 
     /// Write a MSG to the client without flushing.
-    /// Data goes into the BufWriter's 64KB buffer; call `flush()` to send.
+    /// Uses direct byte assembly — no `write!()` formatting.
+    #[allow(dead_code)]
     pub(crate) async fn write_msg(
         &mut self,
-        subject: &str,
+        subject: &[u8],
         sid: u64,
-        reply: Option<&str>,
+        reply: Option<&[u8]>,
         headers: Option<&HeaderMap>,
         payload: &[u8],
     ) -> io::Result<()> {
-        match headers {
-            Some(hdrs) if !hdrs.is_empty() => {
-                let hdr_bytes = hdrs.to_bytes();
-                let hdr_len = hdr_bytes.len();
-                let total_len = hdr_len + payload.len();
-                let line = match reply {
-                    Some(r) => format!("HMSG {subject} {sid} {r} {hdr_len} {total_len}\r\n"),
-                    None => format!("HMSG {subject} {sid} {hdr_len} {total_len}\r\n"),
-                };
-                let mut buf = Vec::with_capacity(line.len() + total_len + 2);
-                buf.extend_from_slice(line.as_bytes());
-                buf.extend_from_slice(&hdr_bytes);
-                buf.extend_from_slice(payload);
-                buf.extend_from_slice(b"\r\n");
-                self.writer.write_all(&buf).await
-            }
-            _ => {
-                let payload_len = payload.len();
-                let line = match reply {
-                    Some(r) => format!("MSG {subject} {sid} {r} {payload_len}\r\n"),
-                    None => format!("MSG {subject} {sid} {payload_len}\r\n"),
-                };
-                let mut buf = Vec::with_capacity(line.len() + payload_len + 2);
-                buf.extend_from_slice(line.as_bytes());
-                buf.extend_from_slice(payload);
-                buf.extend_from_slice(b"\r\n");
-                self.writer.write_all(&buf).await
-            }
-        }
+        let sid_bytes = nats_proto::sid_to_bytes(sid);
+        let data = self
+            .msg_builder
+            .build_msg(subject, &sid_bytes, reply, headers, payload);
+        self.writer.write_all(data).await
+    }
+
+    /// Write a MSG for a ClientMsg (Bytes-based subject/reply) without flushing.
+    pub(crate) async fn write_client_msg(
+        &mut self,
+        msg: &crate::client_conn::ClientMsg,
+    ) -> io::Result<()> {
+        let data = self.msg_builder.build_msg(
+            &msg.subject,
+            &msg.sid_bytes,
+            msg.reply.as_deref(),
+            msg.headers.as_ref(),
+            &msg.payload,
+        );
+        self.writer.write_all(data).await
     }
 
     /// Flush buffered writes to the wire.
@@ -136,176 +136,8 @@ impl ServerConn {
         }
     }
 
-    fn try_parse_client_op(&mut self) -> io::Result<Option<ClientOp>> {
-        let len = match memchr::memmem::find(&self.read_buf, b"\r\n") {
-            Some(len) => len,
-            None => return Ok(None),
-        };
-
-        if self.read_buf.starts_with(b"PING") {
-            self.read_buf.advance(len + 2);
-            return Ok(Some(ClientOp::Ping));
-        }
-
-        if self.read_buf.starts_with(b"PONG") {
-            self.read_buf.advance(len + 2);
-            return Ok(Some(ClientOp::Pong));
-        }
-
-        if self.read_buf.starts_with(b"CONNECT ") {
-            let json_bytes = &self.read_buf[8..len];
-            let info: ConnectInfo = serde_json::from_slice(json_bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            self.read_buf.advance(len + 2);
-            return Ok(Some(ClientOp::Connect(info)));
-        }
-
-        if self.read_buf.starts_with(b"SUB ") {
-            let line = std::str::from_utf8(&self.read_buf[4..len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let mut args = line.split_whitespace();
-            let op = match (args.next(), args.next(), args.next(), args.next()) {
-                (Some(subject), Some(queue), Some(sid_str), None) => {
-                    let sid = sid_str
-                        .parse::<u64>()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                    ClientOp::Subscribe {
-                        sid,
-                        subject: Subject::from(subject),
-                        queue_group: Some(queue.to_string()),
-                    }
-                }
-                (Some(subject), Some(sid_str), None, None) => {
-                    let sid = sid_str
-                        .parse::<u64>()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-                    ClientOp::Subscribe {
-                        sid,
-                        subject: Subject::from(subject),
-                        queue_group: None,
-                    }
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid SUB arguments",
-                    ))
-                }
-            };
-            self.read_buf.advance(len + 2);
-            return Ok(Some(op));
-        }
-
-        if self.read_buf.starts_with(b"UNSUB ") {
-            let line = std::str::from_utf8(&self.read_buf[6..len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let mut args = line.split_whitespace();
-            let (sid_str, max_str) = (args.next(), args.next());
-            let sid = sid_str
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing sid in UNSUB"))?
-                .parse::<u64>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let max = max_str
-                .map(|m| {
-                    m.parse::<u64>()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-                })
-                .transpose()?;
-            self.read_buf.advance(len + 2);
-            return Ok(Some(ClientOp::Unsubscribe { sid, max }));
-        }
-
-        // HPUB subject [reply] hdr_len total_len\r\n[headers+payload]\r\n
-        if self.read_buf.starts_with(b"HPUB ") {
-            let line = std::str::from_utf8(&self.read_buf[5..len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
-
-            let (subject, respond, hdr_len, total_len) = match args.len() {
-                3 => {
-                    let h = parse_usize(&args[1])?;
-                    let t = parse_usize(&args[2])?;
-                    (args[0].clone(), None, h, t)
-                }
-                4 => {
-                    let h = parse_usize(&args[2])?;
-                    let t = parse_usize(&args[3])?;
-                    (args[0].clone(), Some(args[1].clone()), h, t)
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid HPUB arguments",
-                    ))
-                }
-            };
-
-            // Need full message: line\r\n + total_len bytes + \r\n
-            if len + 2 + total_len + 2 > self.read_buf.len() {
-                return Ok(None);
-            }
-
-            self.read_buf.advance(len + 2);
-            let hdr_data = self.read_buf.split_to(hdr_len);
-            let payload = self.read_buf.split_to(total_len - hdr_len).freeze();
-            self.read_buf.advance(2);
-
-            let headers = parse_headers(&hdr_data)?;
-
-            return Ok(Some(ClientOp::Publish {
-                subject: Subject::from(subject.as_str()),
-                payload,
-                respond: respond.map(|r| Subject::from(r.as_str())),
-                headers: Some(headers),
-            }));
-        }
-
-        // PUB subject [reply] size\r\n[payload]\r\n
-        if self.read_buf.starts_with(b"PUB ") {
-            let line = std::str::from_utf8(&self.read_buf[4..len])
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
-
-            let (subject, respond, payload_len) = match args.len() {
-                2 => {
-                    let size = parse_usize(&args[1])?;
-                    (args[0].clone(), None, size)
-                }
-                3 => {
-                    let size = parse_usize(&args[2])?;
-                    (args[0].clone(), Some(args[1].clone()), size)
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid PUB arguments",
-                    ))
-                }
-            };
-
-            if len + 2 + payload_len + 2 > self.read_buf.len() {
-                return Ok(None);
-            }
-
-            self.read_buf.advance(len + 2);
-            let payload = self.read_buf.split_to(payload_len).freeze();
-            self.read_buf.advance(2);
-
-            return Ok(Some(ClientOp::Publish {
-                subject: Subject::from(subject.as_str()),
-                payload,
-                respond: respond.map(|r| Subject::from(r.as_str())),
-                headers: None,
-            }));
-        }
-
-        // Unknown command
-        let unknown = self.read_buf.split_to(len + 2);
-        let line = std::str::from_utf8(&unknown).unwrap_or("<invalid utf8>");
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unknown client operation: '{}'", line.trim()),
-        ))
+    pub(crate) fn try_parse_client_op(&mut self) -> io::Result<Option<ClientOp>> {
+        nats_proto::try_parse_client_op(&mut self.read_buf)
     }
 
     async fn write_flush(&mut self, data: &[u8]) -> io::Result<()> {
@@ -313,74 +145,6 @@ impl ServerConn {
         self.writer.flush().await?;
         Ok(())
     }
-}
-
-fn parse_usize(s: &str) -> io::Result<usize> {
-    s.parse::<usize>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-}
-
-pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
-    use std::str::FromStr;
-
-    let text = std::str::from_utf8(data)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "header isn't valid utf-8"))?;
-
-    let mut lines = text.lines().peekable();
-
-    // Skip version line (NATS/1.0 ...)
-    let _version = lines.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
-    })?;
-
-    let mut headers = HeaderMap::new();
-    while let Some(line) = lines.next() {
-        if line.is_empty() {
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid header line"))?;
-        let name = HeaderName::from_str(name)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let mut value = value.trim_start().to_owned();
-        while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
-            value.push_str(v);
-        }
-        value.truncate(value.trim_end().len());
-        headers.append(name, value.into_header_value());
-    }
-
-    Ok(headers)
-}
-
-/// Operations received from a hub over the leaf node protocol.
-#[derive(Debug)]
-pub(crate) enum LeafOp {
-    Info(Box<ServerInfo>),
-    Ping,
-    Pong,
-    Ok,
-    Err(String),
-    /// LS+ subject [queue]
-    #[allow(dead_code)]
-    LeafSub {
-        subject: String,
-        queue: Option<String>,
-    },
-    /// LS- subject [queue]
-    #[allow(dead_code)]
-    LeafUnsub {
-        subject: String,
-        queue: Option<String>,
-    },
-    /// LMSG – leaf message with optional reply and headers
-    LeafMsg {
-        subject: String,
-        reply: Option<String>,
-        headers: Option<HeaderMap>,
-        payload: bytes::Bytes,
-    },
 }
 
 /// Outgoing leaf node connection to a hub.
@@ -411,6 +175,7 @@ impl LeafConn {
             },
             LeafWriter {
                 writer: BufWriter::with_capacity(64 * 1024, writer),
+                msg_builder: MsgBuilder::new(),
             },
         )
     }
@@ -418,7 +183,7 @@ impl LeafConn {
     /// Read the next leaf operation from the hub.
     pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
         loop {
-            if let Some(op) = try_parse_leaf_op(&mut self.read_buf)? {
+            if let Some(op) = nats_proto::try_parse_leaf_op(&mut self.read_buf)? {
                 return Ok(Some(op));
             }
             let n = self.stream.read_buf(&mut self.read_buf).await?;
@@ -430,278 +195,8 @@ impl LeafConn {
             }
         }
     }
-}
 
-/// Read half of a leaf connection.
-pub(crate) struct LeafReader {
-    reader: ReadHalf<Box<dyn AsyncReadWrite>>,
-    read_buf: BytesMut,
-}
-
-impl LeafReader {
-    /// Read the next leaf operation from the hub.
-    pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
-        loop {
-            if let Some(op) = try_parse_leaf_op(&mut self.read_buf)? {
-                return Ok(Some(op));
-            }
-            let n = self.reader.read_buf(&mut self.read_buf).await?;
-            if n == 0 {
-                if self.read_buf.is_empty() {
-                    return Ok(None);
-                }
-                return Err(io::ErrorKind::ConnectionReset.into());
-            }
-        }
-    }
-}
-
-/// Write half of a leaf connection, wrapped in BufWriter.
-pub(crate) struct LeafWriter {
-    writer: BufWriter<WriteHalf<Box<dyn AsyncReadWrite>>>,
-}
-
-impl LeafWriter {
-    /// Send LS+ subscription interest to the hub.
-    pub(crate) async fn send_leaf_sub(&mut self, subject: &str) -> io::Result<()> {
-        let line = format!("LS+ {subject}\r\n");
-        self.writer.write_all(line.as_bytes()).await
-    }
-
-    /// Send LS- unsubscribe to the hub.
-    pub(crate) async fn send_leaf_unsub(&mut self, subject: &str) -> io::Result<()> {
-        let line = format!("LS- {subject}\r\n");
-        self.writer.write_all(line.as_bytes()).await
-    }
-
-    /// Send PONG to the hub.
-    pub(crate) async fn send_pong(&mut self) -> io::Result<()> {
-        self.writer.write_all(b"PONG\r\n").await
-    }
-
-    /// Send LMSG to the hub.
-    pub(crate) async fn send_leaf_msg(
-        &mut self,
-        subject: &str,
-        reply: Option<&str>,
-        headers: Option<&HeaderMap>,
-        payload: &[u8],
-    ) -> io::Result<()> {
-        match headers {
-            Some(hdrs) if !hdrs.is_empty() => {
-                let hdr_bytes = hdrs.to_bytes();
-                let hdr_len = hdr_bytes.len();
-                let total_len = hdr_len + payload.len();
-                let line = match reply {
-                    Some(r) => format!("LMSG {subject} {r} {hdr_len} {total_len}\r\n"),
-                    None => format!("LMSG {subject} {hdr_len} {total_len}\r\n"),
-                };
-                let mut buf = Vec::with_capacity(line.len() + total_len + 2);
-                buf.extend_from_slice(line.as_bytes());
-                buf.extend_from_slice(&hdr_bytes);
-                buf.extend_from_slice(payload);
-                buf.extend_from_slice(b"\r\n");
-                self.writer.write_all(&buf).await
-            }
-            _ => {
-                let payload_len = payload.len();
-                let line = match reply {
-                    Some(r) => format!("LMSG {subject} {r} {payload_len}\r\n"),
-                    None => format!("LMSG {subject} {payload_len}\r\n"),
-                };
-                let mut buf = Vec::with_capacity(line.len() + payload_len + 2);
-                buf.extend_from_slice(line.as_bytes());
-                buf.extend_from_slice(payload);
-                buf.extend_from_slice(b"\r\n");
-                self.writer.write_all(&buf).await
-            }
-        }
-    }
-
-    /// Flush buffered writes to the wire.
-    pub(crate) async fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush().await
-    }
-}
-
-/// Parse the next leaf op from a buffer (shared by LeafConn and LeafReader).
-fn try_parse_leaf_op(read_buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
-    let len = match memchr::memmem::find(read_buf, b"\r\n") {
-        Some(len) => len,
-        None => return Ok(None),
-    };
-
-    if read_buf.starts_with(b"PING") {
-        read_buf.advance(len + 2);
-        return Ok(Some(LeafOp::Ping));
-    }
-
-    if read_buf.starts_with(b"PONG") {
-        read_buf.advance(len + 2);
-        return Ok(Some(LeafOp::Pong));
-    }
-
-    if read_buf.starts_with(b"+OK") {
-        read_buf.advance(len + 2);
-        return Ok(Some(LeafOp::Ok));
-    }
-
-    if read_buf.starts_with(b"-ERR") {
-        let msg = std::str::from_utf8(&read_buf[5..len])
-            .unwrap_or("<invalid utf8>")
-            .trim_matches('\'')
-            .to_string();
-        read_buf.advance(len + 2);
-        return Ok(Some(LeafOp::Err(msg)));
-    }
-
-    if read_buf.starts_with(b"INFO ") {
-        let json_bytes = &read_buf[5..len];
-        let info: ServerInfo = serde_json::from_slice(json_bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        read_buf.advance(len + 2);
-        return Ok(Some(LeafOp::Info(Box::new(info))));
-    }
-
-    if read_buf.starts_with(b"LS+ ") {
-        let line = std::str::from_utf8(&read_buf[4..len])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let mut args = line.split_whitespace();
-        let subject = args
-            .next()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing subject in LS+")
-            })?
-            .to_string();
-        let queue = args.next().map(String::from);
-        read_buf.advance(len + 2);
-        return Ok(Some(LeafOp::LeafSub { subject, queue }));
-    }
-
-    if read_buf.starts_with(b"LS- ") {
-        let line = std::str::from_utf8(&read_buf[4..len])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let mut args = line.split_whitespace();
-        let subject = args
-            .next()
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing subject in LS-")
-            })?
-            .to_string();
-        let queue = args.next().map(String::from);
-        read_buf.advance(len + 2);
-        return Ok(Some(LeafOp::LeafUnsub { subject, queue }));
-    }
-
-    // LMSG subject [reply] <hdr_size total_size | size>\r\n<payload>\r\n
-    if read_buf.starts_with(b"LMSG ") {
-        let line = std::str::from_utf8(&read_buf[5..len])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        let args: Vec<&str> = line.split_whitespace().collect();
-
-        return match args.len() {
-            // LMSG subject size
-            2 => {
-                let size = parse_usize(args[1])?;
-                if len + 2 + size + 2 > read_buf.len() {
-                    return Ok(None);
-                }
-                let subject = args[0].to_string();
-                read_buf.advance(len + 2);
-                let payload = read_buf.split_to(size).freeze();
-                read_buf.advance(2);
-                Ok(Some(LeafOp::LeafMsg {
-                    subject,
-                    reply: None,
-                    headers: None,
-                    payload,
-                }))
-            }
-            // LMSG subject reply size  OR  LMSG subject hdr_size total_size
-            3 => {
-                let a1 = args[1].parse::<usize>();
-                let a2 = args[2].parse::<usize>();
-                match (a1, a2) {
-                    (Ok(hdr_size), Ok(total_size)) => {
-                        if len + 2 + total_size + 2 > read_buf.len() {
-                            return Ok(None);
-                        }
-                        let subject = args[0].to_string();
-                        read_buf.advance(len + 2);
-                        let hdr_data = read_buf.split_to(hdr_size);
-                        let payload =
-                            read_buf.split_to(total_size - hdr_size).freeze();
-                        read_buf.advance(2);
-                        let headers = parse_headers(&hdr_data)?;
-                        Ok(Some(LeafOp::LeafMsg {
-                            subject,
-                            reply: None,
-                            headers: Some(headers),
-                            payload,
-                        }))
-                    }
-                    _ => {
-                        let size = parse_usize(args[2])?;
-                        if len + 2 + size + 2 > read_buf.len() {
-                            return Ok(None);
-                        }
-                        let subject = args[0].to_string();
-                        let reply = args[1].to_string();
-                        read_buf.advance(len + 2);
-                        let payload = read_buf.split_to(size).freeze();
-                        read_buf.advance(2);
-                        Ok(Some(LeafOp::LeafMsg {
-                            subject,
-                            reply: Some(reply),
-                            headers: None,
-                            payload,
-                        }))
-                    }
-                }
-            }
-            // LMSG subject reply hdr_size total_size
-            4 => {
-                let hdr_size = parse_usize(args[2])?;
-                let total_size = parse_usize(args[3])?;
-                if len + 2 + total_size + 2 > read_buf.len() {
-                    return Ok(None);
-                }
-                let subject = args[0].to_string();
-                let reply = args[1].to_string();
-                read_buf.advance(len + 2);
-                let hdr_data = read_buf.split_to(hdr_size);
-                let payload = read_buf.split_to(total_size - hdr_size).freeze();
-                read_buf.advance(2);
-                let headers = parse_headers(&hdr_data)?;
-                Ok(Some(LeafOp::LeafMsg {
-                    subject,
-                    reply: Some(reply),
-                    headers: Some(headers),
-                    payload,
-                }))
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid LMSG arguments",
-            )),
-        };
-    }
-
-    // Unknown command
-    let unknown = read_buf.split_to(len + 2);
-    let line = std::str::from_utf8(&unknown).unwrap_or("<invalid utf8>");
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("unknown leaf operation: '{}'", line.trim()),
-    ))
-}
-
-impl LeafConn {
     /// Send a leaf node CONNECT to the hub.
-    ///
-    /// The hub distinguishes leaf nodes from regular clients by the absence
-    /// of a `lang` field — regular clients always include `lang`, leaf nodes
-    /// don't. We send a minimal JSON that the hub recognizes as a leaf.
     pub(crate) async fn send_leaf_connect(
         &mut self,
         name: &str,
@@ -737,6 +232,74 @@ impl LeafConn {
     /// Flush buffered writes to the wire.
     pub(crate) async fn flush(&mut self) -> io::Result<()> {
         self.stream.flush().await
+    }
+}
+
+/// Read half of a leaf connection.
+pub(crate) struct LeafReader {
+    reader: ReadHalf<Box<dyn AsyncReadWrite>>,
+    read_buf: BytesMut,
+}
+
+impl LeafReader {
+    /// Read the next leaf operation from the hub.
+    pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
+        loop {
+            if let Some(op) = nats_proto::try_parse_leaf_op(&mut self.read_buf)? {
+                return Ok(Some(op));
+            }
+            let n = self.reader.read_buf(&mut self.read_buf).await?;
+            if n == 0 {
+                if self.read_buf.is_empty() {
+                    return Ok(None);
+                }
+                return Err(io::ErrorKind::ConnectionReset.into());
+            }
+        }
+    }
+}
+
+/// Write half of a leaf connection, wrapped in BufWriter.
+pub(crate) struct LeafWriter {
+    writer: BufWriter<WriteHalf<Box<dyn AsyncReadWrite>>>,
+    msg_builder: MsgBuilder,
+}
+
+impl LeafWriter {
+    /// Send LS+ subscription interest to the hub.
+    pub(crate) async fn send_leaf_sub(&mut self, subject: &[u8]) -> io::Result<()> {
+        let data = self.msg_builder.build_leaf_sub(subject);
+        self.writer.write_all(data).await
+    }
+
+    /// Send LS- unsubscribe to the hub.
+    pub(crate) async fn send_leaf_unsub(&mut self, subject: &[u8]) -> io::Result<()> {
+        let data = self.msg_builder.build_leaf_unsub(subject);
+        self.writer.write_all(data).await
+    }
+
+    /// Send PONG to the hub.
+    pub(crate) async fn send_pong(&mut self) -> io::Result<()> {
+        self.writer.write_all(b"PONG\r\n").await
+    }
+
+    /// Send LMSG to the hub.
+    pub(crate) async fn send_leaf_msg(
+        &mut self,
+        subject: &[u8],
+        reply: Option<&[u8]>,
+        headers: Option<&HeaderMap>,
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let data = self
+            .msg_builder
+            .build_lmsg(subject, reply, headers, payload);
+        self.writer.write_all(data).await
+    }
+
+    /// Flush buffered writes to the wire.
+    pub(crate) async fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush().await
     }
 }
 
@@ -804,7 +367,7 @@ mod tests {
                 queue_group,
             } => {
                 assert_eq!(sid, 1);
-                assert_eq!(subject.as_str(), "test.subject");
+                assert_eq!(&subject[..], b"test.subject");
                 assert!(queue_group.is_none());
             }
             _ => panic!("expected Subscribe"),
@@ -818,8 +381,8 @@ mod tests {
                 queue_group,
             } => {
                 assert_eq!(sid, 2);
-                assert_eq!(subject.as_str(), "test.queue");
-                assert_eq!(queue_group.as_deref(), Some("myqueue"));
+                assert_eq!(&subject[..], b"test.queue");
+                assert_eq!(&queue_group.unwrap()[..], b"myqueue");
             }
             _ => panic!("expected Subscribe"),
         }
@@ -842,8 +405,9 @@ mod tests {
                 payload,
                 respond,
                 headers,
+                ..
             } => {
-                assert_eq!(subject.as_str(), "test.subject");
+                assert_eq!(&subject[..], b"test.subject");
                 assert_eq!(payload.as_ref(), b"hello");
                 assert!(respond.is_none());
                 assert!(headers.is_none());
@@ -870,8 +434,8 @@ mod tests {
                 payload,
                 ..
             } => {
-                assert_eq!(subject.as_str(), "test.subject");
-                assert_eq!(respond.as_ref().unwrap().as_str(), "reply.to");
+                assert_eq!(&subject[..], b"test.subject");
+                assert_eq!(&respond.unwrap()[..], b"reply.to");
                 assert_eq!(payload.as_ref(), b"hello");
             }
             _ => panic!("expected Publish"),
@@ -1020,21 +584,21 @@ mod tests {
 
         match conn.read_leaf_op().await.unwrap().unwrap() {
             LeafOp::LeafSub { subject, queue } => {
-                assert_eq!(subject, "foo.bar");
+                assert_eq!(&subject[..], b"foo.bar");
                 assert!(queue.is_none());
             }
             _ => panic!("expected LeafSub"),
         }
         match conn.read_leaf_op().await.unwrap().unwrap() {
             LeafOp::LeafSub { subject, queue } => {
-                assert_eq!(subject, "baz.*");
-                assert_eq!(queue.as_deref(), Some("myqueue"));
+                assert_eq!(&subject[..], b"baz.*");
+                assert_eq!(&queue.unwrap()[..], b"myqueue");
             }
             _ => panic!("expected LeafSub"),
         }
         match conn.read_leaf_op().await.unwrap().unwrap() {
             LeafOp::LeafUnsub { subject, queue } => {
-                assert_eq!(subject, "foo.bar");
+                assert_eq!(&subject[..], b"foo.bar");
                 assert!(queue.is_none());
             }
             _ => panic!("expected LeafUnsub"),
@@ -1057,7 +621,7 @@ mod tests {
                 headers,
                 payload,
             } => {
-                assert_eq!(subject, "test.subject");
+                assert_eq!(&subject[..], b"test.subject");
                 assert!(reply.is_none());
                 assert!(headers.is_none());
                 assert_eq!(payload.as_ref(), b"hello");
@@ -1082,8 +646,8 @@ mod tests {
                 headers,
                 payload,
             } => {
-                assert_eq!(subject, "test.subject");
-                assert_eq!(reply.as_deref(), Some("reply.to"));
+                assert_eq!(&subject[..], b"test.subject");
+                assert_eq!(&reply.unwrap()[..], b"reply.to");
                 assert!(headers.is_none());
                 assert_eq!(payload.as_ref(), b"hello");
             }
@@ -1113,7 +677,7 @@ mod tests {
                 headers,
                 payload,
             } => {
-                assert_eq!(subject, "test.subject");
+                assert_eq!(&subject[..], b"test.subject");
                 assert!(reply.is_none());
                 let hdrs = headers.unwrap();
                 assert_eq!(
@@ -1148,8 +712,8 @@ mod tests {
                 headers,
                 payload,
             } => {
-                assert_eq!(subject, "test.subject");
-                assert_eq!(reply.as_deref(), Some("reply.inbox"));
+                assert_eq!(&subject[..], b"test.subject");
+                assert_eq!(&reply.unwrap()[..], b"reply.inbox");
                 let hdrs = headers.unwrap();
                 assert_eq!(
                     hdrs.get("Foo").map(|v| v.to_string()),
@@ -1165,8 +729,8 @@ mod tests {
     async fn test_leaf_send_leaf_sub_unsub() {
         let (conn, mut hub) = make_leaf_pair().await;
         let (_reader, mut writer) = conn.split();
-        writer.send_leaf_sub("foo.>").await.unwrap();
-        writer.send_leaf_unsub("foo.>").await.unwrap();
+        writer.send_leaf_sub(b"foo.>").await.unwrap();
+        writer.send_leaf_unsub(b"foo.>").await.unwrap();
         writer.flush().await.unwrap();
 
         let mut buf = BytesMut::with_capacity(4096);
@@ -1179,7 +743,8 @@ mod tests {
     async fn test_leaf_send_lmsg_no_headers() {
         let (conn, mut hub) = make_leaf_pair().await;
         let (_reader, mut writer) = conn.split();
-        writer.send_leaf_msg("test.sub", None, None, b"hello")
+        writer
+            .send_leaf_msg(b"test.sub", None, None, b"hello")
             .await
             .unwrap();
         writer.flush().await.unwrap();
@@ -1194,7 +759,8 @@ mod tests {
     async fn test_leaf_send_lmsg_with_reply() {
         let (conn, mut hub) = make_leaf_pair().await;
         let (_reader, mut writer) = conn.split();
-        writer.send_leaf_msg("test.sub", Some("reply.to"), None, b"hi")
+        writer
+            .send_leaf_msg(b"test.sub", Some(b"reply.to"), None, b"hi")
             .await
             .unwrap();
         writer.flush().await.unwrap();

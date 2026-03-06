@@ -101,6 +101,11 @@ impl Subject {
     /// let s = Subject::from("foo");
     /// let sub = s.into_string();
     /// ```
+    /// Consumes the `Subject` and returns the underlying `Bytes`.
+    pub fn into_bytes(self) -> Bytes {
+        self.bytes
+    }
+
     pub fn into_string(self) -> String {
         // SAFETY: We have guaranteed that the bytes in the `Subject` struct are valid UTF-8.
         unsafe { String::from_utf8_unchecked(self.bytes.into()) }

@@ -7,16 +7,18 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use async_nats::connection::AsyncReadWrite;
-use async_nats::ClientOp;
+use async_nats::header::HeaderMap;
 
-use crate::protocol::ServerConn;
+use crate::nats_proto;
+use crate::protocol::{ClientOp, ServerConn};
 use crate::server::ServerState;
 use crate::sub_list::Subscription;
-use crate::upstream::{ClientMsg, UpstreamCmd};
+use crate::upstream::UpstreamCmd;
 
 /// Handle held by the server for sending messages to a client connection.
 pub(crate) struct ClientHandle {
@@ -85,7 +87,6 @@ impl ClientConnection {
         // Read CONNECT
         match self.conn.read_client_op().await? {
             Some(ClientOp::Connect(_connect_info)) => {
-                // Could validate auth, version, etc. here
                 debug!(id = self.id, "received CONNECT");
             }
             Some(other) => {
@@ -103,9 +104,6 @@ impl ClientConnection {
             }
         }
 
-        // Some clients send PING right after CONNECT
-        // We'll handle that in the message loop
-
         Ok(())
     }
 
@@ -114,7 +112,14 @@ impl ClientConnection {
             tokio::select! {
                 op = self.conn.read_client_op() => {
                     match op? {
-                        Some(op) => self.handle_client_op(op).await?,
+                        Some(op) => {
+                            self.handle_client_op(op).await?;
+                            // Drain all remaining parseable ops from read buffer
+                            // (pure in-memory parsing, no I/O)
+                            while let Some(op) = self.conn.try_parse_client_op()? {
+                                self.handle_client_op(op).await?;
+                            }
+                        }
                         None => return Ok(()), // clean disconnect
                     }
                 }
@@ -122,22 +127,10 @@ impl ClientConnection {
                     match msg {
                         Some(msg) => {
                             // Write first message without flushing
-                            self.conn.write_msg(
-                                &msg.subject,
-                                msg.sid,
-                                msg.reply.as_deref(),
-                                msg.headers.as_ref(),
-                                &msg.payload,
-                            ).await?;
+                            self.conn.write_client_msg(&msg).await?;
                             // Drain any additional queued messages (batch write)
                             while let Ok(msg) = self.msg_rx.try_recv() {
-                                self.conn.write_msg(
-                                    &msg.subject,
-                                    msg.sid,
-                                    msg.reply.as_deref(),
-                                    msg.headers.as_ref(),
-                                    &msg.payload,
-                                ).await?;
+                                self.conn.write_client_msg(&msg).await?;
                             }
                             // Single flush for the whole batch
                             self.conn.flush().await?;
@@ -162,14 +155,16 @@ impl ClientConnection {
                 subject,
                 queue_group,
             } => {
+                // SAFETY: NATS subjects are always valid UTF-8 (ASCII subset)
+                let subject_str = bytes_to_str(&subject);
+                let queue_str = queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
+
                 let sub = Subscription {
                     conn_id: self.id,
                     sid,
-                    subject: subject.to_string(),
-                    queue: queue_group,
+                    subject: subject_str.to_string(),
+                    queue: queue_str,
                 };
-
-                let subject_str = subject.to_string();
 
                 {
                     let mut subs = self.state.subs.write().unwrap();
@@ -180,7 +175,7 @@ impl ClientConnection {
                 {
                     let mut upstream = self.state.upstream.write().await;
                     if let Some(ref mut up) = *upstream {
-                        if let Err(e) = up.add_interest(subject_str.clone()).await {
+                        if let Err(e) = up.add_interest(subject_str.to_string()).await {
                             warn!(error = %e, "failed to add upstream interest");
                         }
                     }
@@ -207,22 +202,20 @@ impl ClientConnection {
                 payload,
                 respond,
                 headers,
+                ..
             } => {
-                let subject_str = subject.to_string();
-                // Compute reply string once, share across local + upstream
-                let reply_str = respond.map(|r| r.to_string());
-
                 // Route to local subscribers
                 {
+                    let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
-                    let matches = subs.match_subject(&subject_str);
+                    let matches = subs.match_subject(subject_str);
                     let conns = self.state.conns.read().unwrap();
                     for sub in &matches {
                         if let Some(handle) = conns.get(&sub.conn_id) {
                             let msg = ClientMsg {
-                                subject: subject_str.clone(),
-                                sid: sub.sid,
-                                reply: reply_str.clone(),
+                                subject: subject.clone(),
+                                sid_bytes: nats_proto::sid_to_bytes(sub.sid),
+                                reply: respond.clone(),
                                 headers: headers.clone(),
                                 payload: payload.clone(),
                             };
@@ -237,8 +230,8 @@ impl ClientConnection {
                     let tx = self.state.upstream_tx.read().unwrap().clone();
                     if let Some(tx) = tx {
                         if let Err(e) = tx.send(UpstreamCmd::Publish {
-                            subject: subject_str,
-                            reply: reply_str,
+                            subject,
+                            reply: respond,
                             headers,
                             payload,
                         }) {
@@ -253,6 +246,14 @@ impl ClientConnection {
         }
         Ok(())
     }
+}
+
+/// Convert `Bytes` to `&str` without UTF-8 validation.
+/// NATS subjects are restricted to ASCII printable characters.
+#[inline]
+fn bytes_to_str(b: &Bytes) -> &str {
+    // SAFETY: NATS protocol subjects/reply-to are always ASCII
+    unsafe { std::str::from_utf8_unchecked(b) }
 }
 
 async fn cleanup_conn(id: u64, state: &ServerState) {
@@ -279,4 +280,15 @@ async fn cleanup_conn(id: u64, state: &ServerState) {
     }
 
     info!(id, "client cleaned up");
+}
+
+/// A message to be delivered to a local client connection.
+/// Uses pre-formatted `sid_bytes` to avoid integer formatting on every write.
+#[derive(Debug)]
+pub(crate) struct ClientMsg {
+    pub subject: Bytes,
+    pub sid_bytes: Bytes,
+    pub reply: Option<Bytes>,
+    pub headers: Option<HeaderMap>,
+    pub payload: Bytes,
 }

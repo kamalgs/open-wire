@@ -5,6 +5,43 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-06 — Zero-copy parser & message builder (nats_proto module)
+
+**Optimization applied:**
+9. New `nats_proto` module: zero-copy protocol parser and message builder
+   - First-byte verb dispatch (match `buf[0]`) instead of sequential `starts_with`
+   - `memchr(b'\n')` single-byte search replacing `memmem::find(b"\r\n")` two-byte search
+   - Hand-rolled `parse_size`/`parse_u64` on raw `&[u8]` — no `from_utf8` + `str::parse`
+   - Stack-allocated `split_args<const N>` on raw bytes — no Vec allocation
+   - `MsgBuilder` with `extend_from_slice` — eliminates `write!()` / `core::fmt` formatting
+   - Pre-formatted `sid_to_bytes` — convert SID to ASCII once, reuse per MSG
+   - `Bytes` (refcounted) for parsed ops instead of `Subject`/`String` allocation
+
+**Profiling hotspot eliminations (pub-only):**
+- `memchr FinderBuilder` 10.4% → 0%
+- `Iterator::try_fold` 10.5% → 0%
+- `from_utf8` 4.3% → 0%
+- `core::fmt` / `write_str` ~4% → 0%
+- Net improvement: +16% pub-only, +8% local pub/sub
+
+| Scenario | Direct Hub | Go Leaf | Rust Leaf | Rust/Go % |
+|---|---|---|---|---|
+| Pub only | ~2.2M | ~1,962K | ~1,345K | **69%** |
+| Local pub/sub (sub) | ~980K | ~778K | ~612K | **79%** |
+| Fan-out x5 (per sub) | ~250K | ~192K | ~157K | **82%** |
+| Leaf → Hub (pub) | — | ~368K | ~779K | **212%** |
+| Hub → Leaf (sub) | — | ~403K | ~483K | **120%** |
+
+**Takeaways:**
+- Pub-only **69% of Go** (up from 37%) — nearly doubled Rust throughput
+- Local pub/sub **79% of Go** (up from 66%)
+- Fan-out x5 roughly same (82% vs 84%) — bottleneck is Bytes clone/drop churn, not parsing
+- Leaf→Hub **2.1x faster than Go** — Rust's strongest scenario
+- Hub→Leaf **20% faster than Go**
+- Remaining local bottlenecks: Bytes refcount churn (6.4%), Tokio mpsc overhead (5.3%), subscription matching (2.7%)
+
+---
+
 ## 2026-03-06 — Full benchmark (500K msgs × 128B, 3 runs) — Commit ee71779
 
 **All optimizations applied:**

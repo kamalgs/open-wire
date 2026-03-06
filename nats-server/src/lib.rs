@@ -17,6 +17,7 @@
 //! and optionally forwards traffic to an upstream NATS hub server.
 
 pub(crate) mod client_conn;
+pub mod nats_proto;
 pub(crate) mod protocol;
 pub mod server;
 pub mod sub_list;
