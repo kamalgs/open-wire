@@ -1,11 +1,41 @@
 # Benchmark Results Log
 
-All benchmarks: 200,000 msgs × 128B payload, best of 2-3 runs.
+All benchmarks: 128B payload, best of 3 runs unless noted.
 Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = millions).
 
 ---
 
-## 2026-03-06 — Split upstream reader/writer
+## 2026-03-06 — Full benchmark (500K msgs × 128B, 3 runs) — Commit ee71779
+
+**All optimizations applied:**
+1. Batch client writes (try_recv drain + single flush)
+2. BufWriter (64KB) on ServerConn writer
+3. std::sync::RwLock for subs/conns (replacing tokio::sync::RwLock)
+4. Lock-free upstream forwarding (shared mpsc sender)
+5. Allocation-free subject_matches (iterator-based)
+6. Unbounded client msg channels (prevent message loss)
+7. Split LeafConn into independent reader/writer tasks (fixes slow consumer)
+8. BufWriter (64KB) on LeafWriter (upstream write batching)
+
+| Scenario | Direct Hub | Go Leaf | Rust Leaf | Rust/Go % |
+|---|---|---|---|---|
+| Pub only | 2.23M | 2.13M | 792K | 37% |
+| Local pub/sub (sub) | 977K | 920K | 607K | 66% |
+| Fan-out x5 (per sub) | 253K | 245K | 207K | **84%** |
+| Leaf → Hub (sub on hub) | — | 599K | 647K | **108%** |
+| Hub → Leaf (sub) | — | 571K | 644K | **113%** |
+
+**Takeaways:**
+- **Leaf↔Hub: Rust beats Go** consistently (108-113% of Go native leaf)
+- **Fan-out x5 at 84% of Go** (up from 16% at baseline)
+- **Local pub/sub at 66% of Go** (up from 10% at baseline)
+- **Pub-only at 37% of Go** — bottleneck is client-facing parser/accept path, not upstream
+- No more slow consumer disconnects in any scenario
+- Cross-server forwarding is now Rust's strongest scenario
+
+---
+
+## 2026-03-06 — Split upstream reader/writer (200K msgs, 2 runs)
 
 **Optimization applied:**
 7. Split LeafConn into independent reader/writer tasks (fixes slow consumer)
