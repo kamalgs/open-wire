@@ -176,18 +176,8 @@ impl ServerConn {
         self.writer.write_all(data).await
     }
 
-    /// Write a MSG for a ClientMsg (Bytes-based subject/reply) without flushing.
-    pub(crate) async fn write_client_msg(
-        &mut self,
-        msg: &crate::sub_list::ClientMsg,
-    ) -> io::Result<()> {
-        let data = self.msg_builder.build_msg(
-            &msg.subject,
-            &msg.sid_bytes,
-            msg.reply.as_deref(),
-            msg.headers.as_ref(),
-            &msg.payload,
-        );
+    /// Write pre-formatted raw bytes to the client (no flush).
+    pub(crate) async fn write_raw(&mut self, data: &[u8]) -> io::Result<()> {
         self.writer.write_all(data).await
     }
 

@@ -16,7 +16,7 @@ use async_nats::connection::AsyncReadWrite;
 use crate::nats_proto;
 use crate::protocol::{ClientOp, ServerConn};
 use crate::server::ServerState;
-use crate::sub_list::{ClientMsg, Subscription};
+use crate::sub_list::{DirectWriter, Subscription, WriterHandle};
 use crate::upstream::UpstreamCmd;
 
 /// Per-client connection handler.
@@ -24,9 +24,10 @@ pub(crate) struct ClientConnection {
     id: u64,
     conn: ServerConn,
     state: Arc<ServerState>,
-    /// Sender cloned into each Subscription for direct message delivery.
-    msg_tx: mpsc::UnboundedSender<ClientMsg>,
-    msg_rx: mpsc::UnboundedReceiver<ClientMsg>,
+    /// DirectWriter cloned into each Subscription for zero-channel message delivery.
+    direct_writer: DirectWriter,
+    /// Handle to drain the shared write buffer and get notified.
+    writer_handle: WriterHandle,
     /// Cached upstream sender — populated once after handshake to avoid
     /// RwLock read + Arc clone on every publish.
     upstream_tx: Option<mpsc::UnboundedSender<UpstreamCmd>>,
@@ -38,14 +39,14 @@ impl ClientConnection {
         stream: Box<dyn AsyncReadWrite>,
         state: Arc<ServerState>,
     ) -> Self {
-        let (msg_tx, msg_rx) = mpsc::unbounded_channel();
+        let (direct_writer, writer_handle) = DirectWriter::new();
         let conn = ServerConn::new(stream, state.buf_config);
         Self {
             id,
             conn,
             state,
-            msg_tx,
-            msg_rx,
+            direct_writer,
+            writer_handle,
             upstream_tx: None,
         }
     }
@@ -119,6 +120,18 @@ impl ClientConnection {
 
     async fn message_loop(&mut self) -> std::io::Result<()> {
         loop {
+            // Always check for pending data before blocking on select!.
+            // This prevents the race where notify() fires while we're still
+            // in the drain loop — the permit is consumed but data remains.
+            if let Some(data) = self.writer_handle.drain() {
+                self.conn.write_raw(&data).await?;
+                while let Some(more) = self.writer_handle.drain() {
+                    self.conn.write_raw(&more).await?;
+                }
+                self.conn.flush().await?;
+                continue;
+            }
+
             let skip = self.can_skip_publish();
             tokio::select! {
                 op = self.conn.read_client_op_inner(skip) => {
@@ -142,20 +155,8 @@ impl ClientConnection {
                         None => return Ok(()), // clean disconnect
                     }
                 }
-                msg = self.msg_rx.recv() => {
-                    match msg {
-                        Some(msg) => {
-                            // Write first message without flushing
-                            self.conn.write_client_msg(&msg).await?;
-                            // Drain any additional queued messages (batch write)
-                            while let Ok(msg) = self.msg_rx.try_recv() {
-                                self.conn.write_client_msg(&msg).await?;
-                            }
-                            // Single flush for the whole batch
-                            self.conn.flush().await?;
-                        }
-                        None => return Ok(()), // server shutting down
-                    }
+                _ = self.writer_handle.notified() => {
+                    // Data will be drained at the top of the next iteration
                 }
             }
         }
@@ -184,7 +185,7 @@ impl ClientConnection {
                     sid_bytes: nats_proto::sid_to_bytes(sid),
                     subject: subject_str.to_string(),
                     queue: queue_str,
-                    msg_tx: self.msg_tx.clone(),
+                    writer: self.direct_writer.clone(),
                 };
 
                 {
@@ -232,20 +233,19 @@ impl ClientConnection {
                 headers,
                 ..
             } => {
-                // Route to local subscribers — direct send, no conns lookup
+                // Route to local subscribers — direct write to shared buffers
                 {
                     let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
                     subs.for_each_match(subject_str, |sub| {
-                        let msg = ClientMsg {
-                            subject: subject.clone(),
-                            sid_bytes: sub.sid_bytes.clone(),
-                            reply: respond.clone(),
-                            headers: headers.clone(),
-                            payload: payload.clone(),
-                        };
-                        // Non-blocking send; drop if the client is slow
-                        let _ = sub.msg_tx.send(msg);
+                        sub.writer.write_msg(
+                            &subject,
+                            &sub.sid_bytes,
+                            respond.as_deref(),
+                            headers.as_ref(),
+                            &payload,
+                        );
+                        sub.writer.notify();
                     });
                 }
 
@@ -279,7 +279,6 @@ fn bytes_to_str(b: &Bytes) -> &str {
 
 async fn cleanup_conn(id: u64, state: &ServerState) {
     // Remove all subscriptions for this connection.
-    // This also drops the msg_tx senders stored in each Subscription.
     let removed = {
         let mut subs = state.subs.write().unwrap();
         let r = subs.remove_conn(id);

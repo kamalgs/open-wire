@@ -16,7 +16,7 @@ use tracing::{debug, error, warn};
 
 use async_nats::header::HeaderMap;
 
-use crate::sub_list::ClientMsg;
+use crate::sub_list::DirectWriter;
 use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter};
 use crate::server::ServerState;
 
@@ -230,10 +230,11 @@ async fn run_leaf_reader(
     cmd_tx: mpsc::UnboundedSender<UpstreamCmd>,
     state: Arc<ServerState>,
 ) {
+    let mut dirty_writers: Vec<DirectWriter> = Vec::new();
     loop {
         match reader.read_leaf_op().await {
             Ok(Some(op)) => {
-                if let Err(e) = handle_hub_op(op, &cmd_tx, &state) {
+                if let Err(e) = handle_hub_op(op, &cmd_tx, &state, &mut dirty_writers) {
                     error!(error = %e, "error handling hub op");
                     break;
                 }
@@ -246,10 +247,14 @@ async fn run_leaf_reader(
                         return;
                     }
                 } {
-                    if let Err(e) = handle_hub_op(op, &cmd_tx, &state) {
+                    if let Err(e) = handle_hub_op(op, &cmd_tx, &state, &mut dirty_writers) {
                         error!(error = %e, "error handling hub op");
                         return;
                     }
+                }
+                // Notify all dirty writers once after draining the batch
+                for w in dirty_writers.drain(..) {
+                    w.notify();
                 }
             }
             Ok(None) => {
@@ -318,10 +323,12 @@ async fn process_cmd(writer: &mut LeafWriter, cmd: &UpstreamCmd) -> std::io::Res
 
 /// Handle an operation received from the hub (reader side).
 /// PING responses are sent via the command channel to the writer task.
+/// Dirty writers (that had data written) are collected for batch notification.
 fn handle_hub_op(
     op: LeafOp,
     cmd_tx: &mpsc::UnboundedSender<UpstreamCmd>,
     state: &ServerState,
+    dirty_writers: &mut Vec<DirectWriter>,
 ) -> std::io::Result<()> {
     match op {
         LeafOp::LeafMsg {
@@ -334,14 +341,14 @@ fn handle_hub_op(
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let subs = state.subs.read().unwrap();
             subs.for_each_match(subject_str, |sub| {
-                let msg = ClientMsg {
-                    subject: subject.clone(),
-                    sid_bytes: sub.sid_bytes.clone(),
-                    reply: reply.clone(),
-                    headers: headers.clone(),
-                    payload: payload.clone(),
-                };
-                let _ = sub.msg_tx.send(msg);
+                sub.writer.write_msg(
+                    &subject,
+                    &sub.sid_bytes,
+                    reply.as_deref(),
+                    headers.as_ref(),
+                    &payload,
+                );
+                dirty_writers.push(sub.writer.clone());
             });
         }
         LeafOp::Ping => {

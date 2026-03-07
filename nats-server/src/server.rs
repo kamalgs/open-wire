@@ -300,8 +300,7 @@ impl LeafServer {
             }
         }
 
-        // Cleanup: clear all subscriptions — drops msg_tx senders,
-        // signaling client tasks to exit.
+        // Cleanup: clear all subscriptions.
         {
             let mut subs = self.state.subs.write().unwrap();
             *subs = SubList::new();

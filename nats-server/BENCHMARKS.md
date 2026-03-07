@@ -5,6 +5,43 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-07 — DirectWriter: bypass mpsc channel for message delivery
+
+**Optimization applied:**
+Replace the per-client `mpsc::UnboundedSender<ClientMsg>` with `DirectWriter` — a shared
+`Mutex<BytesMut>` + `tokio::sync::Notify` that formats MSG/HMSG wire bytes synchronously
+into the client's write buffer. The upstream reader (or local publisher) calls
+`sub.writer.write_msg()` + `sub.writer.notify()` instead of constructing a `ClientMsg`
+struct and sending it through a channel.
+
+**What this eliminates per message:**
+- `mpsc::send()`: atomic linked-list push + AtomicWaker wake (epoll syscall)
+- `ClientMsg` struct allocation (5 fields, 3 Bytes clones)
+- Task hop: sender → channel → receiver → format MSG → write TCP
+- Now: format MSG bytes directly → append to shared buffer → one notify per batch
+
+**Bug found and fixed:** `Notify::notify_one()` stores at most one permit. A fast producer
+calling `notify()` many times before the consumer wakes loses all but one notification.
+Fixed with drain-before-wait pattern: always check the buffer at the top of the message
+loop before blocking on `select!`.
+
+| Scenario | Go Leaf | Rust Leaf | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~1,749K | ~1,293K | **74%** | 77% |
+| Local pub/sub (sub) | ~630K | ~750K | **119%** | 115% |
+| Fan-out x5 (per sub) | ~175K | ~330K | **189%** | 152% |
+| Leaf → Hub (sub on hub) | ~472K | ~675K | **143%** | 119% |
+| Hub → Leaf (sub) | ~462K | ~642K | **139%** | 50% |
+
+**Takeaways:**
+- **Hub→Leaf: 50% → 139% of Go** — the mpsc channel was the bottleneck all along
+- **Fan-out x5: 152% → 189%** — DirectWriter avoids per-subscriber channel overhead
+- **Leaf→Hub: 119% → 143%** — local routing to matching subs is now channel-free
+- All scenarios except pub-only now significantly beat Go
+- Pub-only (74%) is unaffected since it has no subscribers to deliver to
+
+---
+
 ## 2026-03-07 — Zero-copy LMSG parsing + buffer drain in leaf reader
 
 **Optimizations applied:**

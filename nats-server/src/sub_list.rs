@@ -6,21 +6,90 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
-use tokio::sync::mpsc;
+use bytes::{Bytes, BytesMut};
+use tokio::sync::Notify;
 
 use async_nats::header::HeaderMap;
 
-/// A message to be delivered to a local client connection.
-/// Uses pre-formatted `sid_bytes` to avoid integer formatting on every write.
-#[derive(Debug)]
-pub(crate) struct ClientMsg {
-    pub subject: Bytes,
-    pub sid_bytes: Bytes,
-    pub reply: Option<Bytes>,
-    pub headers: Option<HeaderMap>,
-    pub payload: Bytes,
+use crate::nats_proto::MsgBuilder;
+
+/// A shared write buffer + notify pair for zero-channel message delivery.
+///
+/// Instead of sending `ClientMsg` structs through an mpsc channel (which costs
+/// atomic ops + linked-list push + task wake per message), the upstream reader
+/// formats MSG/HMSG wire bytes directly into this shared buffer. The client
+/// writer task is notified once per batch to flush the buffer to TCP.
+#[derive(Clone)]
+pub(crate) struct DirectWriter {
+    buf: Arc<Mutex<BytesMut>>,
+    notify: Arc<Notify>,
+    /// Pre-built MsgBuilder for formatting — kept per-writer to avoid allocation.
+    msg_builder: Arc<Mutex<MsgBuilder>>,
+}
+
+impl DirectWriter {
+    pub(crate) fn new() -> (Self, WriterHandle) {
+        let buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let notify = Arc::new(Notify::new());
+        let writer = Self {
+            buf: Arc::clone(&buf),
+            notify: Arc::clone(&notify),
+            msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
+        };
+        let handle = WriterHandle { buf, notify };
+        (writer, handle)
+    }
+
+    /// Format and append a MSG/HMSG to the shared buffer. Fully synchronous.
+    pub(crate) fn write_msg(
+        &self,
+        subject: &[u8],
+        sid_bytes: &[u8],
+        reply: Option<&[u8]>,
+        headers: Option<&HeaderMap>,
+        payload: &[u8],
+    ) {
+        let mut builder = self.msg_builder.lock().unwrap();
+        let data = builder.build_msg(subject, sid_bytes, reply, headers, payload);
+        let mut buf = self.buf.lock().unwrap();
+        buf.extend_from_slice(data);
+    }
+
+    /// Notify the client writer task that there is data to flush.
+    pub(crate) fn notify(&self) {
+        self.notify.notify_one();
+    }
+}
+
+impl std::fmt::Debug for DirectWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirectWriter").finish()
+    }
+}
+
+/// Handle held by the client writer task to drain the shared buffer.
+pub(crate) struct WriterHandle {
+    buf: Arc<Mutex<BytesMut>>,
+    notify: Arc<Notify>,
+}
+
+impl WriterHandle {
+    /// Wait until notified that data is available.
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    /// Drain all buffered data. Returns `None` if buffer was empty.
+    pub(crate) fn drain(&self) -> Option<BytesMut> {
+        let mut buf = self.buf.lock().unwrap();
+        if buf.is_empty() {
+            None
+        } else {
+            Some(buf.split())
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -33,9 +102,9 @@ pub struct Subscription {
     pub sid_bytes: Bytes,
     pub subject: String,
     pub queue: Option<String>,
-    /// Direct sender to the client's message channel.
-    /// Avoids conns HashMap lookup + lock on every publish.
-    pub(crate) msg_tx: mpsc::UnboundedSender<ClientMsg>,
+    /// Direct writer to the client's shared write buffer.
+    /// Formats MSG bytes synchronously, bypassing mpsc channel overhead.
+    pub(crate) writer: DirectWriter,
 }
 
 /// Returns true if the subject pattern contains wildcard characters (`*` or `>`).
@@ -230,16 +299,16 @@ fn subject_matches_bytes(pattern: &[u8], subject: &[u8]) -> bool {
 mod tests {
     use super::*;
 
-    /// Create a test subscription with a dummy msg_tx sender.
+    /// Create a test subscription with a dummy DirectWriter.
     fn test_sub(conn_id: u64, sid: u64, subject: &str) -> Subscription {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (writer, _handle) = DirectWriter::new();
         Subscription {
             conn_id,
             sid,
             sid_bytes: Bytes::from(sid.to_string().into_bytes()),
             subject: subject.to_string(),
             queue: None,
-            msg_tx: tx,
+            writer,
         }
     }
 
@@ -360,5 +429,213 @@ mod tests {
         assert!(!sl.is_empty());
         let empty = SubList::new();
         assert!(empty.is_empty());
+    }
+
+    // --- DirectWriter tests ---
+
+    #[test]
+    fn test_direct_writer_formats_msg() {
+        let (writer, handle) = DirectWriter::new();
+
+        writer.write_msg(b"test.sub", b"1", None, None, b"hello");
+
+        let data = handle.drain().expect("should have data");
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG test.sub 1 5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_direct_writer_formats_msg_with_reply() {
+        let (writer, handle) = DirectWriter::new();
+
+        writer.write_msg(b"test.sub", b"42", Some(b"reply.to"), None, b"hi");
+
+        let data = handle.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG test.sub 42 reply.to 2\r\nhi\r\n");
+    }
+
+    #[test]
+    fn test_direct_writer_formats_hmsg_with_headers() {
+        use async_nats::header::{HeaderName, IntoHeaderValue};
+        let (writer, handle) = DirectWriter::new();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("X-Key"),
+            "val".into_header_value(),
+        );
+
+        writer.write_msg(b"test.sub", b"1", None, Some(&headers), b"data");
+
+        let data = handle.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert!(s.starts_with("HMSG test.sub 1 "));
+        assert!(s.contains("X-Key: val"));
+        assert!(s.ends_with("data\r\n"));
+    }
+
+    #[test]
+    fn test_direct_writer_batches_multiple_writes() {
+        let (writer, handle) = DirectWriter::new();
+
+        writer.write_msg(b"a", b"1", None, None, b"one");
+        writer.write_msg(b"b", b"2", None, None, b"two");
+        writer.write_msg(b"c", b"3", None, None, b"three");
+
+        let data = handle.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(
+            s,
+            "MSG a 1 3\r\none\r\nMSG b 2 3\r\ntwo\r\nMSG c 3 5\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn test_direct_writer_drain_empty() {
+        let (_writer, handle) = DirectWriter::new();
+        assert!(handle.drain().is_none());
+    }
+
+    #[test]
+    fn test_direct_writer_drain_resets_buffer() {
+        let (writer, handle) = DirectWriter::new();
+
+        writer.write_msg(b"a", b"1", None, None, b"x");
+        let _ = handle.drain().unwrap();
+
+        // Second drain should be empty
+        assert!(handle.drain().is_none());
+
+        // Write again — should work
+        writer.write_msg(b"b", b"2", None, None, b"y");
+        let data = handle.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG b 2 1\r\ny\r\n");
+    }
+
+    #[test]
+    fn test_direct_writer_clone_shares_buffer() {
+        let (writer1, handle) = DirectWriter::new();
+        let writer2 = writer1.clone();
+
+        writer1.write_msg(b"a", b"1", None, None, b"x");
+        writer2.write_msg(b"b", b"2", None, None, b"y");
+
+        let data = handle.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        // Both messages should be in the same buffer
+        assert!(s.contains("MSG a 1 1\r\nx\r\n"));
+        assert!(s.contains("MSG b 2 1\r\ny\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_direct_writer_notify_wakes_handle() {
+        let (writer, handle) = DirectWriter::new();
+
+        // Spawn a task that writes and notifies after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            writer.write_msg(b"test", b"1", None, None, b"hello");
+            writer.notify();
+        });
+
+        // This should wake up when notified
+        handle.notified().await;
+        let data = handle.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG test 1 5\r\nhello\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_direct_writer_notify_stores_permit() {
+        let (writer, handle) = DirectWriter::new();
+
+        // Notify BEFORE waiting — the permit should be stored
+        writer.write_msg(b"test", b"1", None, None, b"early");
+        writer.notify();
+
+        // Small delay to ensure we're calling notified() after notify()
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Should return immediately because permit was stored
+        handle.notified().await;
+        let data = handle.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "MSG test 1 5\r\nearly\r\n");
+    }
+
+    /// Simulate the producer/consumer pattern used in the server:
+    /// a fast producer writes many messages, consumer must receive all of them.
+    /// Uses the correct drain-before-wait pattern that avoids the lost-notify race.
+    #[tokio::test]
+    async fn test_direct_writer_fast_producer_slow_consumer() {
+        let (writer, handle) = DirectWriter::new();
+        let total_msgs = 10_000;
+
+        // Producer: write all messages rapidly (all at once, simulating burst)
+        let producer = tokio::spawn(async move {
+            for i in 0..total_msgs {
+                let payload = format!("msg{i}");
+                writer.write_msg(b"test", b"1", None, None, payload.as_bytes());
+                writer.notify();
+            }
+        });
+
+        // Consumer: drain-before-wait pattern (matches client_conn message_loop)
+        let mut total_msgs_seen = 0usize;
+        loop {
+            // Always check buffer first before blocking
+            while let Some(data) = handle.drain() {
+                let s = std::str::from_utf8(&data).unwrap();
+                total_msgs_seen += s.matches("MSG test 1").count();
+            }
+            if total_msgs_seen >= total_msgs {
+                break;
+            }
+            handle.notified().await;
+        }
+
+        producer.await.unwrap();
+        assert_eq!(total_msgs_seen, total_msgs);
+    }
+
+    /// Test the race where producer finishes before consumer starts draining.
+    /// This catches the lost-notify bug: all notify() calls collapse into one
+    /// permit, consumer must drain without relying on future notifications.
+    #[tokio::test]
+    async fn test_direct_writer_producer_finishes_before_consumer() {
+        let (writer, handle) = DirectWriter::new();
+        let total_msgs = 1_000;
+
+        // Producer writes everything synchronously (no yield points)
+        for i in 0..total_msgs {
+            let payload = format!("m{i}");
+            writer.write_msg(b"x", b"1", None, None, payload.as_bytes());
+        }
+        writer.notify(); // single notify at end
+
+        // Consumer: must get all messages even though notify was called once
+        // The drain-before-wait pattern handles this.
+        let mut total_msgs_seen = 0usize;
+        loop {
+            while let Some(data) = handle.drain() {
+                let s = std::str::from_utf8(&data).unwrap();
+                total_msgs_seen += s.matches("MSG x 1").count();
+            }
+            if total_msgs_seen >= total_msgs {
+                break;
+            }
+            // Use timeout to detect hang (would fail without drain-before-wait)
+            tokio::select! {
+                _ = handle.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    panic!(
+                        "consumer hung! only received {total_msgs_seen}/{total_msgs} messages"
+                    );
+                }
+            }
+        }
+        assert_eq!(total_msgs_seen, total_msgs);
     }
 }
