@@ -5,6 +5,51 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-07 — Resource usage comparison: Rust Leaf vs Go Leaf
+
+Measured during the same benchmark session (5M pub-only, 2M local pub/sub, 2M leaf→hub).
+CPU ticks = user+system clock ticks from `/proc/PID/stat` (lower = less CPU used).
+
+### Memory (RSS)
+
+| State | Go Leaf | Rust Leaf | Ratio |
+|---|---|---|---|
+| Idle (pre-benchmark) | 15 MB | 3.6 MB | Rust 4x smaller |
+| Pub-only (5M × 128B, under load) | ~22 MB | ~57-70 MB | Go 3x smaller |
+| Local pub/sub (2M, under load) | 24 MB | 69 MB | Go 3x smaller |
+| Leaf→Hub (2M, under load) | 34 MB | 345 MB | Go 10x smaller |
+| Peak (VmHWM, session lifetime) | 37 MB | 345 MB | Go 9x smaller |
+
+### CPU (clock ticks per workload)
+
+| Scenario | Go Leaf | Rust Leaf | Ratio | Throughput |
+|---|---|---|---|---|
+| Pub-only (5M msgs) | 286 ticks | 359 ticks | Go 20% less CPU | Go 8% faster |
+| Local pub/sub (2M) | 382 ticks | 290 ticks | Rust 24% less CPU | Rust 15% faster |
+| Leaf→Hub (2M) | 436 ticks | 169 ticks | Rust 61% less CPU | Rust 2.1x faster |
+
+### Other
+
+| Metric | Go Leaf | Rust Leaf |
+|---|---|---|
+| Threads | 13 | 7 |
+| Binary size | 23 MB | 25 MB |
+
+### Analysis
+
+- **Go wins on memory** — 3-10x less RSS under load. The Leaf→Hub spike to 345 MB is the
+  unbounded mpsc channel buffering messages when the publisher (1.2M/s) outpaces the upstream
+  writer (715K/s). Go's goroutine scheduler provides natural backpressure preventing this buildup.
+- **Rust wins on CPU efficiency** when routing messages: 24% less CPU on local pub/sub, 61% less
+  on leaf→hub. Zero-copy parsing and cached sender pay off here.
+- **Pub-only CPU 20% higher for Rust** — mpsc channel send + atomic waker costs more than Go's
+  goroutine-based approach for pure fire-and-forget ingestion.
+- **Rust idle footprint is tiny** (3.6 MB vs 15 MB) — Go runtime + GC metadata has a higher floor.
+- **Key tradeoff**: Rust trades memory for throughput. A bounded channel with backpressure would
+  reduce memory at some throughput cost.
+
+---
+
 ## 2026-03-07 — Zero-copy parse_pub hot path optimization
 
 **Optimizations applied:**
