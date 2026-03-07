@@ -5,7 +5,7 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
-## 2026-03-07 — DirectWriter: bypass mpsc channel for message delivery
+## 2026-03-07 — DirectWriter + fair Go comparison (compression: off)
 
 **Optimization applied:**
 Replace the per-client `mpsc::UnboundedSender<ClientMsg>` with `DirectWriter` — a shared
@@ -25,20 +25,30 @@ calling `notify()` many times before the consumer wakes loses all but one notifi
 Fixed with drain-before-wait pattern: always check the buffer at the top of the message
 loop before blocking on `select!`.
 
-| Scenario | Go Leaf | Rust Leaf | Rust/Go % | Previous |
-|---|---|---|---|---|
-| Pub only | ~1,749K | ~1,293K | **74%** | 77% |
-| Local pub/sub (sub) | ~630K | ~750K | **119%** | 115% |
-| Fan-out x5 (per sub) | ~175K | ~330K | **189%** | 152% |
-| Leaf → Hub (sub on hub) | ~472K | ~675K | **143%** | 119% |
-| Hub → Leaf (sub) | ~462K | ~642K | **139%** | 50% |
+**Go benchmark correction:** Previous runs used bare `leafnodes { listen }` config which
+defaults to `compression: s2_auto`. On localhost, `s2_auto` may still enable S2 compression,
+adding ~25% CPU overhead to Go's leaf node numbers. All numbers below use explicit
+`compression: off` for a fair comparison. Go standalone (non-leaf) scenarios are unaffected.
+
+### Results (same session, Go v2.14.0-dev, `compression: off`)
+
+| Scenario | Go | Rust | Rust/Go % |
+|---|---|---|---|
+| Pub only | 1,853K | 1,250K | **67%** |
+| Local pub/sub (sub) | 815K | 771K | **95%** |
+| Fan-out x5 (per sub) | 209K | 260K | **125%** |
+| Leaf → Hub (sub on hub) | 589K | 694K | **118%** |
+| Hub → Leaf (sub) | 612K | 717K | **117%** |
 
 **Takeaways:**
-- **Hub→Leaf: 50% → 139% of Go** — the mpsc channel was the bottleneck all along
-- **Fan-out x5: 152% → 189%** — DirectWriter avoids per-subscriber channel overhead
-- **Leaf→Hub: 119% → 143%** — local routing to matching subs is now channel-free
-- All scenarios except pub-only now significantly beat Go
-- Pub-only (74%) is unaffected since it has no subscribers to deliver to
+- **Hub→Leaf: 50% → 117% of Go** — DirectWriter bypasses the mpsc channel bottleneck.
+  Previous 139% figure was inflated by Go paying S2 compression overhead.
+- **Fan-out x5: 125% of Go** — DirectWriter avoids per-subscriber channel overhead
+- **Leaf→Hub: 118% of Go** — local routing to matching subs is now channel-free
+- **Local pub/sub: 95% of Go** — within noise of parity on the corrected baseline
+- **Pub-only: 67%** — true gap; Go's goroutine-per-connection model has less overhead
+  for pure ingestion (no async runtime, no channel)
+- All routing scenarios (fan-out, leaf↔hub) beat Go; only pure ingestion lags
 
 ---
 
