@@ -56,7 +56,7 @@ impl Upstream {
         let tcp = TcpStream::connect(&addr).await?;
         tcp.set_nodelay(true)?;
 
-        let mut leaf = LeafConn::new(Box::new(tcp));
+        let mut leaf = LeafConn::new(Box::new(tcp), state.buf_config);
 
         // --- Handshake ---
         // 1. Read INFO from hub

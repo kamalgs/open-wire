@@ -43,7 +43,7 @@ impl ClientConnection {
         state: Arc<ServerState>,
     ) -> (Self, ClientHandle) {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        let conn = ServerConn::new(stream);
+        let conn = ServerConn::new(stream, state.buf_config);
         let handle = ClientHandle { msg_tx };
         let client = Self {
             id,

@@ -16,6 +16,7 @@ use tracing::{error, info};
 use async_nats::ServerInfo;
 
 use crate::client_conn::{ClientConnection, ClientHandle};
+use crate::protocol::BufConfig;
 use crate::sub_list::SubList;
 use crate::upstream::{Upstream, UpstreamCmd};
 
@@ -34,6 +35,11 @@ pub struct LeafServerConfig {
     pub hub_url: Option<String>,
     /// Server name.
     pub server_name: String,
+    /// Max per-client read buffer capacity in bytes (default: 64 KB).
+    /// The buffer starts small (512B) and grows adaptively up to this limit.
+    pub max_read_buf_capacity: usize,
+    /// Per-client write buffer capacity in bytes (default: 64 KB).
+    pub write_buf_capacity: usize,
 }
 
 impl Default for LeafServerConfig {
@@ -45,6 +51,8 @@ impl Default for LeafServerConfig {
             ws_port: None,
             hub_url: None,
             server_name: "leaf-node".to_string(),
+            max_read_buf_capacity: 65536,
+            write_buf_capacity: 65536,
         }
     }
 }
@@ -58,17 +66,19 @@ pub(crate) struct ServerState {
     /// Lock-free sender for forwarding publishes to the upstream hub.
     /// Set once after upstream connects; read without locking on every publish.
     pub upstream_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<UpstreamCmd>>>,
+    pub buf_config: BufConfig,
     next_cid: AtomicU64,
 }
 
 impl ServerState {
-    fn new(info: ServerInfo) -> Self {
+    fn new(info: ServerInfo, buf_config: BufConfig) -> Self {
         Self {
             info,
             conns: std::sync::RwLock::new(HashMap::new()),
             subs: std::sync::RwLock::new(SubList::new()),
             upstream: tokio::sync::RwLock::new(None),
             upstream_tx: std::sync::RwLock::new(None),
+            buf_config,
             next_cid: AtomicU64::new(1),
         }
     }
@@ -102,9 +112,14 @@ impl LeafServer {
             ..Default::default()
         };
 
+        let buf_config = BufConfig {
+            max_read_buf: config.max_read_buf_capacity,
+            write_buf: config.write_buf_capacity,
+        };
+
         Self {
             config,
-            state: Arc::new(ServerState::new(info)),
+            state: Arc::new(ServerState::new(info, buf_config)),
         }
     }
 

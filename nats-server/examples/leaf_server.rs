@@ -4,6 +4,7 @@
 //   cargo run --example leaf_server -- --port 4222
 //   cargo run --example leaf_server -- --port 4222 --hub nats://localhost:7422
 //   cargo run --example leaf_server -- --port 4222 --ws-port 4223
+//   cargo run --example leaf_server -- --read-buf-max 32768 --write-buf-size 32768
 
 use nats_server::{LeafServer, LeafServerConfig};
 
@@ -40,10 +41,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.ws_port = Some(args[i].parse().expect("invalid ws-port"));
             }
+            "--read-buf-max" => {
+                i += 1;
+                config.max_read_buf_capacity =
+                    args[i].parse().expect("invalid read-buf-max");
+            }
+            "--write-buf-size" => {
+                i += 1;
+                config.write_buf_capacity =
+                    args[i].parse().expect("invalid write-buf-size");
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
-                    "Usage: leaf_server [--port PORT] [--host HOST] [--hub URL] [--name NAME] [--ws-port PORT]"
+                    "Usage: leaf_server [--port PORT] [--host HOST] [--hub URL] [--name NAME] \
+                     [--ws-port PORT] [--read-buf-max BYTES] [--write-buf-size BYTES]"
                 );
                 std::process::exit(1);
             }

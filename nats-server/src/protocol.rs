@@ -5,6 +5,8 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+use std::ops::{Deref, DerefMut};
+
 use bytes::BytesMut;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, BufWriter, ReadHalf, WriteHalf};
 
@@ -18,6 +20,99 @@ use crate::nats_proto::{self, MsgBuilder};
 pub(crate) use crate::nats_proto::ClientOp;
 pub(crate) use crate::nats_proto::LeafOp;
 
+// --- Adaptive read buffer (Go-style dynamic sizing) ---
+
+const DEFAULT_START_BUF: usize = 512;
+const DEFAULT_MIN_BUF: usize = 64;
+const DEFAULT_MAX_BUF: usize = 65536;
+const SHORTS_TO_SHRINK: u8 = 2;
+
+/// Configuration for adaptive read buffer sizing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BufConfig {
+    pub max_read_buf: usize,
+    pub write_buf: usize,
+}
+
+impl Default for BufConfig {
+    fn default() -> Self {
+        Self {
+            max_read_buf: DEFAULT_MAX_BUF,
+            write_buf: DEFAULT_MAX_BUF,
+        }
+    }
+}
+
+/// A read buffer that starts small and grows/shrinks based on utilization,
+/// matching Go's nats-server strategy: start at 512B, double on full reads,
+/// halve after 2 consecutive short reads, floor at 64B, ceiling at max.
+pub(crate) struct AdaptiveBuf {
+    buf: BytesMut,
+    target_cap: usize,
+    max_cap: usize,
+    shorts: u8,
+}
+
+impl AdaptiveBuf {
+    fn new(max_cap: usize) -> Self {
+        let start = DEFAULT_START_BUF.min(max_cap);
+        Self {
+            buf: BytesMut::with_capacity(start),
+            target_cap: start,
+            max_cap,
+            shorts: 0,
+        }
+    }
+
+    /// Called after each successful socket read with the number of bytes read.
+    /// Adjusts the target capacity and reallocates if appropriate.
+    fn after_read(&mut self, n: usize) {
+        if n >= self.target_cap && self.target_cap < self.max_cap {
+            // Buffer was fully utilized — grow
+            self.target_cap = (self.target_cap * 2).min(self.max_cap);
+            // Ensure we have enough capacity for the next read
+            let additional = self.target_cap.saturating_sub(self.buf.capacity() - self.buf.len());
+            if additional > 0 {
+                self.buf.reserve(additional);
+            }
+            self.shorts = 0;
+        } else if n < self.target_cap / 2 {
+            // Short read
+            self.shorts = self.shorts.saturating_add(1);
+            if self.shorts > SHORTS_TO_SHRINK && self.target_cap > DEFAULT_MIN_BUF {
+                self.target_cap = (self.target_cap / 2).max(DEFAULT_MIN_BUF);
+                // Only reallocate when buffer is empty (all data consumed)
+                if self.buf.is_empty() {
+                    self.buf = BytesMut::with_capacity(self.target_cap);
+                }
+            }
+        } else {
+            self.shorts = 0;
+        }
+    }
+
+    /// Try to shrink the buffer if it is empty and oversized.
+    /// Call this after parsing has consumed all data.
+    fn try_shrink(&mut self) {
+        if self.buf.is_empty() && self.buf.capacity() > self.target_cap * 2 {
+            self.buf = BytesMut::with_capacity(self.target_cap);
+        }
+    }
+}
+
+impl Deref for AdaptiveBuf {
+    type Target = BytesMut;
+    fn deref(&self) -> &BytesMut {
+        &self.buf
+    }
+}
+
+impl DerefMut for AdaptiveBuf {
+    fn deref_mut(&mut self) -> &mut BytesMut {
+        &mut self.buf
+    }
+}
+
 /// Server-side connection wrapper.
 /// Uses split read/write halves so the writer is wrapped in a BufWriter.
 /// This ensures `write_msg` calls go into a memory buffer and only hit the
@@ -25,17 +120,17 @@ pub(crate) use crate::nats_proto::LeafOp;
 pub(crate) struct ServerConn {
     reader: ReadHalf<Box<dyn AsyncReadWrite>>,
     writer: BufWriter<WriteHalf<Box<dyn AsyncReadWrite>>>,
-    read_buf: BytesMut,
+    read_buf: AdaptiveBuf,
     msg_builder: MsgBuilder,
 }
 
 impl ServerConn {
-    pub(crate) fn new(stream: Box<dyn AsyncReadWrite>) -> Self {
+    pub(crate) fn new(stream: Box<dyn AsyncReadWrite>, buf_config: BufConfig) -> Self {
         let (reader, writer) = io::split(stream);
         Self {
             reader,
-            writer: BufWriter::with_capacity(64 * 1024, writer),
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            writer: BufWriter::with_capacity(buf_config.write_buf, writer),
+            read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
             msg_builder: MsgBuilder::new(),
         }
     }
@@ -126,18 +221,21 @@ impl ServerConn {
             if let Some(op) = self.try_parse_client_op()? {
                 return Ok(Some(op));
             }
-            let n = self.reader.read_buf(&mut self.read_buf).await?;
+            let n = self.reader.read_buf(&mut *self.read_buf).await?;
             if n == 0 {
                 if self.read_buf.is_empty() {
                     return Ok(None);
                 }
                 return Err(io::ErrorKind::ConnectionReset.into());
             }
+            self.read_buf.after_read(n);
         }
     }
 
     pub(crate) fn try_parse_client_op(&mut self) -> io::Result<Option<ClientOp>> {
-        nats_proto::try_parse_client_op(&mut self.read_buf)
+        let result = nats_proto::try_parse_client_op(&mut self.read_buf);
+        self.read_buf.try_shrink();
+        result
     }
 
     async fn write_flush(&mut self, data: &[u8]) -> io::Result<()> {
@@ -153,19 +251,21 @@ impl ServerConn {
 /// reader/writer halves for the I/O loop.
 pub(crate) struct LeafConn {
     stream: Box<dyn AsyncReadWrite>,
-    read_buf: BytesMut,
+    read_buf: AdaptiveBuf,
+    buf_config: BufConfig,
 }
 
 impl LeafConn {
-    pub(crate) fn new(stream: Box<dyn AsyncReadWrite>) -> Self {
+    pub(crate) fn new(stream: Box<dyn AsyncReadWrite>, buf_config: BufConfig) -> Self {
         Self {
             stream,
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
+            buf_config,
         }
     }
 
     /// Split into independent reader and writer halves.
-    /// The writer is wrapped in a 64KB BufWriter for batched I/O.
+    /// The writer is wrapped in a BufWriter for batched I/O.
     pub(crate) fn split(self) -> (LeafReader, LeafWriter) {
         let (reader, writer) = io::split(self.stream);
         (
@@ -174,7 +274,7 @@ impl LeafConn {
                 read_buf: self.read_buf,
             },
             LeafWriter {
-                writer: BufWriter::with_capacity(64 * 1024, writer),
+                writer: BufWriter::with_capacity(self.buf_config.write_buf, writer),
                 msg_builder: MsgBuilder::new(),
             },
         )
@@ -184,15 +284,17 @@ impl LeafConn {
     pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
         loop {
             if let Some(op) = nats_proto::try_parse_leaf_op(&mut self.read_buf)? {
+                self.read_buf.try_shrink();
                 return Ok(Some(op));
             }
-            let n = self.stream.read_buf(&mut self.read_buf).await?;
+            let n = self.stream.read_buf(&mut *self.read_buf).await?;
             if n == 0 {
                 if self.read_buf.is_empty() {
                     return Ok(None);
                 }
                 return Err(io::ErrorKind::ConnectionReset.into());
             }
+            self.read_buf.after_read(n);
         }
     }
 
@@ -238,7 +340,7 @@ impl LeafConn {
 /// Read half of a leaf connection.
 pub(crate) struct LeafReader {
     reader: ReadHalf<Box<dyn AsyncReadWrite>>,
-    read_buf: BytesMut,
+    read_buf: AdaptiveBuf,
 }
 
 impl LeafReader {
@@ -246,15 +348,17 @@ impl LeafReader {
     pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
         loop {
             if let Some(op) = nats_proto::try_parse_leaf_op(&mut self.read_buf)? {
+                self.read_buf.try_shrink();
                 return Ok(Some(op));
             }
-            let n = self.reader.read_buf(&mut self.read_buf).await?;
+            let n = self.reader.read_buf(&mut *self.read_buf).await?;
             if n == 0 {
                 if self.read_buf.is_empty() {
                     return Ok(None);
                 }
                 return Err(io::ErrorKind::ConnectionReset.into());
             }
+            self.read_buf.after_read(n);
         }
     }
 }
@@ -315,7 +419,7 @@ mod tests {
 
     async fn make_pair() -> (ServerConn, tokio::io::DuplexStream) {
         let (client_side, server_side) = duplex(8192);
-        let conn = ServerConn::new(Box::new(server_side));
+        let conn = ServerConn::new(Box::new(server_side), BufConfig::default());
         (conn, client_side)
     }
 
@@ -527,7 +631,7 @@ mod tests {
 
     async fn make_leaf_pair() -> (LeafConn, tokio::io::DuplexStream) {
         let (hub_side, leaf_side) = duplex(8192);
-        let conn = LeafConn::new(Box::new(leaf_side));
+        let conn = LeafConn::new(Box::new(leaf_side), BufConfig::default());
         (conn, hub_side)
     }
 
