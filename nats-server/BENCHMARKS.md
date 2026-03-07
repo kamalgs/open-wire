@@ -5,6 +5,45 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-07 — Byte-level subject matching (eliminate SplitInternal)
+
+**Optimization applied:**
+16. Replace `str::split('.')` iterator in `subject_matches` with direct byte-level dot scanning
+    using `memchr`. Eliminates `core::str::iter::SplitInternal::next` which was 5.7% of CPU
+    in local pub/sub profiles.
+
+**Profile diff (local pub/sub):**
+- `SplitInternal::next`: 5.70% → **0%** (eliminated)
+- `subject_matches`: 1.12% → 1.58% (function itself slightly larger, but no iterator overhead)
+- `memchr::find_avx2`: 0.97% → 5.50% (shared with parse_pub newline scanning)
+
+| Scenario | Direct Hub | Go Leaf | Rust Leaf | Rust/Go % |
+|---|---|---|---|---|
+| Pub only | ~1,671K | ~1,575K | ~1,384K | **88%** |
+| Local pub/sub (sub) | ~680K | ~780K | ~755K | **97%** |
+| Fan-out x5 (per sub) | ~194K | ~193K | ~263K | **136%** |
+| Leaf → Hub (pub) | — | ~519K | ~1,242K | **239%** |
+| Leaf → Hub (sub on hub) | — | ~506K | ~645K | **127%** |
+| Hub → Leaf (sub) | — | ~536K | ~186K | **35%** |
+
+**Takeaways:**
+- Pub-only at **88% of Go** (up from 84%) — variance, no code change affects this path
+- Local pub/sub at **97% of Go** — nearly closed the gap (was 107%, now 97% — within noise)
+- Fan-out x5 at **136% of Go** (up from 122%) — byte-level matching helps with 5 subs
+- Leaf→Hub still dominant at **2.4x Go**
+- Hub→Leaf remains the weak spot at 35% of Go — mpsc channel delivery bottleneck
+
+**Remaining hotspots (local pub/sub profile):**
+- `parse_pub`: 6.6% — already heavily optimized
+- `libc memmove`: 6.4% — BytesMut internal buffer compaction
+- `memchr::find_avx2`: 5.5% — newline + dot scanning (shared)
+- `bytes_mut::shared_v_drop`: 3.6% — refcount drops
+- `for_each_match`: 3.1% — O(n) linear sub scan (trie would help)
+- `mpsc::send + wake`: 5.1% — tokio channel overhead per message delivery
+- `subject_matches`: 1.6% — the matching itself (now byte-level)
+
+---
+
 ## 2026-03-07 — Adaptive read buffers + idle memory benchmark
 
 **Optimization applied:**

@@ -90,23 +90,51 @@ impl SubList {
 /// NATS wildcard matching.
 /// `*` matches a single token, `>` matches one or more tokens (tail match).
 ///
-/// This implementation is allocation-free — it iterates over `.split('.')`
-/// directly instead of collecting into Vecs.
+/// Uses byte-level dot scanning instead of `str::split('.')` to avoid
+/// the `SplitInternal` iterator machinery (which was ~6% of CPU in profiles).
 pub fn subject_matches(pattern: &str, subject: &str) -> bool {
-    let mut pat_iter = pattern.split('.');
-    let mut sub_iter = subject.split('.');
+    subject_matches_bytes(pattern.as_bytes(), subject.as_bytes())
+}
+
+#[inline]
+fn subject_matches_bytes(pattern: &[u8], subject: &[u8]) -> bool {
+    let mut pp = 0; // pattern position
+    let mut sp = 0; // subject position
 
     loop {
-        match (pat_iter.next(), sub_iter.next()) {
-            (Some(">"), Some(_)) => return true,
-            (Some(pt), Some(st)) => {
-                if pt != "*" && pt != st {
-                    return false;
-                }
-            }
-            (None, None) => return true,
-            _ => return false,
+        if pp >= pattern.len() {
+            return sp >= subject.len();
         }
+        if sp >= subject.len() {
+            return false;
+        }
+
+        // Find end of current pattern token
+        let pe = match memchr::memchr(b'.', &pattern[pp..]) {
+            Some(i) => pp + i,
+            None => pattern.len(),
+        };
+
+        // Check for ">"
+        if pe - pp == 1 && pattern[pp] == b'>' {
+            return true;
+        }
+
+        // Find end of current subject token
+        let se = match memchr::memchr(b'.', &subject[sp..]) {
+            Some(i) => sp + i,
+            None => subject.len(),
+        };
+
+        // Check match: "*" matches any single token, otherwise exact
+        let is_star = pe - pp == 1 && pattern[pp] == b'*';
+        if !is_star && pattern[pp..pe] != subject[sp..se] {
+            return false;
+        }
+
+        // Advance past token + dot
+        pp = if pe < pattern.len() { pe + 1 } else { pe };
+        sp = if se < subject.len() { se + 1 } else { se };
     }
 }
 
