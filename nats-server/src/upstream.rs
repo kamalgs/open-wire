@@ -237,6 +237,20 @@ async fn run_leaf_reader(
                     error!(error = %e, "error handling hub op");
                     break;
                 }
+                // Drain all remaining parseable ops from the read buffer
+                // (pure in-memory parsing, no I/O) — same pattern as client_conn
+                while let Some(op) = match reader.try_parse_leaf_op() {
+                    Ok(op) => op,
+                    Err(e) => {
+                        error!(error = %e, "upstream parse error");
+                        return;
+                    }
+                } {
+                    if let Err(e) = handle_hub_op(op, &cmd_tx, &state) {
+                        error!(error = %e, "error handling hub op");
+                        return;
+                    }
+                }
             }
             Ok(None) => {
                 warn!("hub connection closed");

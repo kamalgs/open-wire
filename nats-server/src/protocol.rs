@@ -365,10 +365,10 @@ pub(crate) struct LeafReader {
 
 impl LeafReader {
     /// Read the next leaf operation from the hub.
+    /// Performs I/O if the buffer doesn't contain a complete op.
     pub(crate) async fn read_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
         loop {
-            if let Some(op) = nats_proto::try_parse_leaf_op(&mut self.read_buf)? {
-                self.read_buf.try_shrink();
+            if let Some(op) = self.try_parse_leaf_op()? {
                 return Ok(Some(op));
             }
             let n = self.reader.read_buf(&mut *self.read_buf).await?;
@@ -380,6 +380,13 @@ impl LeafReader {
             }
             self.read_buf.after_read(n);
         }
+    }
+
+    /// Try to parse the next leaf op from the buffer without I/O.
+    pub(crate) fn try_parse_leaf_op(&mut self) -> io::Result<Option<LeafOp>> {
+        let result = nats_proto::try_parse_leaf_op(&mut self.read_buf);
+        self.read_buf.try_shrink();
+        result
     }
 }
 

@@ -5,6 +5,31 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-07 — Zero-copy LMSG parsing + buffer drain in leaf reader
+
+**Optimizations applied:**
+1. **Zero-copy LMSG parsing**: replaced `Bytes::copy_from_slice()` with `split_to().freeze().slice()`
+   for subject/reply in `parse_lmsg`. Was allocating+copying subject bytes per message — now uses
+   Arc refcount bump like `parse_pub` already did. `copy_from_slice` was 2.05% of CPU in profiles.
+2. **Buffer drain in leaf reader**: `run_leaf_reader` now drains all parseable ops from the read
+   buffer after each I/O read (same pattern as client_conn). Previously it did one op per syscall.
+
+| Scenario | Go Leaf | Rust Leaf | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~1,749K | ~1,348K | **77%** | 59% |
+| Local pub/sub (sub) | ~630K | ~727K | **115%** | 118% |
+| Fan-out x5 (per sub) | ~175K | ~266K | **152%** | 159% |
+| Leaf → Hub (sub on hub) | ~472K | ~560K | **119%** | 135% |
+| Hub → Leaf (sub) | ~462K | ~232K | **50%** | 37% |
+
+**Takeaways:**
+- Hub→Leaf: **37% → 50% of Go** — biggest improvement from zero-copy LMSG + buffer drain
+- Remaining Hub→Leaf bottleneck is architectural: single reader task → mpsc channel → per-client
+  writer task, with `tokio::select!` overhead on the client side. Go writes directly from the
+  reader goroutine without a channel hop.
+
+---
+
 ## 2026-03-07 — Eliminate conns lock + split SubList exact/wildcard + skip publish
 
 **Optimizations applied:**

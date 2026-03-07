@@ -724,6 +724,11 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     let args_bytes = &buf[5..line_end];
     let (args, argc) = split_args::<4>(args_bytes);
 
+    // Compute offsets for zero-copy slicing (same approach as parse_pub).
+    let buf_ptr = buf.as_ptr() as usize;
+    let subj_off = args[0].as_ptr() as usize - buf_ptr;
+    let subj_len = args[0].len();
+
     match argc {
         // LMSG subject size
         2 => {
@@ -732,8 +737,9 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
             if buf.len() < total_needed {
                 return Ok(None);
             }
-            let subject = Bytes::copy_from_slice(args[0]);
-            buf.advance(nl + 1);
+            // Freeze header line — zero-copy sub-slicing via Arc refcount bump
+            let header_line = buf.split_to(nl + 1).freeze();
+            let subject = header_line.slice(subj_off..subj_off + subj_len);
             let payload = buf.split_to(size).freeze();
             buf.advance(2);
             Ok(Some(LeafOp::LeafMsg {
@@ -753,8 +759,8 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
                     if buf.len() < total_needed {
                         return Ok(None);
                     }
-                    let subject = Bytes::copy_from_slice(args[0]);
-                    buf.advance(nl + 1);
+                    let header_line = buf.split_to(nl + 1).freeze();
+                    let subject = header_line.slice(subj_off..subj_off + subj_len);
                     let hdr_data = buf.split_to(hdr_size);
                     let payload = buf.split_to(total_size - hdr_size).freeze();
                     buf.advance(2);
@@ -773,9 +779,11 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
                     if buf.len() < total_needed {
                         return Ok(None);
                     }
-                    let subject = Bytes::copy_from_slice(args[0]);
-                    let reply = Bytes::copy_from_slice(args[1]);
-                    buf.advance(nl + 1);
+                    let reply_off = args[1].as_ptr() as usize - buf_ptr;
+                    let reply_len = args[1].len();
+                    let header_line = buf.split_to(nl + 1).freeze();
+                    let subject = header_line.slice(subj_off..subj_off + subj_len);
+                    let reply = header_line.slice(reply_off..reply_off + reply_len);
                     let payload = buf.split_to(size).freeze();
                     buf.advance(2);
                     Ok(Some(LeafOp::LeafMsg {
@@ -795,9 +803,11 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
             if buf.len() < total_needed {
                 return Ok(None);
             }
-            let subject = Bytes::copy_from_slice(args[0]);
-            let reply = Bytes::copy_from_slice(args[1]);
-            buf.advance(nl + 1);
+            let reply_off = args[1].as_ptr() as usize - buf_ptr;
+            let reply_len = args[1].len();
+            let header_line = buf.split_to(nl + 1).freeze();
+            let subject = header_line.slice(subj_off..subj_off + subj_len);
+            let reply = header_line.slice(reply_off..reply_off + reply_len);
             let hdr_data = buf.split_to(hdr_size);
             let payload = buf.split_to(total_size - hdr_size).freeze();
             buf.advance(2);
