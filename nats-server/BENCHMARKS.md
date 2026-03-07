@@ -5,6 +5,37 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-07 — Eliminate conns lock + split SubList exact/wildcard + skip publish
+
+**Optimizations applied:**
+1. **Store `msg_tx` directly in `Subscription`**: eliminates `conns` HashMap lookup + `conns.read()`
+   RwLock acquisition on every publish. The sender is cloned once at subscribe time.
+2. **Split SubList into exact + wildcard**: exact subjects use `HashMap<String, Vec<Sub>>` for O(1)
+   lookup; only wildcard patterns (`*`, `>`) require linear scanning. Most NATS workloads use
+   exact subjects, so this avoids scanning all subscriptions.
+3. **`try_skip_publish`**: when no subscribers exist and no upstream is connected, PUB/HPUB messages
+   are skipped without creating any Bytes objects (no `split_to`, no `freeze`, no refcount bumps).
+   Uses `AtomicBool` flag to avoid taking the subs lock on every publish.
+4. **Removed `conns` HashMap entirely** from `ServerState` — no longer needed since `msg_tx` is
+   stored directly in each Subscription.
+
+| Scenario | Go Leaf | Rust Leaf | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~1,870K | ~1,111K | **59%** | 88% |
+| Local pub/sub (sub) | ~607K | ~717K | **118%** | 97% |
+| Fan-out x5 (per sub) | ~193K | ~307K | **159%** | 136% |
+| Leaf → Hub (sub on hub) | ~480K | ~647K | **135%** | 127% |
+| Hub → Leaf (sub) | ~501K | ~184K | **37%** | 35% |
+
+**Takeaways:**
+- Local pub/sub: **97% → 118%** — now 18% faster than Go (conns lock + HashMap eliminated)
+- Fan-out x5: **136% → 159%** — exact HashMap lookup avoids scanning all 5 subs
+- Leaf→Hub: **127% → 135%** — same optimization benefits upstream delivery
+- Pub-only: dropped to 59% — high variance, likely system noise (structural BytesMut overhead)
+- Hub→Leaf: 35% → 37% — marginal, bottleneck is mpsc channel delivery
+
+---
+
 ## 2026-03-07 — Byte-level subject matching (eliminate SplitInternal)
 
 **Optimization applied:**

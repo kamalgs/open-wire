@@ -179,7 +179,7 @@ impl ServerConn {
     /// Write a MSG for a ClientMsg (Bytes-based subject/reply) without flushing.
     pub(crate) async fn write_client_msg(
         &mut self,
-        msg: &crate::client_conn::ClientMsg,
+        msg: &crate::sub_list::ClientMsg,
     ) -> io::Result<()> {
         let data = self.msg_builder.build_msg(
             &msg.subject,
@@ -217,8 +217,20 @@ impl ServerConn {
 
     /// Read the next client operation from the wire.
     pub(crate) async fn read_client_op(&mut self) -> io::Result<Option<ClientOp>> {
+        self.read_client_op_inner(false).await
+    }
+
+    pub(crate) async fn read_client_op_inner(
+        &mut self,
+        skip_pub: bool,
+    ) -> io::Result<Option<ClientOp>> {
         loop {
-            if let Some(op) = self.try_parse_client_op()? {
+            let parsed = if skip_pub {
+                self.try_skip_or_parse_client_op()?
+            } else {
+                self.try_parse_client_op()?
+            };
+            if let Some(op) = parsed {
                 return Ok(Some(op));
             }
             let n = self.reader.read_buf(&mut *self.read_buf).await?;
@@ -234,6 +246,14 @@ impl ServerConn {
 
     pub(crate) fn try_parse_client_op(&mut self) -> io::Result<Option<ClientOp>> {
         let result = nats_proto::try_parse_client_op(&mut self.read_buf);
+        self.read_buf.try_shrink();
+        result
+    }
+
+    /// Parse the next op, but skip PUB/HPUB without creating Bytes objects.
+    /// Used when there are no subscribers and no upstream to save CPU.
+    pub(crate) fn try_skip_or_parse_client_op(&mut self) -> io::Result<Option<ClientOp>> {
+        let result = nats_proto::try_skip_or_parse_client_op(&mut self.read_buf);
         self.read_buf.try_shrink();
         result
     }

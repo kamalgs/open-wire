@@ -5,9 +5,23 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
+use tokio::sync::mpsc;
+
+use async_nats::header::HeaderMap;
+
+/// A message to be delivered to a local client connection.
+/// Uses pre-formatted `sid_bytes` to avoid integer formatting on every write.
+#[derive(Debug)]
+pub(crate) struct ClientMsg {
+    pub subject: Bytes,
+    pub sid_bytes: Bytes,
+    pub reply: Option<Bytes>,
+    pub headers: Option<HeaderMap>,
+    pub payload: Bytes,
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -19,12 +33,28 @@ pub struct Subscription {
     pub sid_bytes: Bytes,
     pub subject: String,
     pub queue: Option<String>,
+    /// Direct sender to the client's message channel.
+    /// Avoids conns HashMap lookup + lock on every publish.
+    pub(crate) msg_tx: mpsc::UnboundedSender<ClientMsg>,
+}
+
+/// Returns true if the subject pattern contains wildcard characters (`*` or `>`).
+#[inline]
+fn is_wildcard(subject: &str) -> bool {
+    memchr::memchr2(b'*', b'>', subject.as_bytes()).is_some()
 }
 
 /// Subscription list supporting NATS wildcard matching.
+///
+/// Splits subscriptions into exact (HashMap) and wildcard (Vec) for fast
+/// lookups: exact subjects get O(1) HashMap lookup, only wildcard patterns
+/// require linear scanning.
 #[derive(Debug, Default)]
 pub struct SubList {
-    subs: Vec<Subscription>,
+    /// Exact (non-wildcard) subscriptions indexed by subject.
+    exact: HashMap<String, Vec<Subscription>>,
+    /// Wildcard subscriptions (patterns with `*` or `>`).
+    wild: Vec<Subscription>,
 }
 
 impl SubList {
@@ -33,46 +63,95 @@ impl SubList {
     }
 
     pub fn insert(&mut self, sub: Subscription) {
-        self.subs.push(sub);
+        if is_wildcard(&sub.subject) {
+            self.wild.push(sub);
+        } else {
+            self.exact
+                .entry(sub.subject.clone())
+                .or_default()
+                .push(sub);
+        }
     }
 
     pub fn remove(&mut self, conn_id: u64, sid: u64) -> Option<Subscription> {
+        // Try wildcard list first
         if let Some(pos) = self
-            .subs
+            .wild
             .iter()
             .position(|s| s.conn_id == conn_id && s.sid == sid)
         {
-            Some(self.subs.swap_remove(pos))
-        } else {
-            None
+            return Some(self.wild.swap_remove(pos));
         }
+        // Search exact map
+        for subs in self.exact.values_mut() {
+            if let Some(pos) = subs
+                .iter()
+                .position(|s| s.conn_id == conn_id && s.sid == sid)
+            {
+                let removed = subs.swap_remove(pos);
+                return Some(removed);
+            }
+        }
+        None
     }
 
     pub fn remove_conn(&mut self, conn_id: u64) -> Vec<Subscription> {
         let mut removed = Vec::new();
+
+        // Remove from wildcard list
         let mut i = 0;
-        while i < self.subs.len() {
-            if self.subs[i].conn_id == conn_id {
-                removed.push(self.subs.swap_remove(i));
+        while i < self.wild.len() {
+            if self.wild[i].conn_id == conn_id {
+                removed.push(self.wild.swap_remove(i));
             } else {
                 i += 1;
             }
         }
+
+        // Remove from exact map
+        self.exact.retain(|_, subs| {
+            let mut i = 0;
+            while i < subs.len() {
+                if subs[i].conn_id == conn_id {
+                    removed.push(subs.swap_remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            !subs.is_empty()
+        });
+
         removed
     }
 
     pub fn match_subject(&self, subject: &str) -> Vec<&Subscription> {
-        self.subs
-            .iter()
-            .filter(|s| subject_matches(&s.subject, subject))
-            .collect()
+        let mut result = Vec::new();
+        // O(1) exact lookup
+        if let Some(subs) = self.exact.get(subject) {
+            result.extend(subs.iter());
+        }
+        // Linear scan of wildcard patterns only
+        for sub in &self.wild {
+            if subject_matches(&sub.subject, subject) {
+                result.push(sub);
+            }
+        }
+        result
     }
 
     /// Iterate over matching subscriptions without allocating a Vec.
     /// Returns the total number of matches.
     pub fn for_each_match(&self, subject: &str, mut f: impl FnMut(&Subscription)) -> usize {
         let mut count = 0;
-        for sub in &self.subs {
+        // O(1) exact lookup
+        if let Some(subs) = self.exact.get(subject) {
+            for sub in subs {
+                f(sub);
+                count += 1;
+            }
+        }
+        // Linear scan of wildcard patterns only
+        for sub in &self.wild {
             if subject_matches(&sub.subject, subject) {
                 f(sub);
                 count += 1;
@@ -81,9 +160,18 @@ impl SubList {
         count
     }
 
+    /// Returns true if the sublist has no subscriptions at all.
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.wild.is_empty()
+    }
+
     #[allow(dead_code)]
     pub fn unique_subjects(&self) -> HashSet<&str> {
-        self.subs.iter().map(|s| s.subject.as_str()).collect()
+        let mut subjects: HashSet<&str> = self.exact.keys().map(|s| s.as_str()).collect();
+        for sub in &self.wild {
+            subjects.insert(&sub.subject);
+        }
+        subjects
     }
 }
 
@@ -142,6 +230,19 @@ fn subject_matches_bytes(pattern: &[u8], subject: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// Create a test subscription with a dummy msg_tx sender.
+    fn test_sub(conn_id: u64, sid: u64, subject: &str) -> Subscription {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Subscription {
+            conn_id,
+            sid,
+            sid_bytes: Bytes::from(sid.to_string().into_bytes()),
+            subject: subject.to_string(),
+            queue: None,
+            msg_tx: tx,
+        }
+    }
+
     #[test]
     fn test_exact_match() {
         assert!(subject_matches("foo.bar.baz", "foo.bar.baz"));
@@ -180,27 +281,9 @@ mod tests {
     #[test]
     fn test_sublist_insert_match() {
         let mut sl = SubList::new();
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 1,
-            sid_bytes: Bytes::from_static(b"1"),
-            subject: "foo.bar".to_string(),
-            queue: None,
-        });
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 2,
-            sid_bytes: Bytes::from_static(b"2"),
-            subject: "foo.*".to_string(),
-            queue: None,
-        });
-        sl.insert(Subscription {
-            conn_id: 2,
-            sid: 1,
-            sid_bytes: Bytes::from_static(b"1"),
-            subject: "baz.>".to_string(),
-            queue: None,
-        });
+        sl.insert(test_sub(1, 1, "foo.bar"));
+        sl.insert(test_sub(1, 2, "foo.*"));
+        sl.insert(test_sub(2, 1, "baz.>"));
 
         let matches = sl.match_subject("foo.bar");
         assert_eq!(matches.len(), 2);
@@ -217,20 +300,8 @@ mod tests {
     #[test]
     fn test_sublist_remove() {
         let mut sl = SubList::new();
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 1,
-            sid_bytes: Bytes::from_static(b"1"),
-            subject: "foo".to_string(),
-            queue: None,
-        });
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 2,
-            sid_bytes: Bytes::from_static(b"2"),
-            subject: "bar".to_string(),
-            queue: None,
-        });
+        sl.insert(test_sub(1, 1, "foo"));
+        sl.insert(test_sub(1, 2, "bar"));
 
         let removed = sl.remove(1, 1);
         assert!(removed.is_some());
@@ -243,27 +314,9 @@ mod tests {
     #[test]
     fn test_sublist_remove_conn() {
         let mut sl = SubList::new();
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 1,
-            sid_bytes: Bytes::from_static(b"1"),
-            subject: "foo".to_string(),
-            queue: None,
-        });
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 2,
-            sid_bytes: Bytes::from_static(b"2"),
-            subject: "bar".to_string(),
-            queue: None,
-        });
-        sl.insert(Subscription {
-            conn_id: 2,
-            sid: 1,
-            sid_bytes: Bytes::from_static(b"1"),
-            subject: "foo".to_string(),
-            queue: None,
-        });
+        sl.insert(test_sub(1, 1, "foo"));
+        sl.insert(test_sub(1, 2, "bar"));
+        sl.insert(test_sub(2, 1, "foo"));
 
         let removed = sl.remove_conn(1);
         assert_eq!(removed.len(), 2);
@@ -276,31 +329,36 @@ mod tests {
     #[test]
     fn test_unique_subjects() {
         let mut sl = SubList::new();
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 1,
-            sid_bytes: Bytes::from_static(b"1"),
-            subject: "foo".to_string(),
-            queue: None,
-        });
-        sl.insert(Subscription {
-            conn_id: 2,
-            sid: 1,
-            sid_bytes: Bytes::from_static(b"1"),
-            subject: "foo".to_string(),
-            queue: None,
-        });
-        sl.insert(Subscription {
-            conn_id: 1,
-            sid: 2,
-            sid_bytes: Bytes::from_static(b"2"),
-            subject: "bar".to_string(),
-            queue: None,
-        });
+        sl.insert(test_sub(1, 1, "foo"));
+        sl.insert(test_sub(2, 1, "foo"));
+        sl.insert(test_sub(1, 2, "bar"));
 
         let subjects = sl.unique_subjects();
         assert_eq!(subjects.len(), 2);
         assert!(subjects.contains("foo"));
         assert!(subjects.contains("bar"));
+    }
+
+    #[test]
+    fn test_exact_vs_wildcard_split() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.bar"));
+        sl.insert(test_sub(1, 2, "foo.*"));
+        sl.insert(test_sub(1, 3, "baz.>"));
+        sl.insert(test_sub(2, 1, "foo.bar"));
+
+        // "foo.bar" should match 2 exact + 1 wildcard
+        let matches = sl.match_subject("foo.bar");
+        assert_eq!(matches.len(), 3);
+
+        // "foo.qux" should match only the wildcard "foo.*"
+        let matches = sl.match_subject("foo.qux");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].subject, "foo.*");
+
+        // is_empty
+        assert!(!sl.is_empty());
+        let empty = SubList::new();
+        assert!(empty.is_empty());
     }
 }

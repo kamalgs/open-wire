@@ -5,8 +5,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -15,7 +14,7 @@ use tracing::{error, info};
 
 use async_nats::ServerInfo;
 
-use crate::client_conn::{ClientConnection, ClientHandle};
+use crate::client_conn::ClientConnection;
 use crate::protocol::BufConfig;
 use crate::sub_list::SubList;
 use crate::upstream::{Upstream, UpstreamCmd};
@@ -60,12 +59,15 @@ impl Default for LeafServerConfig {
 /// Shared server state accessible by all client connections.
 pub(crate) struct ServerState {
     pub info: ServerInfo,
-    pub conns: std::sync::RwLock<HashMap<u64, ClientHandle>>,
     pub subs: std::sync::RwLock<SubList>,
     pub upstream: tokio::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
     /// Set once after upstream connects; read without locking on every publish.
     pub upstream_tx: std::sync::RwLock<Option<mpsc::UnboundedSender<UpstreamCmd>>>,
+    /// Lock-free flag: true when at least one subscription exists.
+    /// Updated on subscribe/unsubscribe. Avoids taking subs lock on every publish
+    /// just to check emptiness.
+    pub has_subs: AtomicBool,
     pub buf_config: BufConfig,
     next_cid: AtomicU64,
 }
@@ -74,10 +76,10 @@ impl ServerState {
     fn new(info: ServerInfo, buf_config: BufConfig) -> Self {
         Self {
             info,
-            conns: std::sync::RwLock::new(HashMap::new()),
             subs: std::sync::RwLock::new(SubList::new()),
             upstream: tokio::sync::RwLock::new(None),
             upstream_tx: std::sync::RwLock::new(None),
+            has_subs: AtomicBool::new(false),
             buf_config,
             next_cid: AtomicU64::new(1),
         }
@@ -155,12 +157,7 @@ impl LeafServer {
 
         info!(cid, addr = %addr, transport, "accepted connection");
 
-        let (client_conn, handle) = ClientConnection::new(cid, stream, state.clone());
-
-        {
-            let mut conns = state.conns.write().unwrap();
-            conns.insert(cid, handle);
-        }
+        let client_conn = ClientConnection::new(cid, stream, state);
 
         tokio::spawn(async move {
             client_conn.run().await;
@@ -303,10 +300,11 @@ impl LeafServer {
             }
         }
 
-        // Cleanup: drop all connection handles to signal clients
+        // Cleanup: clear all subscriptions — drops msg_tx senders,
+        // signaling client tasks to exit.
         {
-            let mut conns = self.state.conns.write().unwrap();
-            conns.clear();
+            let mut subs = self.state.subs.write().unwrap();
+            *subs = SubList::new();
         }
 
         // Drop upstream

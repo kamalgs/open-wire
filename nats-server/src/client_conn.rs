@@ -12,24 +12,20 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use async_nats::connection::AsyncReadWrite;
-use async_nats::header::HeaderMap;
 
 use crate::nats_proto;
 use crate::protocol::{ClientOp, ServerConn};
 use crate::server::ServerState;
-use crate::sub_list::Subscription;
+use crate::sub_list::{ClientMsg, Subscription};
 use crate::upstream::UpstreamCmd;
-
-/// Handle held by the server for sending messages to a client connection.
-pub(crate) struct ClientHandle {
-    pub msg_tx: mpsc::UnboundedSender<ClientMsg>,
-}
 
 /// Per-client connection handler.
 pub(crate) struct ClientConnection {
     id: u64,
     conn: ServerConn,
     state: Arc<ServerState>,
+    /// Sender cloned into each Subscription for direct message delivery.
+    msg_tx: mpsc::UnboundedSender<ClientMsg>,
     msg_rx: mpsc::UnboundedReceiver<ClientMsg>,
     /// Cached upstream sender — populated once after handshake to avoid
     /// RwLock read + Arc clone on every publish.
@@ -41,18 +37,17 @@ impl ClientConnection {
         id: u64,
         stream: Box<dyn AsyncReadWrite>,
         state: Arc<ServerState>,
-    ) -> (Self, ClientHandle) {
+    ) -> Self {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
         let conn = ServerConn::new(stream, state.buf_config);
-        let handle = ClientHandle { msg_tx };
-        let client = Self {
+        Self {
             id,
             conn,
             state,
+            msg_tx,
             msg_rx,
             upstream_tx: None,
-        };
-        (client, handle)
+        }
     }
 
     /// Run the client connection handler.
@@ -114,17 +109,34 @@ impl ClientConnection {
         Ok(())
     }
 
+    /// Check if publishes can be skipped (no subscribers, no upstream).
+    /// Uses atomic flag — no lock acquisition.
+    #[inline]
+    fn can_skip_publish(&self) -> bool {
+        self.upstream_tx.is_none()
+            && !self.state.has_subs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     async fn message_loop(&mut self) -> std::io::Result<()> {
         loop {
+            let skip = self.can_skip_publish();
             tokio::select! {
-                op = self.conn.read_client_op() => {
+                op = self.conn.read_client_op_inner(skip) => {
                     match op? {
                         Some(op) => {
                             self.handle_client_op(op).await?;
-                            // Drain all remaining parseable ops from read buffer
-                            // (pure in-memory parsing, no I/O)
-                            while let Some(op) = self.conn.try_parse_client_op()? {
-                                self.handle_client_op(op).await?;
+                            // Drain all remaining parseable ops from read buffer.
+                            // Use skip path when no one is listening.
+                            if skip {
+                                while let Some(op) =
+                                    self.conn.try_skip_or_parse_client_op()?
+                                {
+                                    self.handle_client_op(op).await?;
+                                }
+                            } else {
+                                while let Some(op) = self.conn.try_parse_client_op()? {
+                                    self.handle_client_op(op).await?;
+                                }
                             }
                         }
                         None => return Ok(()), // clean disconnect
@@ -172,11 +184,15 @@ impl ClientConnection {
                     sid_bytes: nats_proto::sid_to_bytes(sid),
                     subject: subject_str.to_string(),
                     queue: queue_str,
+                    msg_tx: self.msg_tx.clone(),
                 };
 
                 {
                     let mut subs = self.state.subs.write().unwrap();
                     subs.insert(sub);
+                    self.state
+                        .has_subs
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
                 // Notify upstream
@@ -194,7 +210,11 @@ impl ClientConnection {
             ClientOp::Unsubscribe { sid, max: _ } => {
                 let removed = {
                     let mut subs = self.state.subs.write().unwrap();
-                    subs.remove(self.id, sid)
+                    let r = subs.remove(self.id, sid);
+                    self.state
+                        .has_subs
+                        .store(!subs.is_empty(), std::sync::atomic::Ordering::Relaxed);
+                    r
                 };
 
                 if let Some(removed) = removed {
@@ -212,23 +232,20 @@ impl ClientConnection {
                 headers,
                 ..
             } => {
-                // Route to local subscribers
+                // Route to local subscribers — direct send, no conns lookup
                 {
                     let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
-                    let conns = self.state.conns.read().unwrap();
                     subs.for_each_match(subject_str, |sub| {
-                        if let Some(handle) = conns.get(&sub.conn_id) {
-                            let msg = ClientMsg {
-                                subject: subject.clone(),
-                                sid_bytes: sub.sid_bytes.clone(),
-                                reply: respond.clone(),
-                                headers: headers.clone(),
-                                payload: payload.clone(),
-                            };
-                            // Non-blocking send; drop if the client is slow
-                            let _ = handle.msg_tx.send(msg);
-                        }
+                        let msg = ClientMsg {
+                            subject: subject.clone(),
+                            sid_bytes: sub.sid_bytes.clone(),
+                            reply: respond.clone(),
+                            headers: headers.clone(),
+                            payload: payload.clone(),
+                        };
+                        // Non-blocking send; drop if the client is slow
+                        let _ = sub.msg_tx.send(msg);
                     });
                 }
 
@@ -261,10 +278,15 @@ fn bytes_to_str(b: &Bytes) -> &str {
 }
 
 async fn cleanup_conn(id: u64, state: &ServerState) {
-    // Remove all subscriptions for this connection
+    // Remove all subscriptions for this connection.
+    // This also drops the msg_tx senders stored in each Subscription.
     let removed = {
         let mut subs = state.subs.write().unwrap();
-        subs.remove_conn(id)
+        let r = subs.remove_conn(id);
+        state
+            .has_subs
+            .store(!subs.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        r
     };
 
     // Update upstream interests
@@ -277,22 +299,6 @@ async fn cleanup_conn(id: u64, state: &ServerState) {
         }
     }
 
-    // Remove connection handle
-    {
-        let mut conns = state.conns.write().unwrap();
-        conns.remove(&id);
-    }
-
     info!(id, "client cleaned up");
 }
 
-/// A message to be delivered to a local client connection.
-/// Uses pre-formatted `sid_bytes` to avoid integer formatting on every write.
-#[derive(Debug)]
-pub(crate) struct ClientMsg {
-    pub subject: Bytes,
-    pub sid_bytes: Bytes,
-    pub reply: Option<Bytes>,
-    pub headers: Option<HeaderMap>,
-    pub payload: Bytes,
-}
