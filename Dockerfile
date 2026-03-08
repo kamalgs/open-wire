@@ -8,21 +8,20 @@ COPY Cargo.toml Cargo.lock ./
 
 # Create dummy source files so cargo can resolve the package
 RUN mkdir -p src && \
-    echo "fn main() {}" > src/lib.rs && \
-    mkdir -p examples && \
-    echo "fn main() {}" > examples/leaf_server.rs
+    echo "fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs
 
 # Build dependencies only (cached layer)
-RUN cargo build --release --example leaf_server 2>/dev/null || true
+RUN cargo build --release 2>/dev/null || true
 
 # Copy actual source
 COPY . .
 
 # Touch sources to invalidate the dummy builds
-RUN touch src/lib.rs examples/leaf_server.rs
+RUN touch src/main.rs src/lib.rs
 
 # Build the real binary
-RUN cargo build --release --example leaf_server
+RUN cargo build --release
 
 # Stage 2: Minimal runtime image
 FROM debian:bookworm-slim
@@ -31,10 +30,10 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/examples/leaf_server /usr/local/bin/leaf-server
+COPY --from=builder /build/target/release/open-wire /usr/local/bin/open-wire
 
 EXPOSE 4222
 EXPOSE 4223
 
-ENTRYPOINT ["leaf-server"]
+ENTRYPOINT ["open-wire"]
 CMD ["--port", "4222"]

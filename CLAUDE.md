@@ -12,6 +12,7 @@ Built with raw epoll, zero-copy parsing, and no async runtime.
 
 ```
 src/
+├── main.rs          # CLI binary (--port, --hub, --ws-port, --workers)
 ├── lib.rs           # Public API: LeafServer, LeafServerConfig
 ├── server.rs        # Accept loop, worker spawning, shutdown
 ├── worker.rs        # Per-thread epoll event loop, connection state machine
@@ -22,7 +23,6 @@ src/
 ├── websocket.rs     # HTTP upgrade handshake, WS frame codec
 └── types.rs         # ServerInfo, ConnectInfo, HeaderMap
 examples/
-├── leaf_server.rs   # CLI example (--port, --hub, --ws-port, --workers)
 └── chat/            # Sample chat app (HTML + README)
 tests/
 ├── e2e.rs           # Integration tests (requires nats-server + async-nats)
@@ -57,7 +57,6 @@ CLAUDE.md  LICENSE  NOTICE  README.md
 ```bash
 # Check
 cargo check
-cargo check --example leaf_server
 
 # Test (unit — no external deps)
 cargo test --lib
@@ -72,10 +71,10 @@ cargo +nightly fmt
 cargo clippy --all-targets -- --deny clippy::all
 
 # Build release
-cargo build --release --example leaf_server
+cargo build --release
 
 # Build release with frame pointers (for perf profiling)
-RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release --example leaf_server
+RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
 
 # Benchmarks
 cd tests && ./throughput.sh

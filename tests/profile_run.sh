@@ -13,7 +13,7 @@ MSGS=2000000
 SIZE=128
 RUST_PORT=15223
 OUTDIR="$SCRIPT_DIR/profile_results"
-BIN="$REPO_ROOT/target/release/examples/leaf_server"
+BIN="$REPO_ROOT/target/release/open-wire"
 
 mkdir -p "$OUTDIR"
 

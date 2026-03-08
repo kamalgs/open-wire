@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BIN="$REPO_ROOT/target/release/examples/leaf_server"
+BIN="$REPO_ROOT/target/release/open-wire"
 OUTDIR="$SCRIPT_DIR/profile_results"
 PORT=15225
 MSGS=3000000
@@ -53,4 +53,4 @@ kill $SRV_PID 2>/dev/null; wait $SRV_PID 2>/dev/null || true
 echo ""
 echo "=== LOCAL PUB/SUB FLAT PROFILE (self%) ==="
 perf report -i "$OUTDIR/local_pubsub_fp.perf.data" --stdio --no-children \
-    --percent-limit 0.3 2>&1 | grep -E "^\s+[0-9].*leaf_server|^\s+[0-9].*libc" | head -40
+    --percent-limit 0.3 2>&1 | grep -E "^\s+[0-9].*open.wire|^\s+[0-9].*libc" | head -40

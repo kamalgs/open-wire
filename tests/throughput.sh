@@ -89,8 +89,8 @@ echo ""
 # --- Build Rust leaf server ---
 echo "Building Rust leaf server (release)..."
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-  --release --example leaf_server 2>&1 | tail -1
-RUST_BIN="$REPO_ROOT/target/release/examples/leaf_server"
+  --release 2>&1 | tail -1
+RUST_BIN="$REPO_ROOT/target/release/open-wire"
 echo ""
 
 # --- Start hub ---

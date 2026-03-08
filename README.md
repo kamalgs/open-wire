@@ -40,16 +40,16 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the full results log.
 
 ```bash
 # Build
-cargo build --release --example leaf_server
+cargo build --release
 
 # Run standalone
-./target/release/examples/leaf_server --port 4222
+./target/release/open-wire --port 4222
 
 # Run with upstream hub
-./target/release/examples/leaf_server --port 4222 --hub nats://hub:4111
+./target/release/open-wire --port 4222 --hub nats://hub:4111
 
 # Run with WebSocket support
-./target/release/examples/leaf_server --port 4222 --ws-port 4223
+./target/release/open-wire --port 4222 --ws-port 4223
 ```
 
 ### Docker
@@ -77,7 +77,7 @@ docker run -p 4222:4222 open-wire --hub nats://hub:4111
 
 ```bash
 # Terminal 1
-./target/release/examples/leaf_server --port 4222
+./target/release/open-wire --port 4222
 
 # Terminal 2
 nats sub test.subject -s nats://localhost:4222
@@ -93,7 +93,7 @@ nats pub test.subject "hello" -s nats://localhost:4222
 nats-server -p 4111
 
 # Terminal 2 — start open-wire pointing at the hub
-./target/release/examples/leaf_server --port 4222 --hub nats://localhost:4111
+./target/release/open-wire --port 4222 --hub nats://localhost:4111
 
 # Terminal 3 — subscribe via the leaf
 nats sub "test.>" -s nats://localhost:4222

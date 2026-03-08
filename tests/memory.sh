@@ -66,7 +66,7 @@ sleep 2
 # ===================== RUST LEAF SERVER =====================
 echo
 echo "--- Rust leaf server (adaptive bufs) ---"
-"$REPO_ROOT/target/release/examples/leaf_server" --port $RUST_PORT &>/dev/null &
+"$REPO_ROOT/target/release/open-wire" --port $RUST_PORT &>/dev/null &
 RUST_PID=$!
 wait_for_port $RUST_PORT
 sleep 1

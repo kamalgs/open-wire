@@ -37,8 +37,8 @@ trap cleanup EXIT
 echo "=== Building release binary ==="
 cd "$ROOT_DIR"
 touch src/lib.rs
-cargo build --release --example leaf_server 2>&1 | tail -5
-LEAF_BIN="$ROOT_DIR/target/release/examples/leaf_server"
+cargo build --release 2>&1 | tail -5
+LEAF_BIN="$ROOT_DIR/target/release/open-wire"
 
 # Verify binary has symbols (match "not stripped" explicitly)
 if ! file "$LEAF_BIN" | grep -q "not stripped"; then

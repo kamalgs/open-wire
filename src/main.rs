@@ -1,11 +1,11 @@
-// Example: NATS Leaf Node Gateway Server
+// NATS Leaf Node Gateway Server
 //
 // Usage:
-//   cargo run --example leaf_server -- --port 4222
-//   cargo run --example leaf_server -- --port 4222 --hub nats://localhost:7422
-//   cargo run --example leaf_server -- --workers 8
-//   cargo run --example leaf_server -- --read-buf-max 32768 --write-buf-size 32768
-//   cargo run --example leaf_server -- --ws-port 8222
+//   cargo run -- --port 4222
+//   cargo run -- --port 4222 --hub nats://localhost:7422
+//   cargo run -- --workers 8
+//   cargo run -- --read-buf-max 32768 --write-buf-size 32768
+//   cargo run -- --ws-port 8222
 
 use open_wire::{LeafServer, LeafServerConfig};
 

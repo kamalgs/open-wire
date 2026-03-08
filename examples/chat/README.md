@@ -7,7 +7,7 @@ A single-file browser chat app that connects directly to the leaf node gateway v
 ### 1. Run the leaf server with WebSocket support
 
 ```bash
-cargo run --example leaf_server -- --port 4222 --ws-port 4223
+cargo run -- --port 4222 --ws-port 4223
 ```
 
 ### 2. Serve the app
