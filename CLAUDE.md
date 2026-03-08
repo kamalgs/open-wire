@@ -24,9 +24,9 @@ src/
 examples/
 ├── leaf_server.rs   # CLI example (--port, --hub, --ws-port, --workers)
 └── chat/            # Sample chat app (HTML + README)
-tests/
-└── e2e.rs           # Integration tests (requires nats-server + async-nats)
 bench/
+├── e2e.rs           # Integration tests (requires nats-server + async-nats)
+├── throughput.rs    # Criterion benchmarks
 ├── throughput.sh    # Main Rust vs Go leaf benchmark
 ├── smoke_test.sh    # Quick functional smoke test
 ├── profile.sh       # Perf profiling (pub-only, pubsub, fanout)
@@ -37,8 +37,6 @@ bench/
 ├── memory.sh        # Idle-connection memory comparison (Go vs Rust)
 ├── clients/         # Go helper binary for memory bench
 └── configs/         # nats-server configs for benchmarks
-benches/
-└── throughput.rs    # Criterion benchmarks
 docs/
 ├── architecture.md  # Detailed message flow diagrams
 ├── goals.md         # Project goals
@@ -174,7 +172,7 @@ New dependencies must have licenses allowed in `deny.toml`: MIT, Apache-2.0, ISC
 - **Imports**: Group std → external crates → crate-internal.
 - All public items should have doc comments.
 - Tests go in `#[cfg(test)] mod tests` within each source file (106 unit tests currently).
-- Integration tests in `tests/e2e.rs` use `async-nats` client against a real `nats-server`.
+- Integration tests in `bench/e2e.rs` use `async-nats` client against a real `nats-server`.
 
 ## Commit & PR Standards
 

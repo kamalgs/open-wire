@@ -21,7 +21,12 @@ tokio = { version = "1", features = ["full"] }
 
 [[bench]]
 name = "throughput"
+path = "bench/throughput.rs"
 harness = false
+
+[[test]]
+name = "e2e"
+path = "bench/e2e.rs"
 
 [profile.release]
 debug = 1
