@@ -5,7 +5,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-//! Minimal local types for NATS protocol, replacing async-nats dependency.
+//! Minimal local types for NATS protocol.
 //!
 //! Only the subset actually used by nats-server is implemented.
 

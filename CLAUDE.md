@@ -8,9 +8,6 @@ and optionally bridges traffic to an upstream NATS hub server.
 
 Built with raw epoll, zero-copy parsing, and no async runtime.
 
-> **`async-nats`** is the upstream NATS Rust client kept as a workspace member. It is used only as a
-> dev-dependency for open-wire's integration tests. Do not modify `async-nats/` unless explicitly asked.
-
 ## Repository Structure
 
 ```
@@ -55,13 +52,12 @@ open-wire/
 
 Top-level repo files:
 ```
-Cargo.toml               # Workspace: [open-wire, async-nats]
+Cargo.toml               # Workspace: [open-wire]
 Cargo.lock
 Dockerfile  .dockerignore
 .gitignore  .rustfmt.toml
 CLAUDE.md  LICENSE  NOTICE  README.md  deny.toml
 .cargo/  .claude/  .config/  .github/
-async-nats/              # Upstream NATS client (workspace member, dev-dep only)
 ```
 
 ## Build & Test Commands
@@ -176,8 +172,6 @@ New dependencies must have licenses allowed in `deny.toml`: MIT, Apache-2.0, ISC
 ## Build Environment
 
 - Using zig as C compiler/linker (no system gcc). Config in `.cargo/config.toml`.
-- Dev dependencies in `async-nats/Cargo.toml` (ring, reqwest, criterion, etc.) are disabled
-  because they require system gcc/openssl.
 - `[profile.release] debug = 1, strip = false` for perf symbol resolution.
 
 ## Code Conventions

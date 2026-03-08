@@ -12,5 +12,5 @@ Original copyright:
   Copyright 2020-2024 The NATS Authors
 
 The open-wire crate is an independent implementation that does not share
-code with async-nats. The async-nats crate is retained as a workspace
-member for use in integration tests only.
+code with async-nats. The async-nats crate is used as a dev-dependency
+from crates.io for integration tests only.

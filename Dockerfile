@@ -4,14 +4,11 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /build
 
 # Copy manifests first for dependency caching.
-# async-nats manifest is needed because Cargo.toml declares it as a workspace member.
 COPY Cargo.toml Cargo.lock ./
-COPY async-nats/Cargo.toml async-nats/Cargo.toml
 COPY open-wire/Cargo.toml open-wire/Cargo.toml
 
 # Create dummy source files so cargo can resolve the workspace
-RUN mkdir -p async-nats/src open-wire/src && \
-    echo "fn main() {}" > async-nats/src/lib.rs && \
+RUN mkdir -p open-wire/src && \
     echo "fn main() {}" > open-wire/src/lib.rs && \
     mkdir -p open-wire/examples && \
     echo "fn main() {}" > open-wire/examples/leaf_server.rs

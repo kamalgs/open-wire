@@ -14,7 +14,7 @@ serde_json = "1.0.104"
 tracing = "0.1"
 
 [dev-dependencies]
-async-nats = { path = "../async-nats", default-features = false }
+async-nats = { version = "0.46", default-features = false }
 criterion = "0.5"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
