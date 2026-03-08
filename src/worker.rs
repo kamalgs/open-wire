@@ -386,6 +386,26 @@ impl Worker {
                 }
             }
 
+            // Slow consumer detection: if pending data exceeds max_pending,
+            // disconnect the client to protect server memory.
+            let max_pending = self.state.buf_config.max_pending;
+            if max_pending > 0 {
+                let pending = match &client.transport {
+                    Transport::Raw => client.write_buf.len(),
+                    Transport::WebSocket { ws_out, .. } => client.write_buf.len() + ws_out.len(),
+                };
+                if pending > max_pending {
+                    warn!(
+                        conn_id = *conn_id,
+                        pending_bytes = pending,
+                        max = max_pending,
+                        "slow consumer, disconnecting"
+                    );
+                    to_remove.push(*conn_id);
+                    continue;
+                }
+            }
+
             // For WebSocket: encode write_buf into ws_out, then write ws_out
             let (write_ptr, write_len) = match &mut client.transport {
                 Transport::Raw => (client.write_buf.as_ptr(), client.write_buf.len()),

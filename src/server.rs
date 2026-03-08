@@ -127,6 +127,9 @@ pub struct LeafServerConfig {
     /// Optional WebSocket port. When set, a second listener accepts WebSocket
     /// connections on this port (NATS protocol over WebSocket binary frames).
     pub ws_port: Option<u16>,
+    /// Maximum pending write bytes per connection before disconnecting as a
+    /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
+    pub max_pending: usize,
     /// Client authentication configuration.
     pub client_auth: ClientAuth,
     /// Credentials for connecting to the upstream hub.
@@ -147,6 +150,7 @@ impl Default for LeafServerConfig {
             write_buf_capacity: 65536,
             workers,
             ws_port: None,
+            max_pending: 64 * 1024 * 1024,
             client_auth: ClientAuth::None,
             hub_credentials: None,
         }
@@ -224,6 +228,7 @@ impl LeafServer {
         let buf_config = BufConfig {
             max_read_buf: config.max_read_buf_capacity,
             write_buf: config.write_buf_capacity,
+            max_pending: config.max_pending,
         };
 
         let auth = config.client_auth.clone();

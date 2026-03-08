@@ -43,6 +43,9 @@ const SHORTS_TO_SHRINK: u8 = 2;
 pub(crate) struct BufConfig {
     pub max_read_buf: usize,
     pub write_buf: usize,
+    /// Maximum pending write bytes per connection before disconnecting as slow consumer.
+    /// 0 means unlimited.
+    pub max_pending: usize,
 }
 
 impl Default for BufConfig {
@@ -50,6 +53,7 @@ impl Default for BufConfig {
         Self {
             max_read_buf: DEFAULT_MAX_BUF,
             write_buf: DEFAULT_MAX_BUF,
+            max_pending: 64 * 1024 * 1024,
         }
     }
 }
