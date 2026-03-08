@@ -29,7 +29,7 @@ fail() { echo "  FAIL: $1"; exit 1; }
 # Build
 echo "Building Rust leaf (release)..."
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-  -p nats-server --release --example leaf_server 2>&1 | tail -1
+  -p open-wire --release --example leaf_server 2>&1 | tail -1
 RUST_BIN="$REPO_ROOT/target/release/examples/leaf_server"
 
 # Start servers

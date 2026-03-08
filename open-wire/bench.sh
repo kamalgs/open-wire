@@ -17,7 +17,7 @@
 #   - cargo (Rust toolchain)
 #
 # Usage:
-#   cd nats-server && ./bench.sh
+#   cd open-wire && ./bench.sh
 #   ./bench.sh --msgs 500000 --size 256 --runs 2
 
 set -euo pipefail
@@ -89,7 +89,7 @@ echo ""
 # --- Build Rust leaf server ---
 echo "Building Rust leaf server (release)..."
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-  -p nats-server --release --example leaf_server 2>&1 | tail -1
+  -p open-wire --release --example leaf_server 2>&1 | tail -1
 RUST_BIN="$REPO_ROOT/target/release/examples/leaf_server"
 echo ""
 

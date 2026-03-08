@@ -7,7 +7,7 @@
 //   cargo run --example leaf_server -- --read-buf-max 32768 --write-buf-size 32768
 //   cargo run --example leaf_server -- --ws-port 8222
 
-use nats_server::{LeafServer, LeafServerConfig};
+use open_wire::{LeafServer, LeafServerConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing if tracing-subscriber is available

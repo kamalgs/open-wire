@@ -114,12 +114,9 @@ fn base64_encode(data: &[u8]) -> String {
 
 // ---- WebSocket upgrade handshake ----
 
-/// Standard RFC 6455 WebSocket GUID.
-const WS_MAGIC_RFC: &str = "258EAFA5-E914-47DA-95CA-5AB5AA286740";
-
 /// NATS-specific WebSocket GUID used by the Go nats.go client library.
 /// The NATS client validates the Sec-WebSocket-Accept header against this GUID
-/// instead of the standard RFC 6455 GUID.
+/// instead of the standard RFC 6455 GUID (`258EAFA5-E914-47DA-95CA-5AB5AA286740`).
 const WS_MAGIC_NATS: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Parsed WebSocket upgrade request.

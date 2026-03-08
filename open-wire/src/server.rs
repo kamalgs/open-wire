@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use tracing::{error, info};
 
-use async_nats::ServerInfo;
+use crate::types::ServerInfo;
 
 use crate::protocol::BufConfig;
 use crate::sub_list::SubList;

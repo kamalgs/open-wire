@@ -39,7 +39,6 @@ Ideas to explore, roughly categorised. Nothing here is committed.
 
 ## Platform
 
-- **kqueue (macOS)** — implement a kqueue backend alongside epoll.
-- **Cross-platform abstraction** — trait-based I/O reactor that dispatches to
-  epoll, kqueue, or IOCP at compile time.
-- **WASI / embedded** — explore no_std or WASI targets for edge deployment.
+- **Cross-platform portability** — run on any OS/arch, from Raspberry Pi to
+  CDN edge. Extract a reactor trait, add poll()/kqueue/IOCP/WASI backends.
+  See [portability.md](portability.md) for the full design direction.

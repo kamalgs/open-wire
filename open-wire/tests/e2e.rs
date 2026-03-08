@@ -15,7 +15,7 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use nats_server::{LeafServer, LeafServerConfig};
+use open_wire::{LeafServer, LeafServerConfig};
 use tokio::time::timeout;
 
 /// Find a free TCP port by binding to :0.

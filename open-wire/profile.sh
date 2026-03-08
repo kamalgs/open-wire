@@ -36,8 +36,8 @@ trap cleanup EXIT
 # Build release binary with debug symbols (touch to force rebuild)
 echo "=== Building release binary ==="
 cd "$ROOT_DIR"
-touch nats-server/src/lib.rs
-cargo build --release -p nats-server --example leaf_server 2>&1 | tail -5
+touch open-wire/src/lib.rs
+cargo build --release -p open-wire --example leaf_server 2>&1 | tail -5
 LEAF_BIN="$ROOT_DIR/target/release/examples/leaf_server"
 
 # Verify binary has symbols (match "not stripped" explicitly)

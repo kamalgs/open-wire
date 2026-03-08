@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
 
-use async_nats::header::HeaderMap;
+use crate::types::HeaderMap;
 
 use crate::nats_proto::MsgBuilder;
 
@@ -517,14 +517,10 @@ mod tests {
 
     #[test]
     fn test_direct_writer_formats_hmsg_with_headers() {
-        use async_nats::header::{HeaderName, IntoHeaderValue};
         let writer = DirectWriter::new_dummy();
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("X-Key"),
-            "val".into_header_value(),
-        );
+        headers.insert("X-Key", "val".into());
 
         writer.write_msg(b"test.sub", b"1", None, Some(&headers), b"data");
 

@@ -3,7 +3,7 @@
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
-use nats_server::sub_list::{subject_matches, SubList};
+use open_wire::sub_list::{subject_matches, SubList};
 
 fn bench_subject_matches(c: &mut Criterion) {
     let mut group = c.benchmark_group("subject_matches");
@@ -28,7 +28,7 @@ fn bench_subject_matches(c: &mut Criterion) {
 }
 
 fn bench_sublist_match(c: &mut Criterion) {
-    use nats_server::sub_list::Subscription;
+    use open_wire::sub_list::Subscription;
 
     let mut group = c.benchmark_group("sublist_match");
 
@@ -60,7 +60,7 @@ fn bench_sublist_match(c: &mut Criterion) {
 }
 
 fn bench_publish_local(c: &mut Criterion) {
-    use nats_server::sub_list::Subscription;
+    use open_wire::sub_list::Subscription;
     use std::sync::{Arc, RwLock};
 
     let mut group = c.benchmark_group("publish_local");
@@ -89,7 +89,7 @@ fn bench_publish_local(c: &mut Criterion) {
 mod proto_bench {
     use bytes::BytesMut;
     use criterion::{Criterion, Throughput};
-    use nats_server::nats_proto;
+    use open_wire::nats_proto;
 
     /// Bench parsing a single PUB + payload from a BytesMut buffer.
     pub fn bench_parse_pub(c: &mut Criterion) {

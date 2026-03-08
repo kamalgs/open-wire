@@ -1,20 +1,23 @@
 [package]
-name = "nats-server"
+name = "open-wire"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-async-nats = { path = "../async-nats", default-features = false, features = ["server_2_10", "server_2_11", "server_2_12"] }
 bytes = "1.4.0"
 libc = "0.2"
 memchr = "2.4"
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.104"
 tracing = "0.1"
 
 [dev-dependencies]
+async-nats = { path = "../async-nats", default-features = false }
 criterion = "0.5"
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }
 
 [[bench]]
 name = "throughput"

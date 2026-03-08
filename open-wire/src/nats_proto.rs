@@ -27,8 +27,7 @@
 use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 
-use async_nats::header::{HeaderMap, HeaderName, IntoHeaderValue};
-use async_nats::{ConnectInfo, ServerInfo};
+use crate::types::{ConnectInfo, HeaderMap, ServerInfo};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Itoa: pre-computed decimal byte strings for small integers.
@@ -837,8 +836,6 @@ fn leaf_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
 // ────────────────────────────────────────────────────────────────────────────
 
 pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
-    use std::str::FromStr;
-
     let text = std::str::from_utf8(data)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "header isn't valid utf-8"))?;
 
@@ -857,14 +854,12 @@ pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
         let (name, value) = line.split_once(':').ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "invalid header line")
         })?;
-        let name = HeaderName::from_str(name)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         let mut value = value.trim_start().to_owned();
         while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
             value.push_str(v);
         }
         value.truncate(value.trim_end().len());
-        headers.append(name, value.into_header_value());
+        headers.append(name, value);
     }
 
     Ok(headers)

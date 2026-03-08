@@ -20,6 +20,7 @@ pub mod nats_proto;
 pub(crate) mod protocol;
 pub mod server;
 pub mod sub_list;
+pub mod types;
 pub(crate) mod upstream;
 pub(crate) mod websocket;
 pub(crate) mod worker;

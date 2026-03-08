@@ -73,11 +73,11 @@ jobs:
           cargo test --features slow_tests,websockets -- --nocapture
       # TLS and version-specific tests are now run in parallel in a separate job
 
-  nats_server_tests:
+  open_wire_tests:
     defaults:
       run:
-        working-directory: ./nats-server
-    name: nats-server tests (ubuntu-latest / stable)
+        working-directory: ./open-wire
+    name: open-wire tests (ubuntu-latest / stable)
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -99,7 +99,7 @@ jobs:
         with:
           shared-key: ${{ runner.os }}-${{ steps.install-rust.outputs.cachekey }}-${{ hashFiles('**/Cargo.toml') }}
           cache-on-failure: true
-      - name: Run nats-server tests
+      - name: Run open-wire tests
         env:
           RUST_BACKTRACE: 1
         run: |

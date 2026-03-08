@@ -53,7 +53,7 @@ nats.rs/
 │   │   └── ...
 │   ├── examples/        # Runnable examples
 │   └── benches/         # Criterion benchmarks
-├── nats-server/         # Test harness — launches real nats-server instances
+├── open-wire/           # NATS-compatible message relay (leaf node server)
 ├── nats/                # DEPRECATED sync client — do not modify
 └── nats-core/           # Experimental embedded/no_std client (separate)
 ```

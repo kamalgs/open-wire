@@ -13,7 +13,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tracing::{debug, error, warn};
 
-use async_nats::header::HeaderMap;
+use crate::types::HeaderMap;
 
 use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter};
 use crate::server::ServerState;

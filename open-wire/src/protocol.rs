@@ -12,8 +12,7 @@ use std::os::fd::RawFd;
 
 use bytes::{BufMut, BytesMut};
 
-use async_nats::header::HeaderMap;
-use async_nats::ServerInfo;
+use crate::types::{HeaderMap, ServerInfo};
 
 use crate::nats_proto::{self, MsgBuilder};
 
