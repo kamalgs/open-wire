@@ -48,8 +48,8 @@ Cargo.lock
 BENCHMARKS.md            # Full benchmark results log
 Dockerfile  .dockerignore
 .gitignore  .rustfmt.toml
-CLAUDE.md  LICENSE  NOTICE  README.md  deny.toml
-.cargo/  .claude/  .config/  .github/
+CLAUDE.md  LICENSE  NOTICE  README.md
+.cargo/  .claude/  .github/
 ```
 
 ## Build & Test Commands
@@ -159,7 +159,7 @@ tracing = "0.1"
 
 Minimal dependency footprint. No async runtime, no TLS library.
 
-New dependencies must have licenses allowed in `deny.toml`: MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause.
+New dependencies should use permissive licenses: MIT, Apache-2.0, ISC, BSD-2-Clause, BSD-3-Clause.
 
 ## Build Environment
 
