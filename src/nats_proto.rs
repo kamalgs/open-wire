@@ -1054,6 +1054,28 @@ impl MsgBuilder {
         self.buf.extend_from_slice(b"\r\n");
         &self.buf
     }
+
+    /// Build `LS+ subject queue\r\n` for queue group subscriptions.
+    pub fn build_leaf_sub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(b"LS+ ");
+        self.buf.extend_from_slice(subject);
+        self.buf.extend_from_slice(b" ");
+        self.buf.extend_from_slice(queue);
+        self.buf.extend_from_slice(b"\r\n");
+        &self.buf
+    }
+
+    /// Build `LS- subject queue\r\n` for queue group unsubscriptions.
+    pub fn build_leaf_unsub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(b"LS- ");
+        self.buf.extend_from_slice(subject);
+        self.buf.extend_from_slice(b" ");
+        self.buf.extend_from_slice(queue);
+        self.buf.extend_from_slice(b"\r\n");
+        &self.buf
+    }
 }
 
 /// Pre-format a `u64` sid as decimal ASCII bytes for reuse in MSG lines.
@@ -1559,6 +1581,24 @@ mod tests {
     fn test_build_leaf_unsub() {
         let mut b = MsgBuilder::new();
         assert_eq!(b.build_leaf_unsub(b"foo.>"), b"LS- foo.>\r\n");
+    }
+
+    #[test]
+    fn test_build_leaf_sub_queue() {
+        let mut b = MsgBuilder::new();
+        assert_eq!(
+            b.build_leaf_sub_queue(b"foo.bar", b"myqueue"),
+            b"LS+ foo.bar myqueue\r\n"
+        );
+    }
+
+    #[test]
+    fn test_build_leaf_unsub_queue() {
+        let mut b = MsgBuilder::new();
+        assert_eq!(
+            b.build_leaf_unsub_queue(b"foo.bar", b"myqueue"),
+            b"LS- foo.bar myqueue\r\n"
+        );
     }
 
     #[test]

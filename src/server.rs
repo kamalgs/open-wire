@@ -5,13 +5,15 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
+use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::types::{ConnectInfo, ServerInfo};
 
@@ -141,6 +143,10 @@ pub struct LeafServerConfig {
     pub hub_credentials: Option<HubCredentials>,
     /// Port for Prometheus metrics HTTP endpoint. `None` = disabled.
     pub metrics_port: Option<u16>,
+    /// Path to TLS certificate file (PEM). When set with `tls_key`, enables TLS.
+    pub tls_cert: Option<PathBuf>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for LeafServerConfig {
@@ -163,6 +169,8 @@ impl Default for LeafServerConfig {
             client_auth: ClientAuth::None,
             hub_credentials: None,
             metrics_port: None,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -175,6 +183,29 @@ fn install_metrics_exporter(port: u16) -> Result<(), Box<dyn std::error::Error>>
     let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     builder.with_http_listener(([0, 0, 0, 0], port)).install()?;
     Ok(())
+}
+
+/// Build a rustls `ServerConfig` from PEM cert and key files.
+pub(crate) fn build_tls_server_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> io::Result<Arc<rustls::ServerConfig>> {
+    use rustls_pemfile::{certs, private_key};
+
+    let cert_file = &mut io::BufReader::new(std::fs::File::open(cert_path)?);
+    let key_file = &mut io::BufReader::new(std::fs::File::open(key_path)?);
+
+    let cert_chain: Vec<rustls_pki_types::CertificateDer<'static>> =
+        certs(cert_file).collect::<Result<Vec<_>, _>>()?;
+    let key = private_key(key_file)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key found"))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS config: {e}")))?;
+
+    Ok(Arc::new(config))
 }
 
 /// Shared server state accessible by all client connections.
@@ -194,6 +225,8 @@ pub(crate) struct ServerState {
     pub has_subs: AtomicBool,
     pub buf_config: BufConfig,
     next_cid: AtomicU64,
+    /// TLS configuration for client connections. `None` = plaintext.
+    pub tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl ServerState {
@@ -203,6 +236,7 @@ impl ServerState {
         ping_interval: std::time::Duration,
         max_pings_outstanding: u32,
         buf_config: BufConfig,
+        tls_config: Option<Arc<rustls::ServerConfig>>,
     ) -> Self {
         Self {
             info,
@@ -215,6 +249,7 @@ impl ServerState {
             has_subs: AtomicBool::new(false),
             buf_config,
             next_cid: AtomicU64::new(1),
+            tls_config,
         }
     }
 
@@ -241,6 +276,13 @@ impl LeafServer {
             String::new()
         };
 
+        let tls_config = match (&config.tls_cert, &config.tls_key) {
+            (Some(cert), Some(key)) => {
+                Some(build_tls_server_config(cert, key).expect("failed to load TLS cert/key"))
+            }
+            _ => None,
+        };
+
         let info = ServerInfo {
             server_id: format!("LEAF_{}", rand::random::<u32>()),
             server_name: config.server_name.clone(),
@@ -251,6 +293,7 @@ impl LeafServer {
             host: config.host.clone(),
             port: config.port,
             auth_required: config.client_auth.is_required(),
+            tls_required: tls_config.is_some(),
             nonce,
             ..Default::default()
         };
@@ -270,14 +313,18 @@ impl LeafServer {
                 config.ping_interval,
                 config.max_pings_outstanding,
                 buf_config,
+                tls_config,
             )),
         }
     }
 
     /// Connect to the upstream hub if configured, using the leaf node protocol.
-    fn connect_upstream(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// Uses a supervisor pattern: initial failure is non-fatal, the supervisor
+    /// will keep retrying with exponential backoff.
+    fn connect_upstream(&self) {
         if let Some(ref hub_url) = self.config.hub_url {
             info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
+            // Try initial connect synchronously for fast startup
             match Upstream::connect(
                 hub_url,
                 self.config.hub_credentials.as_ref(),
@@ -290,12 +337,19 @@ impl LeafServer {
                     info!("connected to upstream hub");
                 }
                 Err(e) => {
-                    error!(error = %e, "failed to connect to upstream hub");
-                    return Err(e);
+                    // Initial connect failed — spawn supervisor to keep retrying
+                    warn!(error = %e, "initial hub connection failed, will retry in background");
+                    let upstream = Upstream::spawn_supervisor(
+                        hub_url.clone(),
+                        self.config.hub_credentials.clone(),
+                        Arc::clone(&self.state),
+                    );
+                    let sender = upstream.sender();
+                    *self.state.upstream.write().unwrap() = Some(upstream);
+                    *self.state.upstream_tx.write().unwrap() = Some(sender);
                 }
             }
         }
-        Ok(())
     }
 
     /// Spawn N worker threads and return their handles.
@@ -330,7 +384,7 @@ impl LeafServer {
             info!(port, "prometheus metrics endpoint listening");
         }
 
-        self.connect_upstream()?;
+        self.connect_upstream();
 
         let workers = self.spawn_workers();
         let mut next_worker = 0usize;
@@ -414,7 +468,7 @@ impl LeafServer {
             info!(port, "prometheus metrics endpoint listening");
         }
 
-        self.connect_upstream()?;
+        self.connect_upstream();
 
         let workers = self.spawn_workers();
         let mut next_worker = 0usize;

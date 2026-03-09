@@ -12,7 +12,7 @@
 //! connections on the same worker costs 1 eventfd write, not 100.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +20,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
@@ -30,6 +30,8 @@ use crate::server::ServerState;
 use crate::sub_list::{create_eventfd, DirectWriter, Subscription};
 use crate::upstream::UpstreamCmd;
 use crate::websocket::{self, DecodeStatus, WsCodec};
+
+use rustls::ServerConnection;
 
 /// Sentinel key in epoll_event.u64 for the worker's eventfd.
 const EVENT_FD_KEY: u64 = 0;
@@ -85,6 +87,8 @@ impl WorkerHandle {
 // --- Connection state machine ---
 
 enum ConnPhase {
+    /// TLS: handshake in progress.
+    TlsHandshake,
     /// WebSocket: waiting for HTTP upgrade request.
     WsHandshake,
     /// INFO queued in write_buf, waiting to be flushed.
@@ -107,6 +111,17 @@ enum Transport {
         /// Encoded WebSocket frames ready to write to the socket.
         ws_out: BytesMut,
     },
+    /// TLS — NATS protocol over encrypted transport using rustls.
+    Tls(Box<TlsTransport>),
+}
+
+/// TLS transport state (boxed to keep `Transport` enum small).
+struct TlsTransport {
+    tls_conn: ServerConnection,
+    /// Encrypted bytes read from socket, pending TLS processing.
+    enc_in: BytesMut,
+    /// Encrypted bytes ready to write to socket.
+    enc_out: BytesMut,
 }
 
 struct ClientState {
@@ -356,6 +371,19 @@ impl Worker {
                 },
                 BytesMut::with_capacity(4096),
             )
+        } else if let Some(ref tls_config) = self.state.tls_config {
+            // TLS: perform handshake before sending INFO
+            let tls_conn = ServerConnection::new(Arc::clone(tls_config))
+                .expect("failed to create TLS connection");
+            (
+                ConnPhase::TlsHandshake,
+                Transport::Tls(Box::new(TlsTransport {
+                    tls_conn,
+                    enc_in: BytesMut::with_capacity(8192),
+                    enc_out: BytesMut::with_capacity(8192),
+                })),
+                BytesMut::with_capacity(4096),
+            )
         } else {
             // Raw TCP: send INFO immediately
             let mut wb = BytesMut::with_capacity(4096);
@@ -441,6 +469,7 @@ impl Worker {
                 let pending = match &client.transport {
                     Transport::Raw => client.write_buf.len(),
                     Transport::WebSocket { ws_out, .. } => client.write_buf.len() + ws_out.len(),
+                    Transport::Tls(ref tls) => client.write_buf.len() + tls.enc_out.len(),
                 };
                 if pending > max_pending {
                     warn!(
@@ -456,6 +485,23 @@ impl Worker {
                 }
             }
 
+            // For TLS: encrypt write_buf into enc_out, then write enc_out
+            if let Transport::Tls(ref mut tls) = &mut client.transport {
+                if !client.write_buf.is_empty() {
+                    let _ = tls.tls_conn.writer().write_all(&client.write_buf);
+                    client.write_buf.clear();
+                }
+                // Extract encrypted records
+                loop {
+                    let mut tmp = [0u8; 8192];
+                    match tls.tls_conn.write_tls(&mut io::Cursor::new(&mut tmp[..])) {
+                        Ok(0) => break,
+                        Ok(n) => tls.enc_out.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+            }
+
             // For WebSocket: encode write_buf into ws_out, then write ws_out
             let (write_ptr, write_len) = match &mut client.transport {
                 Transport::Raw => (client.write_buf.as_ptr(), client.write_buf.len()),
@@ -466,6 +512,7 @@ impl Worker {
                     }
                     (ws_out.as_ptr(), ws_out.len())
                 }
+                Transport::Tls(ref tls) => (tls.enc_out.as_ptr(), tls.enc_out.len()),
             };
 
             // Inline flush
@@ -503,6 +550,9 @@ impl Worker {
                 Transport::WebSocket { ws_out, .. } => {
                     ws_out.advance(written_total);
                 }
+                Transport::Tls(ref mut tls) => {
+                    tls.enc_out.advance(written_total);
+                }
             }
 
             if error {
@@ -513,6 +563,7 @@ impl Worker {
             let is_empty = match &client.transport {
                 Transport::Raw => client.write_buf.is_empty(),
                 Transport::WebSocket { ws_out, .. } => ws_out.is_empty(),
+                Transport::Tls(ref tls) => tls.enc_out.is_empty(),
             };
             if is_empty && client.epoll_has_out {
                 epoll_mod(epoll_fd, client.fd, *conn_id, false);
@@ -600,7 +651,27 @@ impl Worker {
 
     /// Try to flush write_buf to the socket. Registers/removes EPOLLOUT as needed.
     /// For WebSocket connections, write_buf is encoded into ws_out first.
+    /// For TLS connections, delegates to tls_flush_encrypted.
     fn try_flush_conn(&mut self, conn_id: u64) {
+        // TLS connections use their own flush path
+        if matches!(
+            self.conns.get(&conn_id).map(|c| &c.transport),
+            Some(Transport::Tls(..))
+        ) {
+            self.tls_flush_encrypted(conn_id);
+            // Phase transition: SendInfo → WaitConnect
+            if let Some(client) = self.conns.get_mut(&conn_id) {
+                if matches!(client.phase, ConnPhase::SendInfo) {
+                    if let Transport::Tls(ref tls) = client.transport {
+                        if tls.enc_out.is_empty() {
+                            client.phase = ConnPhase::WaitConnect;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         let epoll_fd = self.epoll_fd.as_raw_fd();
 
         let client = match self.conns.get_mut(&conn_id) {
@@ -667,15 +738,16 @@ impl Worker {
     }
 
     fn handle_read(&mut self, conn_id: u64) {
-        let is_ws = matches!(
-            self.conns.get(&conn_id).map(|c| &c.transport),
-            Some(Transport::WebSocket { .. })
-        );
+        let transport_type = match self.conns.get(&conn_id).map(|c| &c.transport) {
+            Some(Transport::WebSocket { .. }) => 1,
+            Some(Transport::Tls(..)) => 2,
+            _ => 0,
+        };
 
-        if is_ws {
-            self.handle_read_ws(conn_id);
-        } else {
-            self.handle_read_raw(conn_id);
+        match transport_type {
+            1 => self.handle_read_ws(conn_id),
+            2 => self.handle_read_tls(conn_id),
+            _ => self.handle_read_raw(conn_id),
         }
     }
 
@@ -824,10 +896,177 @@ impl Worker {
         self.flush_notifications();
     }
 
+    fn handle_read_tls(&mut self, conn_id: u64) {
+        // Read encrypted bytes from socket
+        loop {
+            let client = match self.conns.get_mut(&conn_id) {
+                Some(c) => c,
+                None => return,
+            };
+            let tls = if let Transport::Tls(ref mut tls) = client.transport {
+                tls
+            } else {
+                return;
+            };
+            tls.enc_in.reserve(8192);
+            let spare = tls.enc_in.spare_capacity_mut();
+            let n = unsafe {
+                libc::read(
+                    client.fd,
+                    spare.as_mut_ptr() as *mut libc::c_void,
+                    spare.len(),
+                )
+            };
+            if n == 0 {
+                self.remove_conn(conn_id);
+                return;
+            }
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                self.remove_conn(conn_id);
+                return;
+            }
+            unsafe { tls.enc_in.set_len(tls.enc_in.len() + n as usize) };
+        }
+
+        // Feed encrypted data to TLS and extract plaintext
+        let mut error = false;
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if let Transport::Tls(ref mut tls) = client.transport {
+                // Feed encrypted data to rustls
+                loop {
+                    if tls.enc_in.is_empty() {
+                        break;
+                    }
+                    match tls.tls_conn.read_tls(&mut io::Cursor::new(&tls.enc_in[..])) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            tls.enc_in.advance(n);
+                        }
+                        Err(e) => {
+                            warn!(conn_id, error = %e, "TLS read_tls error");
+                            error = true;
+                            break;
+                        }
+                    }
+                }
+
+                if !error {
+                    // Process TLS state (handshake / app data)
+                    match tls.tls_conn.process_new_packets() {
+                        Ok(state) => {
+                            // Extract plaintext
+                            if state.plaintext_bytes_to_read() > 0 {
+                                let n = state.plaintext_bytes_to_read();
+                                client.read_buf.reserve(n);
+                                let chunk = client.read_buf.chunk_mut();
+                                let buf = unsafe {
+                                    std::slice::from_raw_parts_mut(chunk.as_mut_ptr(), chunk.len())
+                                };
+                                match tls.tls_conn.reader().read(buf) {
+                                    Ok(read) => {
+                                        unsafe { client.read_buf.advance_mut(read) };
+                                    }
+                                    Err(e) => {
+                                        warn!(conn_id, error = %e, "TLS plaintext read error");
+                                        error = true;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(conn_id, error = %e, "TLS process error");
+                            error = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if error {
+            // Try to write any TLS alert before disconnecting
+            self.tls_flush_encrypted(conn_id);
+            self.remove_conn(conn_id);
+            return;
+        }
+
+        // Flush any TLS handshake/alert data
+        self.tls_flush_encrypted(conn_id);
+
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            client.last_activity = Instant::now();
+        }
+        self.process_read_buf(conn_id);
+        self.flush_notifications();
+    }
+
+    /// Encrypt pending write_buf data via TLS and flush encrypted output to socket.
+    fn tls_flush_encrypted(&mut self, conn_id: u64) {
+        let epoll_fd = self.epoll_fd.as_raw_fd();
+        let client = match self.conns.get_mut(&conn_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        if let Transport::Tls(ref mut tls) = client.transport {
+            // Encrypt pending plaintext writes
+            if !client.write_buf.is_empty() {
+                if let Err(e) = tls.tls_conn.writer().write_all(&client.write_buf) {
+                    warn!(conn_id, error = %e, "TLS write error");
+                }
+                client.write_buf.clear();
+            }
+
+            // Extract encrypted TLS records to enc_out
+            loop {
+                let mut tmp = [0u8; 8192];
+                match tls.tls_conn.write_tls(&mut io::Cursor::new(&mut tmp[..])) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tls.enc_out.extend_from_slice(&tmp[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // Write enc_out to socket
+            while !tls.enc_out.is_empty() {
+                let n = unsafe {
+                    libc::write(
+                        client.fd,
+                        tls.enc_out.as_ptr() as *const libc::c_void,
+                        tls.enc_out.len(),
+                    )
+                };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        if !client.epoll_has_out {
+                            epoll_mod(epoll_fd, client.fd, conn_id, true);
+                            client.epoll_has_out = true;
+                        }
+                        return;
+                    }
+                    return;
+                }
+                tls.enc_out.advance(n as usize);
+            }
+
+            if tls.enc_out.is_empty() && client.epoll_has_out {
+                epoll_mod(epoll_fd, client.fd, conn_id, false);
+                client.epoll_has_out = false;
+            }
+        }
+    }
+
     fn process_read_buf(&mut self, conn_id: u64) {
         loop {
             let phase = match self.conns.get(&conn_id) {
                 Some(c) => match c.phase {
+                    ConnPhase::TlsHandshake => 3,
                     ConnPhase::WsHandshake => 0,
                     ConnPhase::SendInfo => return,
                     ConnPhase::WaitConnect => 1,
@@ -835,6 +1074,44 @@ impl Worker {
                 },
                 None => return,
             };
+
+            if phase == 3 {
+                // TlsHandshake: check if handshake is complete
+                let handshake_done = match self.conns.get(&conn_id) {
+                    Some(c) => {
+                        if let Transport::Tls(ref tls) = c.transport {
+                            !tls.tls_conn.is_handshaking()
+                        } else {
+                            false
+                        }
+                    }
+                    None => return,
+                };
+                if handshake_done {
+                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    // Queue INFO in write_buf (will be encrypted by tls_flush_encrypted)
+                    client.write_buf.extend_from_slice(&self.info_line);
+                    client.phase = ConnPhase::SendInfo;
+                    self.tls_flush_encrypted(conn_id);
+                    // Check if all encrypted data was flushed
+                    let flushed = match self.conns.get(&conn_id) {
+                        Some(c) => {
+                            if let Transport::Tls(ref tls) = c.transport {
+                                tls.enc_out.is_empty()
+                            } else {
+                                true
+                            }
+                        }
+                        None => return,
+                    };
+                    if flushed {
+                        if let Some(c) = self.conns.get_mut(&conn_id) {
+                            c.phase = ConnPhase::WaitConnect;
+                        }
+                    }
+                }
+                return;
+            }
 
             if phase == 0 {
                 // WsHandshake: parse HTTP upgrade request
@@ -1007,6 +1284,9 @@ impl Worker {
                     None => return Ok(()),
                 };
 
+                // Clone for upstream before moving into Subscription
+                let upstream_queue = queue_str.clone();
+
                 let sub = Subscription {
                     conn_id,
                     sid,
@@ -1025,7 +1305,7 @@ impl Worker {
                 {
                     let mut upstream = self.state.upstream.write().unwrap();
                     if let Some(ref mut up) = *upstream {
-                        if let Err(e) = up.add_interest(subject_str.to_string()) {
+                        if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue) {
                             warn!(error = %e, "failed to add upstream interest");
                         }
                     }
@@ -1048,10 +1328,10 @@ impl Worker {
                     r
                 };
 
-                if let Some(removed) = removed {
+                if let Some(ref removed) = removed {
                     let mut upstream = self.state.upstream.write().unwrap();
                     if let Some(ref mut up) = *upstream {
-                        up.remove_interest(&removed.subject);
+                        up.remove_interest(&removed.subject, removed.queue.as_deref());
                     }
                     gauge!(
                         "subscriptions_active",
@@ -1115,13 +1395,19 @@ impl Worker {
 
                 let upstream_tx = self.conns.get(&conn_id).and_then(|c| c.upstream_tx.clone());
                 if let Some(ref tx) = upstream_tx {
-                    if let Err(e) = tx.send(UpstreamCmd::Publish {
-                        subject,
-                        reply: respond,
-                        headers,
-                        payload,
-                    }) {
-                        warn!(error = %e, "failed to forward publish to upstream");
+                    if tx
+                        .send(UpstreamCmd::Publish {
+                            subject,
+                            reply: respond,
+                            headers,
+                            payload,
+                        })
+                        .is_err()
+                    {
+                        // Writer thread gone — refresh from global state (may have reconnected)
+                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                            client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                        }
                     }
                 }
             }
@@ -1169,7 +1455,7 @@ fn cleanup_conn(id: u64, state: &ServerState) {
         let mut upstream = state.upstream.write().unwrap();
         if let Some(ref mut up) = *upstream {
             for sub in &removed {
-                up.remove_interest(&sub.subject);
+                up.remove_interest(&sub.subject, sub.queue.as_deref());
             }
         }
     }

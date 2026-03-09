@@ -449,6 +449,12 @@ impl LeafConn {
         self.stream.write_all(line.as_bytes())
     }
 
+    /// Send LS+ with queue group to the hub.
+    pub(crate) fn send_leaf_sub_queue(&mut self, subject: &str, queue: &str) -> io::Result<()> {
+        let line = format!("LS+ {subject} {queue}\r\n");
+        self.stream.write_all(line.as_bytes())
+    }
+
     /// Flush buffered writes to the wire.
     pub(crate) fn flush(&mut self) -> io::Result<()> {
         self.stream.flush()
@@ -504,6 +510,18 @@ impl LeafWriter {
     /// Send LS- unsubscribe to the hub.
     pub(crate) fn send_leaf_unsub(&mut self, subject: &[u8]) -> io::Result<()> {
         let data = self.msg_builder.build_leaf_unsub(subject);
+        self.writer.write_all(data)
+    }
+
+    /// Send LS+ with queue group to the hub.
+    pub(crate) fn send_leaf_sub_queue(&mut self, subject: &[u8], queue: &[u8]) -> io::Result<()> {
+        let data = self.msg_builder.build_leaf_sub_queue(subject, queue);
+        self.writer.write_all(data)
+    }
+
+    /// Send LS- with queue group to the hub.
+    pub(crate) fn send_leaf_unsub_queue(&mut self, subject: &[u8], queue: &[u8]) -> io::Result<()> {
+        let data = self.msg_builder.build_leaf_unsub_queue(subject, queue);
         self.writer.write_all(data)
     }
 

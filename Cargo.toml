@@ -19,6 +19,10 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 nkeys = { version = "0.4", default-features = false }
 data-encoding = "2"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+webpki-roots = "0.26"
 
 [dev-dependencies]
 async-nats = { version = "0.46", default-features = false }

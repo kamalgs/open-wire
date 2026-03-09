@@ -104,6 +104,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.metrics_port = Some(args[i].parse().expect("invalid metrics-port"));
             }
+            "--tls-cert" => {
+                i += 1;
+                config.tls_cert = Some(std::path::PathBuf::from(&args[i]));
+            }
+            "--tls-key" => {
+                i += 1;
+                config.tls_key = Some(std::path::PathBuf::from(&args[i]));
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
@@ -112,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
                      [--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
                      [--hub-token TOKEN] [--hub-creds PATH] \
-                     [--metrics-port PORT]"
+                     [--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH]"
                 );
                 std::process::exit(1);
             }
