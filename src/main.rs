@@ -7,9 +7,34 @@
 //   cargo run -- --read-buf-max 32768 --write-buf-size 32768
 //   cargo run -- --ws-port 8222
 
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::Arc;
+
 use tracing_subscriber::EnvFilter;
 
 use open_wire::{ClientAuth, HubCredentials, LeafServer, LeafServerConfig};
+
+/// Global pointer to the shutdown flag, accessible from the signal handler.
+static SHUTDOWN_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(ptr::null_mut());
+
+extern "C" fn handle_signal(_sig: libc::c_int) {
+    let ptr = SHUTDOWN_PTR.load(Ordering::Relaxed);
+    if !ptr.is_null() {
+        unsafe { &*ptr }.store(true, Ordering::Release);
+    }
+}
+
+/// Install a signal handler for the given signal using `sigaction` with `SA_RESTART`.
+fn install_signal_handler(sig: libc::c_int) {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handle_signal as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, ptr::null_mut());
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -155,6 +180,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Metrics port: {metrics_port}");
     }
 
+    // Set up graceful shutdown via signals
+    let shutdown = Arc::new(AtomicBool::new(false));
+    SHUTDOWN_PTR.store(Arc::as_ptr(&shutdown) as *mut AtomicBool, Ordering::Release);
+
+    install_signal_handler(libc::SIGTERM);
+    install_signal_handler(libc::SIGINT);
+    install_signal_handler(libc::SIGHUP);
+
     let server = LeafServer::new(config);
-    server.run()
+    let result = server.run_until_shutdown(shutdown);
+
+    // Clear the global pointer (the Arc is about to drop).
+    SHUTDOWN_PTR.store(ptr::null_mut(), Ordering::Release);
+
+    println!("Server shut down gracefully");
+    result
 }

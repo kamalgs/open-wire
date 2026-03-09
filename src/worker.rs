@@ -52,6 +52,7 @@ pub(crate) enum WorkerCmd {
 pub(crate) struct WorkerHandle {
     pub tx: mpsc::Sender<WorkerCmd>,
     event_fd: Arc<OwnedFd>,
+    join_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WorkerHandle {
@@ -70,6 +71,25 @@ impl WorkerHandle {
     pub fn shutdown(&self) {
         let _ = self.tx.send(WorkerCmd::Shutdown);
         self.wake();
+    }
+
+    /// Wait for the worker thread to finish (with a bounded timeout).
+    pub fn join(mut self) {
+        if let Some(handle) = self.join_handle.take() {
+            // Give the worker up to 5 seconds to finish cleanup.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    warn!("worker thread did not exit within timeout");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
     }
 
     fn wake(&self) {
@@ -177,16 +197,12 @@ impl Worker {
     pub(crate) fn spawn(index: usize, state: Arc<ServerState>) -> WorkerHandle {
         let (tx, rx) = mpsc::channel();
         let event_fd = Arc::new(create_eventfd());
-        let handle = WorkerHandle {
-            tx,
-            event_fd: Arc::clone(&event_fd),
-        };
-
         let info_json =
             serde_json::to_string(&state.info).expect("failed to serialize server info");
         let info_line = format!("INFO {info_json}\r\n").into_bytes();
 
-        std::thread::Builder::new()
+        let event_fd_clone = Arc::clone(&event_fd);
+        let join_handle = std::thread::Builder::new()
             .name(format!("worker-{index}"))
             .spawn(move || {
                 let epoll_fd = unsafe { libc::epoll_create1(0) };
@@ -229,7 +245,11 @@ impl Worker {
             })
             .expect("failed to spawn worker thread");
 
-        handle
+        WorkerHandle {
+            tx,
+            event_fd: event_fd_clone,
+            join_handle: Some(join_handle),
+        }
     }
 
     fn run(&mut self) {
@@ -300,6 +320,12 @@ impl Worker {
             if self.shutdown {
                 break;
             }
+        }
+
+        // Clean up all connections on shutdown.
+        let conn_ids: Vec<u64> = self.conns.keys().copied().collect();
+        for conn_id in conn_ids {
+            self.remove_conn(conn_id);
         }
     }
 

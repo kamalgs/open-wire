@@ -535,9 +535,12 @@ impl LeafServer {
             }
         }
 
-        // Shutdown workers
+        // Shutdown workers: send shutdown command, then join threads.
         for w in &workers {
             w.shutdown();
+        }
+        for w in workers {
+            w.join();
         }
 
         // Cleanup: clear all subscriptions.
