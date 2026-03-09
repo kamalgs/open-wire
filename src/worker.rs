@@ -149,6 +149,12 @@ pub(crate) struct Worker {
     pending_notify_count: usize,
     /// Worker index label for metrics.
     worker_label: String,
+    /// Thread-local metric accumulators — plain u64, no atomics.
+    /// Flushed to the global `metrics` recorder once per epoll batch.
+    msgs_received: u64,
+    msgs_received_bytes: u64,
+    msgs_delivered: u64,
+    msgs_delivered_bytes: u64,
 }
 
 impl Worker {
@@ -199,6 +205,10 @@ impl Worker {
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
                     worker_label: index.to_string(),
+                    msgs_received: 0,
+                    msgs_received_bytes: 0,
+                    msgs_delivered: 0,
+                    msgs_delivered_bytes: 0,
                 };
                 worker.run();
             })
@@ -263,6 +273,9 @@ impl Worker {
             // This handles local delivery (pub on this worker → sub on this worker)
             // without needing an eventfd round-trip.
             self.flush_pending();
+
+            // Flush accumulated message counters to the global metrics recorder.
+            self.flush_metrics();
 
             // Check for idle connections and send keepalive PINGs.
             if epoll_timeout_ms > 0 {
@@ -525,6 +538,28 @@ impl Worker {
             }
         }
         self.pending_notify_count = 0;
+    }
+
+    /// Flush thread-local metric accumulators to the global recorder.
+    /// Called once per epoll batch — amortises atomic overhead across all
+    /// messages processed in a single `epoll_wait` wake-up.
+    fn flush_metrics(&mut self) {
+        if self.msgs_received > 0 {
+            counter!("messages_received_total", "worker" => self.worker_label.clone())
+                .increment(self.msgs_received);
+            counter!("messages_received_bytes", "worker" => self.worker_label.clone())
+                .increment(self.msgs_received_bytes);
+            self.msgs_received = 0;
+            self.msgs_received_bytes = 0;
+        }
+        if self.msgs_delivered > 0 {
+            counter!("messages_delivered_total", "worker" => self.worker_label.clone())
+                .increment(self.msgs_delivered);
+            counter!("messages_delivered_bytes", "worker" => self.worker_label.clone())
+                .increment(self.msgs_delivered_bytes);
+            self.msgs_delivered = 0;
+            self.msgs_delivered_bytes = 0;
+        }
     }
 
     /// Send keepalive PINGs to idle connections and close unresponsive ones.
@@ -1034,23 +1069,16 @@ impl Worker {
                 ..
             } => {
                 let payload_len = payload.len() as u64;
-                counter!(
-                    "messages_received_total",
-                    "worker" => self.worker_label.clone()
-                )
-                .increment(1);
-                counter!(
-                    "messages_received_bytes",
-                    "worker" => self.worker_label.clone()
-                )
-                .increment(payload_len);
+                self.msgs_received += 1;
+                self.msgs_received_bytes += payload_len;
 
                 {
                     let my_event_fd = self.event_fd.as_raw_fd();
                     let pending_notify = &mut self.pending_notify;
                     let pending_count = &mut self.pending_notify_count;
                     let pub_echo = self.conns.get(&conn_id).map(|c| c.echo).unwrap_or(true);
-                    let worker_label = &self.worker_label;
+                    let delivered = &mut self.msgs_delivered;
+                    let delivered_bytes = &mut self.msgs_delivered_bytes;
 
                     let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
@@ -1067,16 +1095,8 @@ impl Worker {
                             headers.as_ref(),
                             &payload,
                         );
-                        counter!(
-                            "messages_delivered_total",
-                            "worker" => worker_label.clone()
-                        )
-                        .increment(1);
-                        counter!(
-                            "messages_delivered_bytes",
-                            "worker" => worker_label.clone()
-                        )
-                        .increment(payload_len);
+                        *delivered += 1;
+                        *delivered_bytes += payload_len;
                         // Skip notification for our own worker — flush_pending
                         // runs after the event loop iteration.
                         let fd = sub.writer.event_raw_fd();
