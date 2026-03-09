@@ -16,21 +16,31 @@ use tracing_subscriber::EnvFilter;
 use open_wire::config;
 use open_wire::{ClientAuth, HubCredentials, LeafServer, LeafServerConfig};
 
+/// Global pointer to the reload flag, accessible from the SIGHUP handler.
+static RELOAD_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(ptr::null_mut());
+
 /// Global pointer to the shutdown flag, accessible from the signal handler.
 static SHUTDOWN_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(ptr::null_mut());
 
-extern "C" fn handle_signal(_sig: libc::c_int) {
+extern "C" fn handle_shutdown(_sig: libc::c_int) {
     let ptr = SHUTDOWN_PTR.load(Ordering::Relaxed);
     if !ptr.is_null() {
         unsafe { &*ptr }.store(true, Ordering::Release);
     }
 }
 
+extern "C" fn handle_reload(_sig: libc::c_int) {
+    let ptr = RELOAD_PTR.load(Ordering::Relaxed);
+    if !ptr.is_null() {
+        unsafe { &*ptr }.store(true, Ordering::Release);
+    }
+}
+
 /// Install a signal handler for the given signal using `sigaction` with `SA_RESTART`.
-fn install_signal_handler(sig: libc::c_int) {
+fn install_signal_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = handle_signal as *const () as usize;
+        sa.sa_sigaction = handler as *const () as usize;
         sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         libc::sigaction(sig, &sa, ptr::null_mut());
@@ -38,12 +48,7 @@ fn install_signal_handler(sig: libc::c_int) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
+    // Defer tracing init until after config is parsed (may need log_file).
     // First pass: look for --config / -c to load config file as base
     let args: Vec<String> = std::env::args().collect();
     let mut config = {
@@ -176,6 +181,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.max_subscriptions = args[i].parse().expect("invalid max-subscriptions");
             }
+            "--pid-file" => {
+                i += 1;
+                config.pid_file = Some(std::path::PathBuf::from(&args[i]));
+            }
+            "--log-file" => {
+                i += 1;
+                config.log_file = Some(std::path::PathBuf::from(&args[i]));
+            }
+            "--monitoring-port" | "--http-port" => {
+                i += 1;
+                config.monitoring_port = Some(args[i].parse().expect("invalid monitoring-port"));
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
@@ -187,7 +204,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [--hub-token TOKEN] [--hub-creds PATH] \
                      [--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH] \
                      [--max-payload BYTES] [--max-connections N] \
-                     [--max-control-line BYTES] [--max-subscriptions N]"
+                     [--max-control-line BYTES] [--max-subscriptions N] \
+                     [--pid-file PATH] [--log-file PATH] [--monitoring-port PORT]"
                 );
                 std::process::exit(1);
             }
@@ -208,6 +226,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.hub_credentials = Some(hub_creds);
     }
 
+    // Initialize tracing — optionally to a log file
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if let Some(ref log_path) = config.log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .expect("failed to open log file");
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
+    // Write PID file
+    if let Some(ref pid_path) = config.pid_file {
+        std::fs::write(pid_path, format!("{}", std::process::id()))
+            .expect("failed to write pid file");
+    }
+
     println!(
         "Starting leaf node server on {}:{} ({} workers)",
         config.host, config.port, config.workers
@@ -221,20 +262,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(metrics_port) = config.metrics_port {
         println!("Metrics port: {metrics_port}");
     }
+    if let Some(monitoring_port) = config.monitoring_port {
+        println!("Monitoring port: {monitoring_port}");
+    }
 
     // Set up graceful shutdown via signals
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN_PTR.store(Arc::as_ptr(&shutdown) as *mut AtomicBool, Ordering::Release);
 
-    install_signal_handler(libc::SIGTERM);
-    install_signal_handler(libc::SIGINT);
-    install_signal_handler(libc::SIGHUP);
+    let reload = Arc::new(AtomicBool::new(false));
+    RELOAD_PTR.store(Arc::as_ptr(&reload) as *mut AtomicBool, Ordering::Release);
 
+    install_signal_handler(libc::SIGTERM, handle_shutdown);
+    install_signal_handler(libc::SIGINT, handle_shutdown);
+    install_signal_handler(libc::SIGHUP, handle_reload);
+
+    // Determine config path for hot-reload
+    let config_path: Option<String> = {
+        let mut cp = None;
+        let mut j = 1;
+        while j < args.len() {
+            if matches!(args[j].as_str(), "--config" | "-c") {
+                j += 1;
+                if j < args.len() {
+                    cp = Some(args[j].clone());
+                }
+            }
+            j += 1;
+        }
+        cp
+    };
+
+    let pid_file = config.pid_file.clone();
     let server = LeafServer::new(config);
-    let result = server.run_until_shutdown(shutdown);
+    let result = server.run_until_shutdown(shutdown, reload, config_path.as_deref());
 
-    // Clear the global pointer (the Arc is about to drop).
+    // Clear the global pointers (the Arcs are about to drop).
     SHUTDOWN_PTR.store(ptr::null_mut(), Ordering::Release);
+    RELOAD_PTR.store(ptr::null_mut(), Ordering::Release);
+
+    // Remove PID file
+    if let Some(ref pid_path) = pid_file {
+        let _ = std::fs::remove_file(pid_path);
+    }
 
     println!("Server shut down gracefully");
     result

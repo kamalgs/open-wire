@@ -5,8 +5,7 @@ Items marked ~~strikethrough~~ are already implemented.
 
 ## Protocol Gaps
 
-- **UNSUB max enforcement** — auto-unsubscribe after N messages (`UNSUB <sid> <max>`).
-  Currently parsed but not enforced.
+- ~~**UNSUB max enforcement**~~ — auto-unsubscribe after N messages (`UNSUB <sid> <max>`).
 - **Drain protocol** — graceful client drain (`-ERR` + disconnect after flush).
 - **Subject deny import/export** — per-connection subject allow/deny lists on
   leaf connections.
@@ -19,14 +18,13 @@ Items marked ~~strikethrough~~ are already implemented.
 ## Config / Operational Gaps
 
 - ~~**Config file**~~ — Go nats-server `.conf` format parser (`--config` flag).
-- **Config reload** — `SIGHUP` triggers config file reload (currently SIGHUP
-  triggers shutdown, not reload).
-- **pid_file** — write PID to a file on startup.
-- **log_file** — write logs to a file instead of stderr.
-- **Lame duck mode** — stop accepting new connections, send lame-duck INFO to
-  existing clients, drain, then shut down.
-- **Varz / Connz endpoints** — HTTP `/varz`, `/connz` monitoring endpoints
-  (Go-compatible JSON format).
+- ~~**Config reload**~~ — `SIGHUP` triggers config file reload of hot-reloadable values.
+- ~~**pid_file**~~ — write PID to a file on startup, remove on shutdown.
+- ~~**log_file**~~ — write logs to a file instead of stderr.
+- ~~**Lame duck mode**~~ — stop accepting new connections, send lame-duck INFO to
+  existing clients, wait for lame_duck_duration, then shut down.
+- ~~**Varz / Healthz endpoints**~~ — HTTP `/varz`, `/healthz` monitoring endpoints
+  on configurable `monitoring_port`.
 - ~~**Metrics endpoint**~~ — Prometheus metrics on a configurable port.
 - ~~**Signal handling**~~ — SIGTERM/SIGINT graceful shutdown.
 - ~~**Structured logging**~~ — `tracing` with env-filter.

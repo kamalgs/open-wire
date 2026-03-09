@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -45,6 +45,8 @@ pub(crate) enum WorkerCmd {
         addr: SocketAddr,
         is_websocket: bool,
     },
+    /// Broadcast INFO line with ldm:true to all active connections.
+    LameDuck(Vec<u8>),
     Shutdown,
 }
 
@@ -64,6 +66,12 @@ impl WorkerHandle {
             addr,
             is_websocket,
         });
+        self.wake();
+    }
+
+    /// Send lame duck INFO line to all active connections.
+    pub fn send_lame_duck(&self, info_line: Vec<u8>) {
+        let _ = self.tx.send(WorkerCmd::LameDuck(info_line));
         self.wake();
     }
 
@@ -260,10 +268,11 @@ impl Worker {
         // Compute epoll timeout for periodic keepalive checks.
         // Use half the ping interval (capped at 30s) so we check reasonably often.
         // -1 if keepalive is disabled.
-        let epoll_timeout_ms = if self.state.ping_interval.is_zero() {
+        let ping_interval_ms = self.state.ping_interval_ms.load(Ordering::Relaxed);
+        let epoll_timeout_ms = if ping_interval_ms == 0 {
             -1i32
         } else {
-            let half = self.state.ping_interval.as_millis() / 2;
+            let half = ping_interval_ms / 2;
             half.min(30_000) as i32
         };
 
@@ -342,7 +351,7 @@ impl Worker {
             );
         }
 
-        // Check for new connections / shutdown
+        // Check for new connections / shutdown / lame duck
         while let Ok(cmd) = self.rx.try_recv() {
             match cmd {
                 WorkerCmd::NewConn {
@@ -352,6 +361,9 @@ impl Worker {
                     is_websocket,
                 } => {
                     self.add_conn(id, stream, addr, is_websocket);
+                }
+                WorkerCmd::LameDuck(info_line) => {
+                    self.handle_lame_duck(&info_line);
                 }
                 WorkerCmd::Shutdown => {
                     self.shutdown = true;
@@ -512,6 +524,10 @@ impl Worker {
                     );
                     counter!("slow_consumers_total", "worker" => self.worker_label.clone())
                         .increment(1);
+                    self.state
+                        .stats
+                        .slow_consumers
+                        .fetch_add(1, Ordering::Relaxed);
                     to_remove.push(*conn_id);
                     continue;
                 }
@@ -632,6 +648,14 @@ impl Worker {
                 .increment(self.msgs_received);
             counter!("messages_received_bytes", "worker" => self.worker_label.clone())
                 .increment(self.msgs_received_bytes);
+            self.state
+                .stats
+                .in_msgs
+                .fetch_add(self.msgs_received, Ordering::Relaxed);
+            self.state
+                .stats
+                .in_bytes
+                .fetch_add(self.msgs_received_bytes, Ordering::Relaxed);
             self.msgs_received = 0;
             self.msgs_received_bytes = 0;
         }
@@ -640,6 +664,14 @@ impl Worker {
                 .increment(self.msgs_delivered);
             counter!("messages_delivered_bytes", "worker" => self.worker_label.clone())
                 .increment(self.msgs_delivered_bytes);
+            self.state
+                .stats
+                .out_msgs
+                .fetch_add(self.msgs_delivered, Ordering::Relaxed);
+            self.state
+                .stats
+                .out_bytes
+                .fetch_add(self.msgs_delivered_bytes, Ordering::Relaxed);
             self.msgs_delivered = 0;
             self.msgs_delivered_bytes = 0;
         }
@@ -648,8 +680,9 @@ impl Worker {
     /// Send keepalive PINGs to idle connections and close unresponsive ones.
     fn check_pings(&mut self) {
         let now = Instant::now();
-        let interval = self.state.ping_interval;
-        let max_pings = self.state.max_pings_outstanding;
+        let interval_ms = self.state.ping_interval_ms.load(Ordering::Relaxed);
+        let interval = std::time::Duration::from_millis(interval_ms);
+        let max_pings = self.state.max_pings_outstanding.load(Ordering::Relaxed);
         let epoll_fd = self.epoll_fd.as_raw_fd();
         let mut to_remove: Vec<u64> = Vec::new();
 
@@ -678,6 +711,21 @@ impl Worker {
 
         for conn_id in to_remove {
             self.remove_conn(conn_id);
+        }
+    }
+
+    /// Broadcast INFO with ldm:true to all active connections.
+    fn handle_lame_duck(&mut self, info_line: &[u8]) {
+        let epoll_fd = self.epoll_fd.as_raw_fd();
+        for (conn_id, client) in &mut self.conns {
+            if !matches!(client.phase, ConnPhase::Active) {
+                continue;
+            }
+            client.write_buf.extend_from_slice(info_line);
+            if !client.epoll_has_out {
+                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                client.epoll_has_out = true;
+            }
         }
     }
 
@@ -1190,7 +1238,7 @@ impl Worker {
             // and there is no newline within the first max_control_line bytes,
             // the client is sending an oversized control line.
             if phase == 1 || phase == 2 {
-                let max_ctrl = self.state.max_control_line;
+                let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
                 if max_ctrl > 0 {
                     let exceeded = {
                         let client = self.conns.get(&conn_id).unwrap();
@@ -1338,7 +1386,7 @@ impl Worker {
                 subject,
                 queue_group,
             } => {
-                let max_subs = self.state.max_subscriptions;
+                let max_subs = self.state.max_subscriptions.load(Ordering::Relaxed);
                 if max_subs > 0 {
                     let at_limit = match self.conns.get(&conn_id) {
                         Some(c) => c.sub_count >= max_subs,
@@ -1379,6 +1427,8 @@ impl Worker {
                     subject: subject_str.to_string(),
                     queue: queue_str,
                     writer: direct_writer,
+                    max_msgs: AtomicU64::new(0),
+                    delivered: AtomicU64::new(0),
                 };
 
                 {
@@ -1407,30 +1457,66 @@ impl Worker {
                 .increment(1.0);
                 debug!(conn_id, sid, subject = %subject_str, "client subscribed");
             }
-            ClientOp::Unsubscribe { sid, max: _ } => {
-                let removed = {
-                    let mut subs = self.state.subs.write().unwrap();
-                    let r = subs.remove(conn_id, sid);
-                    self.state
-                        .has_subs
-                        .store(!subs.is_empty(), Ordering::Relaxed);
-                    r
-                };
+            ClientOp::Unsubscribe { sid, max } => {
+                if let Some(n) = max {
+                    // UNSUB with max: set delivery limit, auto-remove when reached.
+                    let subs = self.state.subs.read().unwrap();
+                    let found = subs.set_unsub_max(conn_id, sid, n);
+                    let already_expired = found && subs.is_expired(conn_id, sid);
+                    drop(subs);
 
-                if let Some(ref removed) = removed {
-                    if let Some(client) = self.conns.get_mut(&conn_id) {
-                        client.sub_count = client.sub_count.saturating_sub(1);
+                    if already_expired {
+                        // Already delivered >= max, remove immediately.
+                        let mut subs = self.state.subs.write().unwrap();
+                        if let Some(removed) = subs.remove(conn_id, sid) {
+                            self.state
+                                .has_subs
+                                .store(!subs.is_empty(), Ordering::Relaxed);
+                            if let Some(client) = self.conns.get_mut(&conn_id) {
+                                client.sub_count = client.sub_count.saturating_sub(1);
+                            }
+                            let mut upstream = self.state.upstream.write().unwrap();
+                            if let Some(ref mut up) = *upstream {
+                                up.remove_interest(&removed.subject, removed.queue.as_deref());
+                            }
+                            gauge!(
+                                "subscriptions_active",
+                                "worker" => self.worker_label.clone()
+                            )
+                            .decrement(1.0);
+                            debug!(
+                                conn_id, sid,
+                                subject = %removed.subject,
+                                "auto-unsubscribed (max already reached)"
+                            );
+                        }
                     }
-                    let mut upstream = self.state.upstream.write().unwrap();
-                    if let Some(ref mut up) = *upstream {
-                        up.remove_interest(&removed.subject, removed.queue.as_deref());
+                } else {
+                    // Immediate unsubscribe
+                    let removed = {
+                        let mut subs = self.state.subs.write().unwrap();
+                        let r = subs.remove(conn_id, sid);
+                        self.state
+                            .has_subs
+                            .store(!subs.is_empty(), Ordering::Relaxed);
+                        r
+                    };
+
+                    if let Some(ref removed) = removed {
+                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                            client.sub_count = client.sub_count.saturating_sub(1);
+                        }
+                        let mut upstream = self.state.upstream.write().unwrap();
+                        if let Some(ref mut up) = *upstream {
+                            up.remove_interest(&removed.subject, removed.queue.as_deref());
+                        }
+                        gauge!(
+                            "subscriptions_active",
+                            "worker" => self.worker_label.clone()
+                        )
+                        .decrement(1.0);
+                        debug!(conn_id, sid, subject = %removed.subject, "client unsubscribed");
                     }
-                    gauge!(
-                        "subscriptions_active",
-                        "worker" => self.worker_label.clone()
-                    )
-                    .decrement(1.0);
-                    debug!(conn_id, sid, subject = %removed.subject, "client unsubscribed");
                 }
             }
             ClientOp::Publish {
@@ -1440,7 +1526,7 @@ impl Worker {
                 headers,
                 ..
             } => {
-                let max_payload = self.state.max_payload;
+                let max_payload = self.state.max_payload.load(Ordering::Relaxed);
                 if max_payload > 0 && payload.len() > max_payload {
                     warn!(
                         conn_id,
@@ -1475,7 +1561,7 @@ impl Worker {
 
                     let subject_str = bytes_to_str(&subject);
                     let subs = self.state.subs.read().unwrap();
-                    subs.for_each_match(subject_str, |sub| {
+                    let (_match_count, expired) = subs.for_each_match(subject_str, |sub| {
                         // Suppress echo: don't deliver to the publisher itself
                         // when the client set echo: false in CONNECT.
                         if !pub_echo && sub.conn_id == conn_id {
@@ -1504,6 +1590,37 @@ impl Worker {
                             }
                         }
                     });
+                    drop(subs);
+
+                    // Remove expired subs (reached max delivery limit).
+                    if !expired.is_empty() {
+                        let mut subs = self.state.subs.write().unwrap();
+                        for (exp_conn_id, exp_sid) in &expired {
+                            if let Some(removed) = subs.remove(*exp_conn_id, *exp_sid) {
+                                if let Some(client) = self.conns.get_mut(exp_conn_id) {
+                                    client.sub_count = client.sub_count.saturating_sub(1);
+                                }
+                                let mut upstream = self.state.upstream.write().unwrap();
+                                if let Some(ref mut up) = *upstream {
+                                    up.remove_interest(&removed.subject, removed.queue.as_deref());
+                                }
+                                gauge!(
+                                    "subscriptions_active",
+                                    "worker" => self.worker_label.clone()
+                                )
+                                .decrement(1.0);
+                                debug!(
+                                    conn_id = exp_conn_id,
+                                    sid = exp_sid,
+                                    subject = %removed.subject,
+                                    "auto-unsubscribed (max reached)"
+                                );
+                            }
+                        }
+                        self.state
+                            .has_subs
+                            .store(!subs.is_empty(), Ordering::Relaxed);
+                    }
                 }
 
                 let upstream_tx = self.conns.get(&conn_id).and_then(|c| c.upstream_tx.clone());

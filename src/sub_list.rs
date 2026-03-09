@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
@@ -140,7 +140,7 @@ impl std::fmt::Debug for DirectWriter {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct Subscription {
     pub conn_id: u64,
@@ -153,6 +153,26 @@ pub struct Subscription {
     /// Direct writer to the client's shared write buffer.
     /// Formats MSG bytes synchronously, bypassing mpsc channel overhead.
     pub(crate) writer: DirectWriter,
+    /// Maximum messages to deliver before auto-unsubscribe. 0 = no limit.
+    /// Atomic because `for_each_match` holds a read lock while multiple workers deliver.
+    pub(crate) max_msgs: AtomicU64,
+    /// Number of messages delivered so far (only incremented when max_msgs > 0).
+    pub(crate) delivered: AtomicU64,
+}
+
+impl Clone for Subscription {
+    fn clone(&self) -> Self {
+        Self {
+            conn_id: self.conn_id,
+            sid: self.sid,
+            sid_bytes: self.sid_bytes.clone(),
+            subject: self.subject.clone(),
+            queue: self.queue.clone(),
+            writer: self.writer.clone(),
+            max_msgs: AtomicU64::new(self.max_msgs.load(Ordering::Relaxed)),
+            delivered: AtomicU64::new(self.delivered.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl Subscription {
@@ -167,6 +187,8 @@ impl Subscription {
             subject,
             queue,
             writer,
+            max_msgs: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
         }
     }
 }
@@ -271,17 +293,91 @@ impl SubList {
         result
     }
 
+    /// Set the auto-unsubscribe max on an existing subscription.
+    /// Works under a read lock (uses atomics). Returns `true` if the sub was found.
+    /// If the sub has already delivered >= max messages, returns `true` but caller
+    /// should remove it under a write lock.
+    pub fn set_unsub_max(&self, conn_id: u64, sid: u64, max: u64) -> bool {
+        // Check exact subs
+        for subs in self.exact.values() {
+            for sub in subs {
+                if sub.conn_id == conn_id && sub.sid == sid {
+                    sub.max_msgs.store(max, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+        // Check wildcard subs
+        for sub in &self.wild {
+            if sub.conn_id == conn_id && sub.sid == sid {
+                sub.max_msgs.store(max, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a subscription has already reached its delivery limit.
+    pub fn is_expired(&self, conn_id: u64, sid: u64) -> bool {
+        let find = |sub: &Subscription| -> bool {
+            let max = sub.max_msgs.load(Ordering::Relaxed);
+            max > 0 && sub.delivered.load(Ordering::Relaxed) >= max
+        };
+        for subs in self.exact.values() {
+            for sub in subs {
+                if sub.conn_id == conn_id && sub.sid == sid {
+                    return find(sub);
+                }
+            }
+        }
+        for sub in &self.wild {
+            if sub.conn_id == conn_id && sub.sid == sid {
+                return find(sub);
+            }
+        }
+        false
+    }
+
     /// Iterate over matching subscriptions without allocating a Vec.
-    /// Returns the total number of matches.
+    /// Returns `(match_count, expired_subs)` where expired_subs is a list of
+    /// `(conn_id, sid)` pairs for subscriptions that reached their max delivery limit.
     ///
     /// Queue group semantics: non-queue subs receive every message,
     /// while each queue group delivers to exactly one member (round-robin).
-    pub fn for_each_match(&self, subject: &str, mut f: impl FnMut(&Subscription)) -> usize {
+    pub fn for_each_match(
+        &self,
+        subject: &str,
+        mut f: impl FnMut(&Subscription),
+    ) -> (usize, Vec<(u64, u64)>) {
         let mut count = 0;
+        let mut expired: Vec<(u64, u64)> = Vec::new();
         // Collect queue group subs lazily — only allocate when needed.
         // Uses indices to avoid lifetime issues with the closure.
         // (source, index): source 0 = exact, source 1 = wild
         let mut queue_groups: Vec<(&str, Vec<(u8, usize)>)> = Vec::new();
+
+        // Check max_msgs limit, deliver if allowed, track expired.
+        macro_rules! deliver_sub {
+            ($sub:expr) => {{
+                let max = $sub.max_msgs.load(Ordering::Relaxed);
+                if max > 0 {
+                    let prev = $sub.delivered.fetch_add(1, Ordering::Relaxed);
+                    if prev >= max {
+                        // Already over limit — undo increment, skip delivery
+                        $sub.delivered.fetch_sub(1, Ordering::Relaxed);
+                    } else {
+                        if prev + 1 >= max {
+                            expired.push(($sub.conn_id, $sub.sid));
+                        }
+                        f($sub);
+                        count += 1;
+                    }
+                } else {
+                    f($sub);
+                    count += 1;
+                }
+            }};
+        }
 
         // Route a single matching sub: deliver non-queue immediately,
         // collect queue subs by group name.
@@ -297,8 +393,7 @@ impl SubList {
                         queue_groups.push((q.as_str(), vec![($source, $idx)]));
                     }
                 } else {
-                    f($sub);
-                    count += 1;
+                    deliver_sub!($sub);
                 }
             };
         }
@@ -328,12 +423,11 @@ impl SubList {
                 } else {
                     &self.wild[sub_idx]
                 };
-                f(sub);
-                count += 1;
+                deliver_sub!(sub);
             }
         }
 
-        count
+        (count, expired)
     }
 
     /// Returns true if the sublist has no subscriptions at all.
@@ -424,15 +518,7 @@ mod tests {
 
     /// Create a test subscription with a dummy DirectWriter.
     fn test_sub(conn_id: u64, sid: u64, subject: &str) -> Subscription {
-        let writer = DirectWriter::new_dummy();
-        Subscription {
-            conn_id,
-            sid,
-            sid_bytes: Bytes::from(sid.to_string().into_bytes()),
-            subject: subject.to_string(),
-            queue: None,
-            writer,
-        }
+        Subscription::new_dummy(conn_id, sid, subject.to_string(), None)
     }
 
     #[test]
@@ -799,7 +885,7 @@ mod tests {
         sl.insert(test_queue_sub(3, 1, "foo", "q1"));
 
         let mut delivered = Vec::new();
-        let count = sl.for_each_match("foo", |sub| {
+        let (count, _expired) = sl.for_each_match("foo", |sub| {
             delivered.push(sub.conn_id);
         });
         assert_eq!(count, 1);
@@ -814,7 +900,7 @@ mod tests {
 
         let mut counts = [0u32; 3]; // conn_id 1 and 2
         for _ in 0..100 {
-            sl.for_each_match("foo", |sub| {
+            let _ = sl.for_each_match("foo", |sub| {
                 counts[sub.conn_id as usize] += 1;
             });
         }
@@ -834,7 +920,7 @@ mod tests {
         sl.insert(test_sub(3, 1, "foo"));
 
         let mut delivered = Vec::new();
-        let count = sl.for_each_match("foo", |sub| {
+        let (count, _) = sl.for_each_match("foo", |sub| {
             delivered.push(sub.conn_id);
         });
         // Non-queue sub always delivered + 1 from queue group
@@ -851,7 +937,7 @@ mod tests {
         sl.insert(test_queue_sub(4, 1, "foo", "q2"));
 
         let mut delivered = Vec::new();
-        let count = sl.for_each_match("foo", |sub| {
+        let (count, _) = sl.for_each_match("foo", |sub| {
             delivered.push(sub.conn_id);
         });
         // 1 from q1 + 1 from q2
@@ -866,7 +952,7 @@ mod tests {
         sl.insert(test_queue_sub(2, 1, "foo.*", "q1"));
 
         let mut delivered = Vec::new();
-        let count = sl.for_each_match("foo.bar", |sub| {
+        let (count, _) = sl.for_each_match("foo.bar", |sub| {
             delivered.push(sub.conn_id);
         });
         assert_eq!(count, 1);
@@ -887,5 +973,97 @@ mod tests {
         assert!(interests.contains(&("foo", None)));
         assert!(interests.contains(&("bar", Some("q1"))));
         assert!(interests.contains(&("bar", Some("q2"))));
+    }
+
+    // --- UNSUB max tests ---
+
+    #[test]
+    fn test_unsub_max_delivery_limit() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo"));
+        sl.set_unsub_max(1, 1, 3);
+
+        // Deliver 3 messages — all should succeed
+        for _ in 0..3 {
+            let (count, _) = sl.for_each_match("foo", |_sub| {});
+            assert_eq!(count, 1);
+        }
+
+        // 4th message should be skipped and sub expired
+        let (count, expired) = sl.for_each_match("foo", |_sub| {});
+        assert_eq!(count, 0);
+        assert!(expired.is_empty()); // already expired on 3rd delivery
+    }
+
+    #[test]
+    fn test_unsub_max_single_shot() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo"));
+        sl.set_unsub_max(1, 1, 1);
+
+        let (count, expired) = sl.for_each_match("foo", |_sub| {});
+        assert_eq!(count, 1);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0], (1, 1));
+
+        // Next delivery should skip
+        let (count, _) = sl.for_each_match("foo", |_sub| {});
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_unsub_max_with_queue_group() {
+        let mut sl = SubList::new();
+        sl.insert(test_queue_sub(1, 1, "foo", "q1"));
+        sl.insert(test_queue_sub(2, 1, "foo", "q1"));
+        sl.set_unsub_max(1, 1, 2);
+
+        // Deliver enough messages that conn_id=1 gets 2
+        let mut conn1_count = 0u32;
+        for _ in 0..100 {
+            let (_, expired) = sl.for_each_match("foo", |sub| {
+                if sub.conn_id == 1 {
+                    conn1_count += 1;
+                }
+            });
+            // Remove expired
+            for (cid, sid) in expired {
+                sl.remove(cid, sid);
+            }
+        }
+        // conn_id=1 should have received exactly 2
+        assert_eq!(conn1_count, 2);
+    }
+
+    #[test]
+    fn test_unsub_max_already_expired() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo"));
+
+        // Set max=3, then deliver 3 messages to reach the limit
+        sl.set_unsub_max(1, 1, 3);
+        for _ in 0..3 {
+            let _ = sl.for_each_match("foo", |_sub| {});
+        }
+
+        // Should now be expired
+        assert!(sl.is_expired(1, 1));
+
+        // Increasing the max should un-expire it
+        sl.set_unsub_max(1, 1, 5);
+        assert!(!sl.is_expired(1, 1));
+    }
+
+    #[test]
+    fn test_set_unsub_max_wildcard() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.*"));
+        assert!(sl.set_unsub_max(1, 1, 2));
+
+        let (count, _) = sl.for_each_match("foo.bar", |_sub| {});
+        assert_eq!(count, 1);
+        let (count, expired) = sl.for_each_match("foo.baz", |_sub| {});
+        assert_eq!(count, 1);
+        assert_eq!(expired.len(), 1);
     }
 }

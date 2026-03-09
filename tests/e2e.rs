@@ -12,6 +12,8 @@
 
 use std::net::TcpListener as StdTcpListener;
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -89,9 +91,10 @@ impl Drop for NatsServer {
 
 /// Start a LeafServer on the given port with optional hub_url, returning the
 /// shutdown sender. The server runs in a background tokio task.
-fn spawn_leaf(port: u16, hub_url: Option<String>) -> tokio::sync::broadcast::Sender<()> {
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-    let shutdown_rx = shutdown_tx.subscribe();
+fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = Arc::clone(&shutdown);
+    let reload = Arc::new(AtomicBool::new(false));
 
     let config = LeafServerConfig {
         host: "127.0.0.1".to_string(),
@@ -102,13 +105,13 @@ fn spawn_leaf(port: u16, hub_url: Option<String>) -> tokio::sync::broadcast::Sen
     };
     let server = LeafServer::new(config);
 
-    tokio::spawn(async move {
-        if let Err(e) = server.run_until_shutdown(shutdown_rx).await {
+    std::thread::spawn(move || {
+        if let Err(e) = server.run_until_shutdown(shutdown_clone, reload, None) {
             eprintln!("leaf server error: {}", e);
         }
     });
 
-    shutdown_tx
+    shutdown
 }
 
 /// Wait until the leaf server accepts a TCP connection.
@@ -156,7 +159,7 @@ async fn local_pub_sub() {
     assert_eq!(msg.subject.as_str(), "test.subject");
     assert_eq!(&msg.payload[..], b"hello");
 
-    let _ = shutdown_tx.send(());
+    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
@@ -207,7 +210,7 @@ async fn upstream_forward() {
     assert_eq!(msg.subject.as_str(), "events.hello");
     assert_eq!(&msg.payload[..], b"from-upstream");
 
-    let _ = shutdown_tx.send(());
+    shutdown_tx.store(true, Ordering::Release);
 }
 
 #[tokio::test]
@@ -258,5 +261,5 @@ async fn leaf_to_upstream() {
     assert_eq!(msg.subject.as_str(), "data.test");
     assert_eq!(&msg.payload[..], b"from-leaf");
 
-    let _ = shutdown_tx.send(());
+    shutdown_tx.store(true, Ordering::Release);
 }

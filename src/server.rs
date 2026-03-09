@@ -9,9 +9,10 @@ use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use metrics::counter;
 use tracing::{error, info, warn};
@@ -157,6 +158,16 @@ pub struct LeafServerConfig {
     pub tls_cert: Option<PathBuf>,
     /// Path to TLS private key file (PEM).
     pub tls_key: Option<PathBuf>,
+    /// Path to write the server PID file. Removed on shutdown.
+    pub pid_file: Option<PathBuf>,
+    /// Path to the log file. When set, tracing output is directed here.
+    pub log_file: Option<PathBuf>,
+    /// Duration of lame duck mode before shutdown (default: 30s).
+    pub lame_duck_duration: std::time::Duration,
+    /// Grace period before lame duck starts closing connections (default: 10s).
+    pub lame_duck_grace_period: std::time::Duration,
+    /// Port for the monitoring HTTP server (/varz, /healthz). `None` = disabled.
+    pub monitoring_port: Option<u16>,
 }
 
 impl Default for LeafServerConfig {
@@ -185,6 +196,11 @@ impl Default for LeafServerConfig {
             metrics_port: None,
             tls_cert: None,
             tls_key: None,
+            pid_file: None,
+            log_file: None,
+            lame_duck_duration: std::time::Duration::from_secs(30),
+            lame_duck_grace_period: std::time::Duration::from_secs(10),
+            monitoring_port: None,
         }
     }
 }
@@ -196,6 +212,124 @@ impl Default for LeafServerConfig {
 fn install_metrics_exporter(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     builder.with_http_listener(([0, 0, 0, 0], port)).install()?;
+    Ok(())
+}
+
+/// Spawn a monitoring HTTP server on the given port.
+/// Serves `/varz` (JSON stats) and `/healthz` (health check).
+fn spawn_monitoring_server(port: u16, state: Arc<ServerState>) {
+    std::thread::Builder::new()
+        .name("monitoring".into())
+        .spawn(move || {
+            let listener = match TcpListener::bind(("0.0.0.0", port)) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(port, error = %e, "failed to bind monitoring port");
+                    return;
+                }
+            };
+            info!(port, "monitoring endpoint listening");
+
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut stream) => {
+                        let _ = handle_monitoring_request(&mut stream, &state);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "monitoring accept error");
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn monitoring thread");
+}
+
+/// Handle a single HTTP request on the monitoring port.
+fn handle_monitoring_request(stream: &mut TcpStream, state: &ServerState) -> io::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+
+    // Parse the path from "GET /path HTTP/1.x"
+    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+
+    // Consume remaining headers
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let (status, content_type, body) = match path {
+        "/healthz" => (
+            "200 OK",
+            "application/json",
+            r#"{"status":"ok"}"#.to_string(),
+        ),
+        "/varz" => {
+            let uptime = state.stats.start_time.elapsed();
+            let subs_count = {
+                let subs = state.subs.read().unwrap();
+                subs.unique_subjects().len()
+            };
+            let body = format!(
+                concat!(
+                    "{{",
+                    "\"server_id\":\"{}\",",
+                    "\"server_name\":\"{}\",",
+                    "\"version\":\"{}\",",
+                    "\"host\":\"{}\",",
+                    "\"port\":{},",
+                    "\"uptime_sec\":{},",
+                    "\"connections\":{},",
+                    "\"total_connections\":{},",
+                    "\"in_msgs\":{},",
+                    "\"out_msgs\":{},",
+                    "\"in_bytes\":{},",
+                    "\"out_bytes\":{},",
+                    "\"slow_consumers\":{},",
+                    "\"subscriptions\":{},",
+                    "\"max_payload\":{},",
+                    "\"max_connections\":{}",
+                    "}}"
+                ),
+                state.info.server_id,
+                state.info.server_name,
+                state.info.version,
+                state.info.host,
+                state.info.port,
+                uptime.as_secs(),
+                state.active_connections.load(Ordering::Relaxed),
+                state.stats.total_connections.load(Ordering::Relaxed),
+                state.stats.in_msgs.load(Ordering::Relaxed),
+                state.stats.out_msgs.load(Ordering::Relaxed),
+                state.stats.in_bytes.load(Ordering::Relaxed),
+                state.stats.out_bytes.load(Ordering::Relaxed),
+                state.stats.slow_consumers.load(Ordering::Relaxed),
+                subs_count,
+                state.max_payload.load(Ordering::Relaxed),
+                state.max_connections.load(Ordering::Relaxed),
+            );
+            ("200 OK", "application/json", body)
+        }
+        _ => ("404 Not Found", "text/plain", "404 Not Found\n".to_string()),
+    };
+
+    let response = format!(
+        "HTTP/1.1 {status}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes())?;
+    stream.flush()?;
     Ok(())
 }
 
@@ -223,11 +357,36 @@ pub(crate) fn build_tls_server_config(
 }
 
 /// Shared server state accessible by all client connections.
+/// Aggregated server statistics for /varz monitoring.
+pub(crate) struct ServerStats {
+    pub in_msgs: AtomicU64,
+    pub out_msgs: AtomicU64,
+    pub in_bytes: AtomicU64,
+    pub out_bytes: AtomicU64,
+    pub total_connections: AtomicU64,
+    pub slow_consumers: AtomicU64,
+    pub start_time: Instant,
+}
+
+impl Default for ServerStats {
+    fn default() -> Self {
+        Self {
+            in_msgs: AtomicU64::new(0),
+            out_msgs: AtomicU64::new(0),
+            in_bytes: AtomicU64::new(0),
+            out_bytes: AtomicU64::new(0),
+            total_connections: AtomicU64::new(0),
+            slow_consumers: AtomicU64::new(0),
+            start_time: Instant::now(),
+        }
+    }
+}
+
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
-    pub ping_interval: std::time::Duration,
-    pub max_pings_outstanding: u32,
+    pub ping_interval_ms: AtomicU64,
+    pub max_pings_outstanding: AtomicU32,
     pub subs: std::sync::RwLock<SubList>,
     pub upstream: std::sync::RwLock<Option<Upstream>>,
     /// Lock-free sender for forwarding publishes to the upstream hub.
@@ -244,13 +403,15 @@ pub(crate) struct ServerState {
     /// Global count of active client connections (across all workers).
     pub active_connections: AtomicU64,
     /// Maximum simultaneous client connections. 0 = unlimited.
-    pub max_connections: usize,
+    pub max_connections: AtomicUsize,
     /// Maximum message payload size in bytes.
-    pub max_payload: usize,
+    pub max_payload: AtomicUsize,
     /// Maximum control line length in bytes.
-    pub max_control_line: usize,
+    pub max_control_line: AtomicUsize,
     /// Maximum subscriptions per client connection. 0 = unlimited.
-    pub max_subscriptions: usize,
+    pub max_subscriptions: AtomicUsize,
+    /// Aggregated server statistics.
+    pub stats: ServerStats,
 }
 
 impl ServerState {
@@ -270,8 +431,8 @@ impl ServerState {
         Self {
             info,
             auth,
-            ping_interval,
-            max_pings_outstanding,
+            ping_interval_ms: AtomicU64::new(ping_interval.as_millis() as u64),
+            max_pings_outstanding: AtomicU32::new(max_pings_outstanding),
             subs: std::sync::RwLock::new(SubList::new()),
             upstream: std::sync::RwLock::new(None),
             upstream_tx: std::sync::RwLock::new(None),
@@ -280,10 +441,11 @@ impl ServerState {
             next_cid: AtomicU64::new(1),
             tls_config,
             active_connections: AtomicU64::new(0),
-            max_connections,
-            max_payload,
-            max_control_line,
-            max_subscriptions,
+            max_connections: AtomicUsize::new(max_connections),
+            max_payload: AtomicUsize::new(max_payload),
+            max_control_line: AtomicUsize::new(max_control_line),
+            max_subscriptions: AtomicUsize::new(max_subscriptions),
+            stats: ServerStats::default(),
         }
     }
 
@@ -409,7 +571,7 @@ impl LeafServer {
         is_websocket: bool,
     ) {
         // Enforce max_connections limit.
-        let max = self.state.max_connections;
+        let max = self.state.max_connections.load(Ordering::Relaxed);
         if max > 0 {
             let current = self.state.active_connections.load(Ordering::Relaxed);
             if current >= max as u64 {
@@ -421,6 +583,10 @@ impl LeafServer {
         }
         self.state
             .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .stats
+            .total_connections
             .fetch_add(1, Ordering::Relaxed);
 
         let cid = self.state.next_client_id();
@@ -435,6 +601,10 @@ impl LeafServer {
         if let Some(port) = self.config.metrics_port {
             install_metrics_exporter(port)?;
             info!(port, "prometheus metrics endpoint listening");
+        }
+
+        if let Some(port) = self.config.monitoring_port {
+            spawn_monitoring_server(port, Arc::clone(&self.state));
         }
 
         self.connect_upstream();
@@ -512,13 +682,22 @@ impl LeafServer {
     ///
     /// Uses `poll()` on the listener fd with a timeout so we can periodically
     /// check the shutdown flag without spinning.
+    ///
+    /// If `reload` is set (via SIGHUP), the server re-reads the config file and
+    /// updates hot-reloadable values (max_payload, max_connections, etc.).
     pub fn run_until_shutdown(
         &self,
         shutdown: Arc<AtomicBool>,
+        reload: Arc<AtomicBool>,
+        config_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(port) = self.config.metrics_port {
             install_metrics_exporter(port)?;
             info!(port, "prometheus metrics endpoint listening");
+        }
+
+        if let Some(port) = self.config.monitoring_port {
+            spawn_monitoring_server(port, Arc::clone(&self.state));
         }
 
         self.connect_upstream();
@@ -561,6 +740,16 @@ impl LeafServer {
                 break;
             }
 
+            // Check for config reload (SIGHUP)
+            if reload.load(Ordering::Relaxed) {
+                reload.store(false, Ordering::Relaxed);
+                if let Some(path) = config_path {
+                    self.reload_config(path);
+                } else {
+                    warn!("SIGHUP received but no config file specified");
+                }
+            }
+
             pfds[0].revents = 0;
             pfds[1].revents = 0;
             let ret = unsafe { libc::poll(pfds.as_mut_ptr(), nfds as libc::nfds_t, 1000) };
@@ -588,7 +777,28 @@ impl LeafServer {
             }
         }
 
-        // Shutdown workers: send shutdown command, then join threads.
+        // --- Lame duck mode shutdown ---
+        // 1. Build INFO with ldm: true and send to all workers
+        let mut ldm_info = self.state.info.clone();
+        ldm_info.lame_duck_mode = true;
+        let ldm_json = serde_json::to_string(&ldm_info).unwrap_or_default();
+        let ldm_line = format!("INFO {ldm_json}\r\n").into_bytes();
+
+        info!(
+            duration_secs = self.config.lame_duck_duration.as_secs(),
+            "entering lame duck mode"
+        );
+        for w in &workers {
+            w.send_lame_duck(ldm_line.clone());
+        }
+
+        // 2. Sleep for lame_duck_duration (stop accepting)
+        let end = std::time::Instant::now() + self.config.lame_duck_duration;
+        while std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        // 3. Shutdown workers
         for w in &workers {
             w.shutdown();
         }
@@ -610,6 +820,56 @@ impl LeafServer {
         }
 
         Ok(())
+    }
+
+    /// Reload configuration from file. Updates hot-reloadable values.
+    fn reload_config(&self, path: &str) {
+        info!(path, "reloading configuration");
+        match crate::config::load_config(std::path::Path::new(path)) {
+            Ok(new_config) => {
+                // Hot-reload numeric limits
+                self.state
+                    .max_payload
+                    .store(new_config.max_payload, Ordering::Relaxed);
+                self.state
+                    .max_connections
+                    .store(new_config.max_connections, Ordering::Relaxed);
+                self.state
+                    .max_control_line
+                    .store(new_config.max_control_line, Ordering::Relaxed);
+                self.state
+                    .max_subscriptions
+                    .store(new_config.max_subscriptions, Ordering::Relaxed);
+                self.state
+                    .max_pings_outstanding
+                    .store(new_config.max_pings_outstanding, Ordering::Relaxed);
+                self.state.ping_interval_ms.store(
+                    new_config.ping_interval.as_millis() as u64,
+                    Ordering::Relaxed,
+                );
+
+                // Warn about non-reloadable fields
+                if new_config.host != self.config.host {
+                    warn!("host change requires restart (ignored)");
+                }
+                if new_config.port != self.config.port {
+                    warn!("port change requires restart (ignored)");
+                }
+                if new_config.workers != self.config.workers {
+                    warn!("workers change requires restart (ignored)");
+                }
+                if new_config.tls_cert != self.config.tls_cert
+                    || new_config.tls_key != self.config.tls_key
+                {
+                    warn!("TLS config change requires restart (ignored)");
+                }
+
+                info!("configuration reloaded successfully");
+            }
+            Err(e) => {
+                error!(error = %e, "failed to reload configuration");
+            }
+        }
     }
 }
 

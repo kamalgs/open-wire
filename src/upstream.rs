@@ -520,7 +520,7 @@ fn handle_hub_op(
             // SAFETY: NATS subjects are always ASCII
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let subs = state.subs.read().unwrap();
-            subs.for_each_match(subject_str, |sub| {
+            let (_count, expired) = subs.for_each_match(subject_str, |sub| {
                 sub.writer.write_msg(
                     &subject,
                     &sub.sid_bytes,
@@ -530,6 +530,21 @@ fn handle_hub_op(
                 );
                 dirty_writers.push(sub.writer.clone());
             });
+            drop(subs);
+
+            // Remove expired subs (reached max delivery limit).
+            if !expired.is_empty() {
+                let mut subs = state.subs.write().unwrap();
+                for (conn_id, sid) in &expired {
+                    if let Some(removed) = subs.remove(*conn_id, *sid) {
+                        let mut upstream = state.upstream.write().unwrap();
+                        if let Some(ref mut up) = *upstream {
+                            up.remove_interest(&removed.subject, removed.queue.as_deref());
+                        }
+                    }
+                }
+                state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+            }
         }
         LeafOp::Ping => {
             // Send PONG via the writer thread

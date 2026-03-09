@@ -701,11 +701,7 @@ const IGNORED_KEYS: &[&str] = &[
     "debug",
     "trace",
     "logtime",
-    "log_file",
-    "pid_file",
     "write_deadline",
-    "lame_duck_duration",
-    "lame_duck_grace_period",
     "no_auth_user",
     "connect_error_reports",
     "reconnect_error_reports",
@@ -774,12 +770,23 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
                 config.ping_interval = std::time::Duration::from_secs(secs);
             }
             "ping_max" => config.max_pings_outstanding = as_u32(value)?,
+            "pid_file" => config.pid_file = Some(std::path::PathBuf::from(as_string(value)?)),
+            "log_file" => config.log_file = Some(std::path::PathBuf::from(as_string(value)?)),
+            "lame_duck_duration" => {
+                let secs = parse_duration_secs(value)?;
+                config.lame_duck_duration = std::time::Duration::from_secs(secs);
+            }
+            "lame_duck_grace_period" => {
+                let secs = parse_duration_secs(value)?;
+                config.lame_duck_grace_period = std::time::Duration::from_secs(secs);
+            }
 
             // --- open-wire extensions ---
             "workers" => config.workers = as_usize(value)?,
             "max_read_buf" => config.max_read_buf_capacity = parse_size(value)?,
             "write_buf_size" => config.write_buf_capacity = parse_size(value)?,
             "metrics_port" => config.metrics_port = Some(as_u16(value)?),
+            "monitoring_port" | "http_port" => config.monitoring_port = Some(as_u16(value)?),
 
             // --- authorization block ---
             "authorization" => {
