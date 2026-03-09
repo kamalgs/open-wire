@@ -24,6 +24,55 @@ use crate::sub_list::SubList;
 use crate::upstream::{Upstream, UpstreamCmd};
 use crate::worker::{Worker, WorkerHandle};
 
+/// Per-subject permission rule with allow/deny lists.
+#[derive(Debug, Clone, Default)]
+pub struct Permission {
+    /// Subjects allowed (NATS wildcard patterns). Empty = allow all.
+    pub allow: Vec<String>,
+    /// Subjects denied (NATS wildcard patterns). Deny takes precedence.
+    pub deny: Vec<String>,
+}
+
+impl Permission {
+    /// Check whether the given subject is permitted.
+    /// Deny takes precedence over allow. Empty allow list = allow all.
+    pub fn is_allowed(&self, subject: &str) -> bool {
+        if self
+            .deny
+            .iter()
+            .any(|p| crate::sub_list::subject_matches(p, subject))
+        {
+            return false;
+        }
+        if self.allow.is_empty() {
+            return true;
+        }
+        self.allow
+            .iter()
+            .any(|p| crate::sub_list::subject_matches(p, subject))
+    }
+}
+
+/// Per-user publish/subscribe permissions.
+#[derive(Debug, Clone, Default)]
+pub struct Permissions {
+    /// Publish permission rules.
+    pub publish: Permission,
+    /// Subscribe permission rules.
+    pub subscribe: Permission,
+}
+
+/// A user entry with credentials and optional permissions.
+#[derive(Debug, Clone)]
+pub struct UserConfig {
+    /// Username.
+    pub user: String,
+    /// Password.
+    pub pass: String,
+    /// Optional per-user permissions.
+    pub permissions: Option<Permissions>,
+}
+
 /// Downstream client authentication configuration.
 #[derive(Debug, Clone, Default)]
 pub enum ClientAuth {
@@ -37,6 +86,8 @@ pub enum ClientAuth {
     /// NKey public key allowlist. Server sends nonce in INFO;
     /// client signs nonce and sends `nkey` + `sig` in CONNECT.
     NKey(Vec<String>),
+    /// Multi-user with per-user credentials and optional permissions.
+    Users(Vec<UserConfig>),
 }
 
 impl ClientAuth {
@@ -50,6 +101,23 @@ impl ClientAuth {
         matches!(self, ClientAuth::NKey(_))
     }
 
+    /// Look up permissions for a successfully authenticated client.
+    /// Returns `None` if the auth mode doesn't support per-user permissions
+    /// or the user has no permissions configured.
+    pub fn lookup_permissions(&self, info: &ConnectInfo) -> Option<Permissions> {
+        match self {
+            ClientAuth::Users(users) => {
+                let u = info.user.as_deref()?;
+                let p = info.pass.as_deref()?;
+                users
+                    .iter()
+                    .find(|uc| uc.user == u && uc.pass == p)
+                    .and_then(|uc| uc.permissions.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Validate a client's CONNECT info against the configured auth.
     pub fn validate(&self, info: &ConnectInfo, nonce: &str) -> bool {
         match self {
@@ -58,6 +126,17 @@ impl ClientAuth {
             ClientAuth::UserPass { user, pass } => {
                 info.user.as_deref() == Some(user.as_str())
                     && info.pass.as_deref() == Some(pass.as_str())
+            }
+            ClientAuth::Users(users) => {
+                let u = match info.user.as_deref() {
+                    Some(u) => u,
+                    None => return false,
+                };
+                let p = match info.pass.as_deref() {
+                    Some(p) => p,
+                    None => return false,
+                };
+                users.iter().any(|uc| uc.user == u && uc.pass == p)
             }
             ClientAuth::NKey(allowed_keys) => {
                 let nkey = match info.nkey.as_deref() {
@@ -162,6 +241,9 @@ pub struct LeafServerConfig {
     pub pid_file: Option<PathBuf>,
     /// Path to the log file. When set, tracing output is directed here.
     pub log_file: Option<PathBuf>,
+    /// Timeout for clients to send CONNECT after connection (default: 2s).
+    /// Set to `Duration::ZERO` to disable. Only enforced when auth is required.
+    pub auth_timeout: std::time::Duration,
     /// Duration of lame duck mode before shutdown (default: 30s).
     pub lame_duck_duration: std::time::Duration,
     /// Grace period before lame duck starts closing connections (default: 10s).
@@ -198,6 +280,7 @@ impl Default for LeafServerConfig {
             tls_key: None,
             pid_file: None,
             log_file: None,
+            auth_timeout: std::time::Duration::from_secs(2),
             lame_duck_duration: std::time::Duration::from_secs(30),
             lame_duck_grace_period: std::time::Duration::from_secs(10),
             monitoring_port: None,
@@ -356,6 +439,17 @@ pub(crate) fn build_tls_server_config(
     Ok(Arc::new(config))
 }
 
+/// Build a rustls `ClientConfig` using system root certificates (webpki-roots).
+/// Used for TLS connections to upstream hub servers.
+pub(crate) fn build_tls_client_config() -> Arc<rustls::ClientConfig> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Arc::new(config)
+}
+
 /// Shared server state accessible by all client connections.
 /// Aggregated server statistics for /varz monitoring.
 pub(crate) struct ServerStats {
@@ -386,6 +480,7 @@ pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
     pub ping_interval_ms: AtomicU64,
+    pub auth_timeout_ms: AtomicU64,
     pub max_pings_outstanding: AtomicU32,
     pub subs: std::sync::RwLock<SubList>,
     pub upstream: std::sync::RwLock<Option<Upstream>>,
@@ -420,6 +515,7 @@ impl ServerState {
         info: ServerInfo,
         auth: ClientAuth,
         ping_interval: std::time::Duration,
+        auth_timeout: std::time::Duration,
         max_pings_outstanding: u32,
         buf_config: BufConfig,
         tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -432,6 +528,7 @@ impl ServerState {
             info,
             auth,
             ping_interval_ms: AtomicU64::new(ping_interval.as_millis() as u64),
+            auth_timeout_ms: AtomicU64::new(auth_timeout.as_millis() as u64),
             max_pings_outstanding: AtomicU32::new(max_pings_outstanding),
             subs: std::sync::RwLock::new(SubList::new()),
             upstream: std::sync::RwLock::new(None),
@@ -507,6 +604,7 @@ impl LeafServer {
                 info,
                 auth,
                 config.ping_interval,
+                config.auth_timeout,
                 config.max_pings_outstanding,
                 buf_config,
                 tls_config,
@@ -798,7 +896,15 @@ impl LeafServer {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        // 3. Shutdown workers
+        // 3. Drain all connections (flush pending, remove subs, disconnect)
+        info!("draining connections");
+        for w in &workers {
+            w.send_drain();
+        }
+        // Give workers time to flush
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // 4. Shutdown workers
         for w in &workers {
             w.shutdown();
         }
@@ -845,6 +951,10 @@ impl LeafServer {
                     .store(new_config.max_pings_outstanding, Ordering::Relaxed);
                 self.state.ping_interval_ms.store(
                     new_config.ping_interval.as_millis() as u64,
+                    Ordering::Relaxed,
+                );
+                self.state.auth_timeout_ms.store(
+                    new_config.auth_timeout.as_millis() as u64,
                     Ordering::Relaxed,
                 );
 
@@ -1090,5 +1200,144 @@ mod tests {
     fn default_metrics_port_is_none() {
         let config = LeafServerConfig::default();
         assert!(config.metrics_port.is_none());
+    }
+
+    // --- ClientAuth::Users ---
+
+    #[test]
+    fn users_match() {
+        let auth = ClientAuth::Users(vec![
+            UserConfig {
+                user: "alice".into(),
+                pass: "pass1".into(),
+                permissions: None,
+            },
+            UserConfig {
+                user: "bob".into(),
+                pass: "pass2".into(),
+                permissions: None,
+            },
+        ]);
+        let info = ConnectInfo {
+            user: Some("bob".into()),
+            pass: Some("pass2".into()),
+            ..Default::default()
+        };
+        assert!(auth.validate(&info, ""));
+    }
+
+    #[test]
+    fn users_wrong_pass() {
+        let auth = ClientAuth::Users(vec![UserConfig {
+            user: "alice".into(),
+            pass: "pass1".into(),
+            permissions: None,
+        }]);
+        let info = ConnectInfo {
+            user: Some("alice".into()),
+            pass: Some("wrong".into()),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, ""));
+    }
+
+    #[test]
+    fn users_unknown_user() {
+        let auth = ClientAuth::Users(vec![UserConfig {
+            user: "alice".into(),
+            pass: "pass1".into(),
+            permissions: None,
+        }]);
+        let info = ConnectInfo {
+            user: Some("unknown".into()),
+            pass: Some("pass1".into()),
+            ..Default::default()
+        };
+        assert!(!auth.validate(&info, ""));
+    }
+
+    #[test]
+    fn users_is_required() {
+        let auth = ClientAuth::Users(vec![]);
+        assert!(auth.is_required());
+        assert!(!auth.needs_nonce());
+    }
+
+    // --- Permission ---
+
+    #[test]
+    fn permission_allow_all_by_default() {
+        let perm = Permission::default();
+        assert!(perm.is_allowed("foo.bar"));
+    }
+
+    #[test]
+    fn permission_allow_list() {
+        let perm = Permission {
+            allow: vec!["foo.>".into()],
+            deny: Vec::new(),
+        };
+        assert!(perm.is_allowed("foo.bar"));
+        assert!(!perm.is_allowed("bar.baz"));
+    }
+
+    #[test]
+    fn permission_deny_takes_precedence() {
+        let perm = Permission {
+            allow: vec![">".into()],
+            deny: vec!["secret.>".into()],
+        };
+        assert!(perm.is_allowed("foo.bar"));
+        assert!(!perm.is_allowed("secret.data"));
+    }
+
+    #[test]
+    fn permission_deny_with_empty_allow() {
+        let perm = Permission {
+            allow: Vec::new(),
+            deny: vec!["_SYS.>".into()],
+        };
+        assert!(perm.is_allowed("foo.bar"));
+        assert!(!perm.is_allowed("_SYS.monitor"));
+    }
+
+    // --- lookup_permissions ---
+
+    #[test]
+    fn lookup_permissions_found() {
+        let auth = ClientAuth::Users(vec![UserConfig {
+            user: "alice".into(),
+            pass: "pass".into(),
+            permissions: Some(Permissions {
+                publish: Permission {
+                    allow: vec!["pub.>".into()],
+                    deny: Vec::new(),
+                },
+                subscribe: Permission::default(),
+            }),
+        }]);
+        let info = ConnectInfo {
+            user: Some("alice".into()),
+            pass: Some("pass".into()),
+            ..Default::default()
+        };
+        let perms = auth.lookup_permissions(&info);
+        assert!(perms.is_some());
+        assert_eq!(perms.unwrap().publish.allow, vec!["pub.>"]);
+    }
+
+    #[test]
+    fn lookup_permissions_none_for_non_users_auth() {
+        let auth = ClientAuth::Token("t".into());
+        let info = ConnectInfo::default();
+        assert!(auth.lookup_permissions(&info).is_none());
+    }
+
+    // --- auth_timeout default ---
+
+    #[test]
+    fn default_auth_timeout() {
+        let config = LeafServerConfig::default();
+        assert_eq!(config.auth_timeout, std::time::Duration::from_secs(2));
     }
 }

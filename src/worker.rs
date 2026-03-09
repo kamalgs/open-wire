@@ -47,6 +47,8 @@ pub(crate) enum WorkerCmd {
     },
     /// Broadcast INFO line with ldm:true to all active connections.
     LameDuck(Vec<u8>),
+    /// Drain all connections: flush pending data, remove subs, disconnect.
+    Drain,
     Shutdown,
 }
 
@@ -72,6 +74,12 @@ impl WorkerHandle {
     /// Send lame duck INFO line to all active connections.
     pub fn send_lame_duck(&self, info_line: Vec<u8>) {
         let _ = self.tx.send(WorkerCmd::LameDuck(info_line));
+        self.wake();
+    }
+
+    /// Send drain command to all connections and wake the worker.
+    pub fn send_drain(&self) {
+        let _ = self.tx.send(WorkerCmd::Drain);
         self.wake();
     }
 
@@ -125,6 +133,8 @@ enum ConnPhase {
     WaitConnect,
     /// Normal operation.
     Active,
+    /// Connection is draining — no new subs, flush pending, then disconnect.
+    Draining,
 }
 
 /// Transport layer for a client connection.
@@ -169,12 +179,16 @@ struct ClientState {
     epoll_has_out: bool,
     /// When false, suppress delivery of the client's own published messages.
     echo: bool,
+    /// When this connection was accepted (for auth timeout).
+    accepted_at: Instant,
     /// Last time activity was seen on this connection.
     last_activity: Instant,
     /// Number of server-initiated PINGs sent without a PONG response.
     pings_outstanding: u32,
     /// Number of active subscriptions for this connection.
     sub_count: usize,
+    /// Per-user permissions (set after CONNECT for Users auth).
+    permissions: Option<crate::server::Permissions>,
 }
 
 // --- Worker ---
@@ -265,15 +279,28 @@ impl Worker {
     fn run(&mut self) {
         let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
 
-        // Compute epoll timeout for periodic keepalive checks.
+        // Compute epoll timeout for periodic keepalive and auth timeout checks.
         // Use half the ping interval (capped at 30s) so we check reasonably often.
-        // -1 if keepalive is disabled.
+        // If auth timeout is enabled, ensure we wake up often enough to enforce it.
         let ping_interval_ms = self.state.ping_interval_ms.load(Ordering::Relaxed);
-        let epoll_timeout_ms = if ping_interval_ms == 0 {
-            -1i32
-        } else {
-            let half = ping_interval_ms / 2;
-            half.min(30_000) as i32
+        let auth_timeout_ms = self.state.auth_timeout_ms.load(Ordering::Relaxed);
+        let epoll_timeout_ms = {
+            let ping_half = if ping_interval_ms == 0 {
+                u64::MAX
+            } else {
+                (ping_interval_ms / 2).min(30_000)
+            };
+            let auth_half = if auth_timeout_ms == 0 || !self.state.auth.is_required() {
+                u64::MAX
+            } else {
+                (auth_timeout_ms / 2).clamp(100, 30_000)
+            };
+            let min = ping_half.min(auth_half);
+            if min == u64::MAX {
+                -1i32
+            } else {
+                min as i32
+            }
         };
 
         loop {
@@ -294,8 +321,8 @@ impl Worker {
                 break;
             }
 
-            for i in 0..n as usize {
-                let ev = events[i];
+            for ev in events.iter().take(n as usize) {
+                let ev = *ev;
                 let key = ev.u64;
 
                 if key == EVENT_FD_KEY {
@@ -323,9 +350,10 @@ impl Worker {
             // Flush accumulated message counters to the global metrics recorder.
             self.flush_metrics();
 
-            // Check for idle connections and send keepalive PINGs.
+            // Check for idle connections, keepalive PINGs, and auth timeouts.
             if epoll_timeout_ms > 0 {
                 self.check_pings();
+                self.check_auth_timeout();
             }
 
             if self.shutdown {
@@ -364,6 +392,9 @@ impl Worker {
                 }
                 WorkerCmd::LameDuck(info_line) => {
                     self.handle_lame_duck(&info_line);
+                }
+                WorkerCmd::Drain => {
+                    self.handle_drain();
                 }
                 WorkerCmd::Shutdown => {
                     self.shutdown = true;
@@ -445,9 +476,11 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
             sub_count: 0,
+            permissions: None,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -714,6 +747,41 @@ impl Worker {
         }
     }
 
+    /// Disconnect clients that haven't completed authentication within the deadline.
+    fn check_auth_timeout(&mut self) {
+        let timeout_ms = self.state.auth_timeout_ms.load(Ordering::Relaxed);
+        if timeout_ms == 0 || !self.state.auth.is_required() {
+            return;
+        }
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let now = Instant::now();
+        let epoll_fd = self.epoll_fd.as_raw_fd();
+        let mut to_remove: Vec<u64> = Vec::new();
+
+        for (conn_id, client) in &mut self.conns {
+            if matches!(client.phase, ConnPhase::Active) {
+                continue;
+            }
+            if now.duration_since(client.accepted_at) > timeout {
+                warn!(conn_id = *conn_id, "authentication timeout");
+                counter!("auth_timeout_total", "worker" => self.worker_label.clone()).increment(1);
+                client
+                    .write_buf
+                    .extend_from_slice(b"-ERR 'Authentication Timeout'\r\n");
+                if !client.epoll_has_out {
+                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                    client.epoll_has_out = true;
+                }
+                to_remove.push(*conn_id);
+            }
+        }
+
+        for conn_id in to_remove {
+            self.try_flush_conn(conn_id);
+            self.remove_conn(conn_id);
+        }
+    }
+
     /// Broadcast INFO with ldm:true to all active connections.
     fn handle_lame_duck(&mut self, info_line: &[u8]) {
         let epoll_fd = self.epoll_fd.as_raw_fd();
@@ -726,6 +794,38 @@ impl Worker {
                 epoll_mod(epoll_fd, client.fd, *conn_id, true);
                 client.epoll_has_out = true;
             }
+        }
+    }
+
+    /// Drain all connections: flush pending data, remove subscriptions, disconnect.
+    fn handle_drain(&mut self) {
+        let conn_ids: Vec<u64> = self.conns.keys().copied().collect();
+        for conn_id in conn_ids {
+            let is_active = matches!(
+                self.conns.get(&conn_id).map(|c| &c.phase),
+                Some(ConnPhase::Active)
+            );
+            if !is_active {
+                // Non-active connections: disconnect immediately
+                self.remove_conn(conn_id);
+                continue;
+            }
+            // Active connections: flush direct_buf, try to flush socket, then remove
+            if let Some(client) = self.conns.get_mut(&conn_id) {
+                client.phase = ConnPhase::Draining;
+                // Drain direct_buf into write_buf
+                {
+                    let mut dbuf = client.direct_buf.lock().unwrap();
+                    if !dbuf.is_empty() {
+                        client.write_buf.extend_from_slice(&dbuf);
+                        dbuf.clear();
+                    }
+                }
+            }
+            self.try_flush_conn(conn_id);
+            // Remove all subs for this connection
+            cleanup_conn(conn_id, &self.state);
+            self.remove_conn(conn_id);
         }
     }
 
@@ -936,7 +1036,7 @@ impl Worker {
         if let Some(client) = self.conns.get_mut(&conn_id) {
             if let Transport::WebSocket { codec, raw_buf, .. } = &mut client.transport {
                 loop {
-                    match codec.decode(raw_buf, &mut *client.read_buf) {
+                    match codec.decode(raw_buf, &mut client.read_buf) {
                         Ok(DecodeStatus::Complete) => continue,
                         Ok(DecodeStatus::NeedMore) => break,
                         Ok(DecodeStatus::Close) => {
@@ -1150,7 +1250,7 @@ impl Worker {
                     ConnPhase::WsHandshake => 0,
                     ConnPhase::SendInfo => return,
                     ConnPhase::WaitConnect => 1,
-                    ConnPhase::Active => 2,
+                    ConnPhase::Active | ConnPhase::Draining => 2,
                 },
                 None => return,
             };
@@ -1268,7 +1368,7 @@ impl Worker {
                 // WaitConnect: parse CONNECT
                 let op = {
                     let client = self.conns.get_mut(&conn_id).unwrap();
-                    match nats_proto::try_parse_client_op(&mut *client.read_buf) {
+                    match nats_proto::try_parse_client_op(&mut client.read_buf) {
                         Ok(op) => op,
                         Err(_) => {
                             self.remove_conn(conn_id);
@@ -1298,9 +1398,11 @@ impl Worker {
                             self.remove_conn(conn_id);
                             return;
                         }
+                        let perms = self.state.auth.lookup_permissions(&connect_info);
                         let client = self.conns.get_mut(&conn_id).unwrap();
                         client.phase = ConnPhase::Active;
                         client.echo = connect_info.echo;
+                        client.permissions = perms;
                         client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
                         info!(conn_id, "client connected");
                     }
@@ -1327,9 +1429,9 @@ impl Worker {
                 let op = {
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     let result = if can_skip {
-                        nats_proto::try_skip_or_parse_client_op(&mut *client.read_buf)
+                        nats_proto::try_skip_or_parse_client_op(&mut client.read_buf)
                     } else {
-                        nats_proto::try_parse_client_op(&mut *client.read_buf)
+                        nats_proto::try_parse_client_op(&mut client.read_buf)
                     };
                     match result {
                         Ok(op) => op,
@@ -1386,6 +1488,35 @@ impl Worker {
                 subject,
                 queue_group,
             } => {
+                // Silently reject SUB during drain
+                if matches!(
+                    self.conns.get(&conn_id).map(|c| &c.phase),
+                    Some(ConnPhase::Draining)
+                ) {
+                    return Ok(());
+                }
+
+                // Check subscribe permissions
+                {
+                    let denied = self.conns.get(&conn_id).and_then(|c| {
+                        c.permissions.as_ref().map(|p| {
+                            let subj = bytes_to_str(&subject);
+                            !p.subscribe.is_allowed(subj)
+                        })
+                    });
+                    if denied == Some(true) {
+                        counter!("subscriptions_rejected_total", "reason" => "permissions")
+                            .increment(1);
+                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                            client.write_buf.extend_from_slice(
+                                b"-ERR 'Permissions Violation for Subscription'\r\n",
+                            );
+                        }
+                        self.try_flush_conn(conn_id);
+                        return Ok(());
+                    }
+                }
+
                 let max_subs = self.state.max_subscriptions.load(Ordering::Relaxed);
                 if max_subs > 0 {
                     let at_limit = match self.conns.get(&conn_id) {
@@ -1526,6 +1657,26 @@ impl Worker {
                 headers,
                 ..
             } => {
+                // Check publish permissions
+                {
+                    let denied = self.conns.get(&conn_id).and_then(|c| {
+                        c.permissions.as_ref().map(|p| {
+                            let subj = bytes_to_str(&subject);
+                            !p.publish.is_allowed(subj)
+                        })
+                    });
+                    if denied == Some(true) {
+                        counter!("messages_rejected_total", "reason" => "permissions").increment(1);
+                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                            client
+                                .write_buf
+                                .extend_from_slice(b"-ERR 'Permissions Violation for Publish'\r\n");
+                        }
+                        self.try_flush_conn(conn_id);
+                        return Ok(());
+                    }
+                }
+
                 let max_payload = self.state.max_payload.load(Ordering::Relaxed);
                 if max_payload > 0 && payload.len() > max_payload {
                     warn!(
@@ -1583,11 +1734,11 @@ impl Worker {
                             return;
                         }
                         // Accumulate notification (deduplicated across entire batch).
-                        if !pending_notify[..*pending_count].contains(&fd) {
-                            if *pending_count < pending_notify.len() {
-                                pending_notify[*pending_count] = fd;
-                                *pending_count += 1;
-                            }
+                        if !pending_notify[..*pending_count].contains(&fd)
+                            && *pending_count < pending_notify.len()
+                        {
+                            pending_notify[*pending_count] = fd;
+                            *pending_count += 1;
                         }
                     });
                     drop(subs);

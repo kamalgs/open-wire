@@ -193,6 +193,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.monitoring_port = Some(args[i].parse().expect("invalid monitoring-port"));
             }
+            "--auth-timeout" => {
+                i += 1;
+                let secs: u64 = args[i].parse().expect("invalid auth-timeout");
+                config.auth_timeout = std::time::Duration::from_secs(secs);
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
@@ -205,7 +210,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH] \
                      [--max-payload BYTES] [--max-connections N] \
                      [--max-control-line BYTES] [--max-subscriptions N] \
-                     [--pid-file PATH] [--log-file PATH] [--monitoring-port PORT]"
+                     [--pid-file PATH] [--log-file PATH] [--monitoring-port PORT] \
+                     [--auth-timeout SECS]"
                 );
                 std::process::exit(1);
             }

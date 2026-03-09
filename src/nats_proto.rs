@@ -80,7 +80,7 @@ fn parse_size(d: &[u8]) -> io::Result<usize> {
     }
     let mut n: usize = 0;
     for &b in d {
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad size"));
         }
         n = n * 10 + (b - b'0') as usize;
@@ -96,7 +96,7 @@ fn parse_u64(d: &[u8]) -> io::Result<u64> {
     }
     let mut n: u64 = 0;
     for &b in d {
-        if b < b'0' || b > b'9' {
+        if !b.is_ascii_digit() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad u64"));
         }
         n = n * 10 + (b - b'0') as u64;
@@ -873,6 +873,12 @@ pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
 /// to avoid allocation.
 pub struct MsgBuilder {
     buf: Vec<u8>,
+}
+
+impl Default for MsgBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MsgBuilder {

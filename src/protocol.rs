@@ -9,6 +9,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::RawFd;
+use std::sync::{Arc, Mutex};
 
 use bytes::{BufMut, BytesMut};
 
@@ -26,6 +27,74 @@ pub(crate) struct UpstreamConnectCreds {
 }
 
 use crate::nats_proto::{self, MsgBuilder};
+
+/// Stream wrapper for upstream hub connections — plain TCP or TLS.
+///
+/// For TLS, both halves share the same `ClientConnection` behind an `Arc<Mutex>`.
+/// Each half also holds a cloned `TcpStream` so reads and writes go to the same socket.
+pub(crate) enum HubStream {
+    Plain(TcpStream),
+    Tls {
+        tls: Arc<Mutex<rustls::ClientConnection>>,
+        tcp: TcpStream,
+    },
+}
+
+impl Read for HubStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            HubStream::Plain(s) => s.read(buf),
+            HubStream::Tls { tls, tcp } => {
+                let mut conn = tls.lock().unwrap();
+                // Feed encrypted data from socket into TLS engine
+                match conn.read_tls(tcp) {
+                    Ok(0) => return Ok(0),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // No data available on socket, but maybe we have buffered plaintext
+                    }
+                    Err(e) => return Err(e),
+                }
+                conn.process_new_packets()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                match conn.reader().read(buf) {
+                    Ok(n) => Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // No plaintext available yet
+                        Err(e)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        }
+    }
+}
+
+impl Write for HubStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            HubStream::Plain(s) => s.write(buf),
+            HubStream::Tls { tls, tcp } => {
+                let mut conn = tls.lock().unwrap();
+                let n = conn.writer().write(buf)?;
+                conn.write_tls(tcp)?;
+                Ok(n)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            HubStream::Plain(s) => s.flush(),
+            HubStream::Tls { tls, tcp } => {
+                let mut conn = tls.lock().unwrap();
+                conn.writer().flush()?;
+                conn.write_tls(tcp)?;
+                tcp.flush()
+            }
+        }
+    }
+}
 
 // Re-export parsed op types so the rest of the crate uses nats_proto's types.
 pub(crate) use crate::nats_proto::ClientOp;
@@ -345,7 +414,7 @@ impl ServerConn {
 /// Used during the handshake phase; call `split()` to get independent
 /// reader/writer halves for the I/O loop.
 pub(crate) struct LeafConn {
-    stream: TcpStream,
+    stream: HubStream,
     read_buf: AdaptiveBuf,
     buf_config: BufConfig,
 }
@@ -353,7 +422,23 @@ pub(crate) struct LeafConn {
 impl LeafConn {
     pub(crate) fn new(stream: TcpStream, buf_config: BufConfig) -> Self {
         Self {
-            stream,
+            stream: HubStream::Plain(stream),
+            read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
+            buf_config,
+        }
+    }
+
+    /// Create a new leaf connection over TLS.
+    pub(crate) fn new_tls(
+        tcp: TcpStream,
+        tls_conn: rustls::ClientConnection,
+        buf_config: BufConfig,
+    ) -> Self {
+        Self {
+            stream: HubStream::Tls {
+                tls: Arc::new(Mutex::new(tls_conn)),
+                tcp,
+            },
             read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
             buf_config,
         }
@@ -362,17 +447,46 @@ impl LeafConn {
     /// Split into independent reader and writer halves.
     /// The writer is wrapped in a BufWriter for batched I/O.
     pub(crate) fn split(self) -> io::Result<(LeafReader, LeafWriter)> {
-        let writer_stream = self.stream.try_clone()?;
-        Ok((
-            LeafReader {
-                reader: self.stream,
-                read_buf: self.read_buf,
-            },
-            LeafWriter {
-                writer: BufWriter::with_capacity(self.buf_config.write_buf, writer_stream),
-                msg_builder: MsgBuilder::new(),
-            },
-        ))
+        match self.stream {
+            HubStream::Plain(tcp) => {
+                let writer_tcp = tcp.try_clone()?;
+                Ok((
+                    LeafReader {
+                        reader: HubStream::Plain(tcp),
+                        read_buf: self.read_buf,
+                    },
+                    LeafWriter {
+                        writer: BufWriter::with_capacity(
+                            self.buf_config.write_buf,
+                            HubStream::Plain(writer_tcp),
+                        ),
+                        msg_builder: MsgBuilder::new(),
+                    },
+                ))
+            }
+            HubStream::Tls { tls, tcp } => {
+                let writer_tcp = tcp.try_clone()?;
+                Ok((
+                    LeafReader {
+                        reader: HubStream::Tls {
+                            tls: Arc::clone(&tls),
+                            tcp,
+                        },
+                        read_buf: self.read_buf,
+                    },
+                    LeafWriter {
+                        writer: BufWriter::with_capacity(
+                            self.buf_config.write_buf,
+                            HubStream::Tls {
+                                tls,
+                                tcp: writer_tcp,
+                            },
+                        ),
+                        msg_builder: MsgBuilder::new(),
+                    },
+                ))
+            }
+        }
     }
 
     /// Read the next leaf operation from the hub.
@@ -463,7 +577,7 @@ impl LeafConn {
 
 /// Read half of a leaf connection.
 pub(crate) struct LeafReader {
-    reader: TcpStream,
+    reader: HubStream,
     read_buf: AdaptiveBuf,
 }
 
@@ -496,7 +610,7 @@ impl LeafReader {
 
 /// Write half of a leaf connection, wrapped in BufWriter.
 pub(crate) struct LeafWriter {
-    writer: BufWriter<TcpStream>,
+    writer: BufWriter<HubStream>,
     msg_builder: MsgBuilder,
 }
 

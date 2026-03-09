@@ -6,7 +6,7 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write as _};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -217,11 +217,21 @@ fn connect_and_run(
 
     let stream_shutdown = tcp.try_clone()?;
 
-    if parsed.use_tls {
-        return Err("tls:// upstream not yet supported; use nats:// scheme".into());
-    }
-
-    let mut leaf = LeafConn::new(tcp, state.buf_config);
+    let mut leaf = if parsed.use_tls {
+        let tls_config = crate::server::build_tls_client_config();
+        let server_name = rustls_pki_types::ServerName::try_from(parsed.host.clone())
+            .map_err(|e| format!("invalid TLS server name '{}': {e}", parsed.host))?;
+        let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
+            .map_err(|e| format!("TLS client connection failed: {e}"))?;
+        // Perform TLS handshake using blocking I/O via StreamOwned
+        let mut tls_stream = rustls::StreamOwned::new(tls_conn, tcp);
+        // Force handshake by flushing (rustls completes handshake on first I/O)
+        tls_stream.flush()?;
+        let (tls_conn, tcp) = tls_stream.into_parts();
+        LeafConn::new_tls(tcp, tls_conn, state.buf_config)
+    } else {
+        LeafConn::new(tcp, state.buf_config)
+    };
 
     let merged = merge_hub_credentials(&parsed.creds, config_creds);
 
@@ -569,6 +579,8 @@ fn handle_hub_op(
 /// Parsed hub URL components.
 struct ParsedHubUrl {
     addr: String,
+    /// Hostname for TLS SNI (Server Name Indication).
+    host: String,
     creds: HubCredentials,
     use_tls: bool,
 }
@@ -582,9 +594,10 @@ struct ParsedHubUrl {
 /// - `nats://user:pass@host:port` — user/pass auth
 /// - `host:port` — bare address, no credentials
 fn parse_hub_url(url: &str) -> Result<ParsedHubUrl, Box<dyn std::error::Error>> {
-    let use_tls = url.starts_with("tls://");
+    let use_tls = url.starts_with("tls://") || url.starts_with("nats+tls://");
     let stripped = url
         .strip_prefix("tls://")
+        .or_else(|| url.strip_prefix("nats+tls://"))
         .or_else(|| url.strip_prefix("nats://"))
         .or_else(|| url.strip_prefix("nats-leaf://"))
         .unwrap_or(url);
@@ -609,6 +622,13 @@ fn parse_hub_url(url: &str) -> Result<ParsedHubUrl, Box<dyn std::error::Error>> 
         stripped
     };
 
+    // Extract hostname (before port) for TLS SNI
+    let host = if let Some(colon_pos) = host_port.rfind(':') {
+        host_port[..colon_pos].to_string()
+    } else {
+        host_port.to_string()
+    };
+
     let addr = if host_port.contains(':') {
         host_port.to_string()
     } else {
@@ -618,6 +638,7 @@ fn parse_hub_url(url: &str) -> Result<ParsedHubUrl, Box<dyn std::error::Error>> 
 
     Ok(ParsedHubUrl {
         addr,
+        host,
         creds,
         use_tls,
     })
@@ -797,7 +818,23 @@ mod tests {
     fn parse_tls_scheme() {
         let parsed = parse_hub_url("tls://hub:7422").unwrap();
         assert_eq!(parsed.addr, "hub:7422");
+        assert_eq!(parsed.host, "hub");
         assert!(parsed.use_tls);
+    }
+
+    #[test]
+    fn parse_nats_tls_scheme() {
+        let parsed = parse_hub_url("nats+tls://hub.example.com:7422").unwrap();
+        assert_eq!(parsed.addr, "hub.example.com:7422");
+        assert_eq!(parsed.host, "hub.example.com");
+        assert!(parsed.use_tls);
+    }
+
+    #[test]
+    fn parse_host_extracted() {
+        let parsed = parse_hub_url("nats://myhost:4222").unwrap();
+        assert_eq!(parsed.host, "myhost");
+        assert!(!parsed.use_tls);
     }
 
     // --- merge_hub_credentials ---

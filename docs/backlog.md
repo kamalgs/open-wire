@@ -6,7 +6,7 @@ Items marked ~~strikethrough~~ are already implemented.
 ## Protocol Gaps
 
 - ~~**UNSUB max enforcement**~~ — auto-unsubscribe after N messages (`UNSUB <sid> <max>`).
-- **Drain protocol** — graceful client drain (`-ERR` + disconnect after flush).
+- ~~**Drain protocol**~~ — graceful client drain (`-ERR` + disconnect after flush).
 - **Subject deny import/export** — per-connection subject allow/deny lists on
   leaf connections.
 - **HMSG header forwarding fidelity** — verify all header edge cases match Go
@@ -32,12 +32,12 @@ Items marked ~~strikethrough~~ are already implemented.
 ## Security Gaps
 
 - **mTLS** — mutual TLS with client certificate verification.
-- **TLS to upstream hub** — TLS on the leaf→hub connection (currently plaintext only).
+- ~~**TLS to upstream hub**~~ — TLS on the leaf→hub connection (currently plaintext only).
 - ~~**TLS for clients**~~ — accept TLS client connections (rustls).
 - ~~**Token / user-pass auth**~~ — single token or user/password authentication.
 - ~~**NKey auth**~~ — NKey challenge-response authentication.
-- **Per-user permissions** — publish/subscribe allow/deny per user.
-- **Auth timeout** — disconnect clients that don't authenticate within a deadline.
+- ~~**Per-user permissions**~~ — publish/subscribe allow/deny per user.
+- ~~**Auth timeout**~~ — disconnect clients that don't authenticate within a deadline.
 - **Accounts** — multi-tenant account isolation (non-goal for now, but noted for
   completeness).
 

@@ -30,7 +30,9 @@
 use std::fmt;
 use std::path::Path;
 
-use crate::server::{ClientAuth, HubCredentials, LeafServerConfig};
+use crate::server::{
+    ClientAuth, HubCredentials, LeafServerConfig, Permission, Permissions, UserConfig,
+};
 
 /// Errors that can occur during config parsing.
 #[derive(Debug)]
@@ -743,6 +745,7 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
     let mut auth_token: Option<String> = None;
     let mut auth_user: Option<String> = None;
     let mut auth_pass: Option<String> = None;
+    let mut auth_users: Option<Vec<UserConfig>> = None;
 
     for (key, value) in entries {
         match key.as_str() {
@@ -768,6 +771,10 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
             "ping_interval" => {
                 let secs = parse_duration_secs(value)?;
                 config.ping_interval = std::time::Duration::from_secs(secs);
+            }
+            "auth_timeout" => {
+                let secs = parse_duration_secs(value)?;
+                config.auth_timeout = std::time::Duration::from_secs(secs);
             }
             "ping_max" => config.max_pings_outstanding = as_u32(value)?,
             "pid_file" => config.pid_file = Some(std::path::PathBuf::from(as_string(value)?)),
@@ -796,6 +803,11 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
                             "token" => auth_token = Some(as_string(aval)?),
                             "user" | "username" => auth_user = Some(as_string(aval)?),
                             "password" | "pass" => auth_pass = Some(as_string(aval)?),
+                            "users" => {
+                                if let Some(arr) = aval.as_array() {
+                                    auth_users = Some(parse_users_array(arr)?);
+                                }
+                            }
                             _ => {
                                 tracing::debug!("ignoring authorization key: {akey}");
                             }
@@ -863,7 +875,9 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
     }
 
     // Build client auth
-    if let Some(token) = auth_token {
+    if let Some(users) = auth_users {
+        config.client_auth = ClientAuth::Users(users);
+    } else if let Some(token) = auth_token {
         config.client_auth = ClientAuth::Token(token);
     } else if let (Some(user), Some(pass)) = (auth_user, auth_pass) {
         config.client_auth = ClientAuth::UserPass { user, pass };
@@ -942,6 +956,98 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
     }
 
     Ok(())
+}
+
+/// Parse a `users` array from the authorization block.
+fn parse_users_array(arr: &[Value]) -> Result<Vec<UserConfig>, ConfigError> {
+    let mut users = Vec::with_capacity(arr.len());
+    for item in arr {
+        let entries = match item.as_map() {
+            Some(e) => e,
+            None => continue,
+        };
+        let mut user = String::new();
+        let mut pass = String::new();
+        let mut permissions: Option<Permissions> = None;
+
+        for (key, val) in entries {
+            match key.as_str() {
+                "user" | "username" => user = as_string(val)?,
+                "password" | "pass" => pass = as_string(val)?,
+                "permissions" => {
+                    if let Some(pmap) = val.as_map() {
+                        permissions = Some(parse_permissions(pmap)?);
+                    }
+                }
+                _ => {
+                    tracing::debug!("ignoring user key: {key}");
+                }
+            }
+        }
+
+        if user.is_empty() || pass.is_empty() {
+            tracing::warn!("skipping user entry with missing user/password");
+            continue;
+        }
+        users.push(UserConfig {
+            user,
+            pass,
+            permissions,
+        });
+    }
+    Ok(users)
+}
+
+/// Parse a permissions block: `{ publish: { allow/deny }, subscribe: { allow/deny } }`.
+fn parse_permissions(entries: &[(String, Value)]) -> Result<Permissions, ConfigError> {
+    let mut perms = Permissions::default();
+    for (key, val) in entries {
+        match key.as_str() {
+            "publish" => {
+                perms.publish = parse_permission_rule(val)?;
+            }
+            "subscribe" => {
+                perms.subscribe = parse_permission_rule(val)?;
+            }
+            _ => {
+                tracing::debug!("ignoring permissions key: {key}");
+            }
+        }
+    }
+    Ok(perms)
+}
+
+/// Parse a single permission rule: `{ allow: [...], deny: [...] }` or just an array (= allow).
+fn parse_permission_rule(val: &Value) -> Result<Permission, ConfigError> {
+    // If it's a bare array, treat it as allow list
+    if let Some(arr) = val.as_array() {
+        let allow = arr.iter().map(as_string).collect::<Result<Vec<_>, _>>()?;
+        return Ok(Permission {
+            allow,
+            deny: Vec::new(),
+        });
+    }
+    let mut perm = Permission::default();
+    if let Some(entries) = val.as_map() {
+        for (key, v) in entries {
+            match key.as_str() {
+                "allow" => {
+                    if let Some(arr) = v.as_array() {
+                        perm.allow = arr.iter().map(as_string).collect::<Result<Vec<_>, _>>()?;
+                    }
+                }
+                "deny" => {
+                    if let Some(arr) = v.as_array() {
+                        perm.deny = arr.iter().map(as_string).collect::<Result<Vec<_>, _>>()?;
+                    }
+                }
+                _ => {
+                    tracing::debug!("ignoring permission key: {key}");
+                }
+            }
+        }
+    }
+    Ok(perm)
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1356,45 @@ authorization {
 "#;
         let config = load_config_str(input).unwrap();
         assert!(matches!(config.client_auth, ClientAuth::Token(ref t) if t == "s3cret-t0ken"));
+    }
+
+    #[test]
+    fn parse_users_auth() {
+        let input = r#"
+authorization {
+    users [
+        { user: "alice", password: "pass1" }
+        { user: "bob", password: "pass2", permissions: {
+            publish: { allow: ["pub.>"], deny: ["pub.secret.>"] }
+            subscribe: ["sub.>"]
+        }}
+    ]
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        match &config.client_auth {
+            ClientAuth::Users(users) => {
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].user, "alice");
+                assert_eq!(users[0].pass, "pass1");
+                assert!(users[0].permissions.is_none());
+
+                assert_eq!(users[1].user, "bob");
+                let perms = users[1].permissions.as_ref().unwrap();
+                assert_eq!(perms.publish.allow, vec!["pub.>"]);
+                assert_eq!(perms.publish.deny, vec!["pub.secret.>"]);
+                assert_eq!(perms.subscribe.allow, vec!["sub.>"]);
+                assert!(perms.subscribe.deny.is_empty());
+            }
+            _ => panic!("expected Users auth"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_timeout() {
+        let input = "auth_timeout: 5\n";
+        let config = load_config_str(input).unwrap();
+        assert_eq!(config.auth_timeout, std::time::Duration::from_secs(5));
     }
 
     #[test]
