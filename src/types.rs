@@ -100,9 +100,16 @@ pub struct ConnectInfo {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// A simple NATS header map. Keys are case-preserved strings.
+///
+/// Preserves the NATS/1.0 status line (e.g. `NATS/1.0 503` or
+/// `NATS/1.0 408 Request Timeout`) through the entire message path.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeaderMap {
     inner: HashMap<String, Vec<String>>,
+    /// Optional status code from the `NATS/1.0` version line (e.g. 503, 408).
+    status: Option<u16>,
+    /// Optional status description (e.g. "Request Timeout").
+    description: Option<String>,
 }
 
 impl HeaderMap {
@@ -111,7 +118,23 @@ impl HeaderMap {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.is_empty() && self.status.is_none()
+    }
+
+    /// Return the status code from the version line, if any.
+    pub fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// Return the status description from the version line, if any.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Set the status code and optional description on the version line.
+    pub fn set_status(&mut self, code: u16, description: Option<String>) {
+        self.status = Some(code);
+        self.description = description;
     }
 
     /// Append a value to the given header key (allows multiple values per key).
@@ -140,7 +163,23 @@ impl HeaderMap {
     /// ```
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(b"NATS/1.0\r\n");
+        match (self.status, self.description.as_deref()) {
+            (Some(code), Some(desc)) => {
+                buf.extend_from_slice(b"NATS/1.0 ");
+                buf.extend_from_slice(code.to_string().as_bytes());
+                buf.extend_from_slice(b" ");
+                buf.extend_from_slice(desc.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            (Some(code), None) => {
+                buf.extend_from_slice(b"NATS/1.0 ");
+                buf.extend_from_slice(code.to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            _ => {
+                buf.extend_from_slice(b"NATS/1.0\r\n");
+            }
+        }
         for (k, vs) in &self.inner {
             for v in vs {
                 buf.extend_from_slice(k.as_bytes());
@@ -156,6 +195,11 @@ impl HeaderMap {
 
 impl fmt::Display for HeaderMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.status, self.description.as_deref()) {
+            (Some(code), Some(desc)) => writeln!(f, "NATS/1.0 {code} {desc}")?,
+            (Some(code), None) => writeln!(f, "NATS/1.0 {code}")?,
+            _ => writeln!(f, "NATS/1.0")?,
+        }
         for (k, vs) in &self.inner {
             for v in vs {
                 writeln!(f, "{k}: {v}")?;
@@ -220,6 +264,44 @@ mod tests {
         h.append("X", "b".into());
         // get() returns first value
         assert_eq!(h.get("X"), Some("a"));
+    }
+
+    #[test]
+    fn header_map_status_round_trip() {
+        let mut h = HeaderMap::new();
+        h.set_status(503, None);
+        let bytes = h.to_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert_eq!(s, "NATS/1.0 503\r\n\r\n");
+    }
+
+    #[test]
+    fn header_map_status_with_description() {
+        let mut h = HeaderMap::new();
+        h.set_status(408, Some("Request Timeout".into()));
+        h.insert("X-Key", "val".into());
+        let bytes = h.to_bytes();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("NATS/1.0 408 Request Timeout\r\n"));
+        assert!(s.contains("X-Key: val\r\n"));
+    }
+
+    #[test]
+    fn header_map_status_only_not_empty() {
+        let mut h = HeaderMap::new();
+        assert!(h.is_empty());
+        h.set_status(503, None);
+        assert!(!h.is_empty());
+        assert_eq!(h.status(), Some(503));
+        assert_eq!(h.description(), None);
+    }
+
+    #[test]
+    fn header_map_display_with_status() {
+        let mut h = HeaderMap::new();
+        h.set_status(408, Some("Request Timeout".into()));
+        let s = format!("{h}");
+        assert!(s.starts_with("NATS/1.0 408 Request Timeout\n"));
     }
 
     #[test]

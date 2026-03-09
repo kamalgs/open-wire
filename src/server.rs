@@ -237,6 +237,10 @@ pub struct LeafServerConfig {
     pub tls_cert: Option<PathBuf>,
     /// Path to TLS private key file (PEM).
     pub tls_key: Option<PathBuf>,
+    /// Path to CA certificate file (PEM) for client certificate verification (mTLS).
+    pub tls_ca_cert: Option<PathBuf>,
+    /// When `true` (and `tls_ca_cert` is set), require and verify client certificates.
+    pub tls_verify: bool,
     /// Path to write the server PID file. Removed on shutdown.
     pub pid_file: Option<PathBuf>,
     /// Path to the log file. When set, tracing output is directed here.
@@ -278,6 +282,8 @@ impl Default for LeafServerConfig {
             metrics_port: None,
             tls_cert: None,
             tls_key: None,
+            tls_ca_cert: None,
+            tls_verify: false,
             pid_file: None,
             log_file: None,
             auth_timeout: std::time::Duration::from_secs(2),
@@ -417,10 +423,16 @@ fn handle_monitoring_request(stream: &mut TcpStream, state: &ServerState) -> io:
 }
 
 /// Build a rustls `ServerConfig` from PEM cert and key files.
+///
+/// When `ca_cert_path` is provided and `verify` is `true`, client certificates
+/// are required and verified against the given CA (mutual TLS).
 pub(crate) fn build_tls_server_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
+    ca_cert_path: Option<&std::path::Path>,
+    verify: bool,
 ) -> io::Result<Arc<rustls::ServerConfig>> {
+    use rustls::server::WebPkiClientVerifier;
     use rustls_pemfile::{certs, private_key};
 
     let cert_file = &mut io::BufReader::new(std::fs::File::open(cert_path)?);
@@ -431,10 +443,38 @@ pub(crate) fn build_tls_server_config(
     let key = private_key(key_file)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no private key found"))?;
 
-    let config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS config: {e}")))?;
+    let config = if verify {
+        let ca_path = ca_cert_path.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tls_verify requires tls_ca_cert",
+            )
+        })?;
+        let ca_file = &mut io::BufReader::new(std::fs::File::open(ca_path)?);
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in certs(ca_file) {
+            let cert = cert?;
+            root_store
+                .add(cert)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("CA cert: {e}")))?;
+        }
+
+        let verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("client verifier: {e}"))
+            })?;
+
+        rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS config: {e}")))?
+    } else {
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS config: {e}")))?
+    };
 
     Ok(Arc::new(config))
 }
@@ -570,9 +610,15 @@ impl LeafServer {
         };
 
         let tls_config = match (&config.tls_cert, &config.tls_key) {
-            (Some(cert), Some(key)) => {
-                Some(build_tls_server_config(cert, key).expect("failed to load TLS cert/key"))
-            }
+            (Some(cert), Some(key)) => Some(
+                build_tls_server_config(
+                    cert,
+                    key,
+                    config.tls_ca_cert.as_deref(),
+                    config.tls_verify,
+                )
+                .expect("failed to load TLS cert/key"),
+            ),
             _ => None,
         };
 
@@ -970,6 +1016,8 @@ impl LeafServer {
                 }
                 if new_config.tls_cert != self.config.tls_cert
                     || new_config.tls_key != self.config.tls_key
+                    || new_config.tls_ca_cert != self.config.tls_ca_cert
+                    || new_config.tls_verify != self.config.tls_verify
                 {
                     warn!("TLS config change requires restart (ignored)");
                 }

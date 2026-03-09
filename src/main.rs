@@ -165,6 +165,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.tls_key = Some(std::path::PathBuf::from(&args[i]));
             }
+            "--tls-ca-cert" => {
+                i += 1;
+                config.tls_ca_cert = Some(std::path::PathBuf::from(&args[i]));
+            }
+            "--tls-verify" => {
+                config.tls_verify = true;
+            }
             "--max-payload" => {
                 i += 1;
                 config.max_payload = args[i].parse().expect("invalid max-payload");
@@ -208,6 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
                      [--hub-token TOKEN] [--hub-creds PATH] \
                      [--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH] \
+                     [--tls-ca-cert PATH] [--tls-verify] \
                      [--max-payload BYTES] [--max-connections N] \
                      [--max-control-line BYTES] [--max-subscriptions N] \
                      [--pid-file PATH] [--log-file PATH] [--monitoring-port PORT] \

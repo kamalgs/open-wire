@@ -1268,6 +1268,20 @@ impl Worker {
                     None => return,
                 };
                 if handshake_done {
+                    // Log client certificate if present (mTLS)
+                    if let Some(c) = self.conns.get(&conn_id) {
+                        if let Transport::Tls(ref tls) = c.transport {
+                            if let Some(certs) = tls.tls_conn.peer_certificates() {
+                                if let Some(cert) = certs.first() {
+                                    tracing::info!(
+                                        conn_id,
+                                        cert_len = cert.len(),
+                                        "client certificate verified"
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     // Queue INFO in write_buf (will be encrypted by tls_flush_encrypted)
                     client.write_buf.extend_from_slice(&self.info_line);

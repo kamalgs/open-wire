@@ -9,7 +9,7 @@ Items marked ~~strikethrough~~ are already implemented.
 - ~~**Drain protocol**~~ — graceful client drain (`-ERR` + disconnect after flush).
 - **Subject deny import/export** — per-connection subject allow/deny lists on
   leaf connections.
-- **HMSG header forwarding fidelity** — verify all header edge cases match Go
+- ~~**HMSG header forwarding fidelity**~~ — verify all header edge cases match Go
   behavior (multi-value, empty headers, etc.).
 - **Request-reply timeout** — server-side request timeout support.
 - **Multiple hub connections** — connect to more than one upstream hub.
@@ -31,7 +31,7 @@ Items marked ~~strikethrough~~ are already implemented.
 
 ## Security Gaps
 
-- **mTLS** — mutual TLS with client certificate verification.
+- ~~**mTLS**~~ — mutual TLS with client certificate verification.
 - ~~**TLS to upstream hub**~~ — TLS on the leaf→hub connection (currently plaintext only).
 - ~~**TLS for clients**~~ — accept TLS client connections (rustls).
 - ~~**Token / user-pass auth**~~ — single token or user/password authentication.

@@ -855,6 +855,13 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
                             "key_file" => {
                                 config.tls_key = Some(std::path::PathBuf::from(as_string(tval)?));
                             }
+                            "ca_file" => {
+                                config.tls_ca_cert =
+                                    Some(std::path::PathBuf::from(as_string(tval)?));
+                            }
+                            "verify" => {
+                                config.tls_verify = matches!(tval, Value::Bool(true));
+                            }
                             _ => {
                                 tracing::debug!("ignoring tls key: {tkey}");
                             }
@@ -1469,5 +1476,36 @@ leafnodes {
         let input = r#"ping_interval: "2m""#;
         let config = load_config_str(input).unwrap();
         assert_eq!(config.ping_interval, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn parse_tls_ca_file_and_verify() {
+        let input = r#"
+tls {
+    cert_file: "/path/to/cert.pem"
+    key_file: "/path/to/key.pem"
+    ca_file: "/path/to/ca.pem"
+    verify: true
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert_eq!(
+            config.tls_ca_cert.as_deref(),
+            Some(std::path::Path::new("/path/to/ca.pem"))
+        );
+        assert!(config.tls_verify);
+    }
+
+    #[test]
+    fn parse_tls_verify_defaults_false() {
+        let input = r#"
+tls {
+    cert_file: "/path/to/cert.pem"
+    key_file: "/path/to/key.pem"
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert!(config.tls_ca_cert.is_none());
+        assert!(!config.tls_verify);
     }
 }

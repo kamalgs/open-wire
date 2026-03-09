@@ -841,12 +841,28 @@ pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
 
     let mut lines = text.lines().peekable();
 
-    // Skip version line (NATS/1.0 ...)
-    let _version = lines.next().ok_or_else(|| {
+    // Parse version line — extract optional status code and description.
+    let version_line = lines.next().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "no header version line found")
     })?;
 
     let mut headers = HeaderMap::new();
+
+    // Extract status from version line: "NATS/1.0", "NATS/1.0 503", "NATS/1.0 408 Request Timeout"
+    let after = version_line
+        .strip_prefix("NATS/1.0")
+        .unwrap_or("")
+        .trim_start();
+    if !after.is_empty() {
+        let (code_str, desc) = match after.split_once(' ') {
+            Some((c, d)) => (c, Some(d)),
+            None => (after, None),
+        };
+        if let Ok(code) = code_str.parse::<u16>() {
+            headers.set_status(code, desc.map(String::from));
+        }
+    }
+
     while let Some(line) = lines.next() {
         if line.is_empty() {
             continue;
@@ -856,7 +872,8 @@ pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid header line"))?;
         let mut value = value.trim_start().to_owned();
         while let Some(v) = lines.next_if(|s| s.starts_with(char::is_whitespace)) {
-            value.push_str(v);
+            value.push(' ');
+            value.push_str(v.trim_start());
         }
         value.truncate(value.trim_end().len());
         headers.append(name, value);
@@ -1669,5 +1686,49 @@ mod tests {
         let mut buf = BytesMut::from("PUB foo 5\r\nhel");
         let op = try_skip_or_parse_client_op(&mut buf).unwrap();
         assert!(op.is_none()); // not enough data
+    }
+
+    // -- parse_headers status line -----------------------------------------------
+
+    #[test]
+    fn test_parse_headers_status_503() {
+        let data = b"NATS/1.0 503\r\n\r\n";
+        let h = parse_headers(data).unwrap();
+        assert_eq!(h.status(), Some(503));
+        assert_eq!(h.description(), None);
+    }
+
+    #[test]
+    fn test_parse_headers_status_with_description() {
+        let data = b"NATS/1.0 408 Request Timeout\r\n\r\n";
+        let h = parse_headers(data).unwrap();
+        assert_eq!(h.status(), Some(408));
+        assert_eq!(h.description(), Some("Request Timeout"));
+    }
+
+    #[test]
+    fn test_parse_headers_no_status() {
+        let data = b"NATS/1.0\r\nX-Key: val\r\n\r\n";
+        let h = parse_headers(data).unwrap();
+        assert_eq!(h.status(), None);
+        assert_eq!(h.get("X-Key"), Some("val"));
+    }
+
+    #[test]
+    fn test_parse_headers_status_round_trip() {
+        let data = b"NATS/1.0 408 Request Timeout\r\nX-Foo: bar\r\n\r\n";
+        let h = parse_headers(data).unwrap();
+        let bytes = h.to_bytes();
+        let h2 = parse_headers(&bytes).unwrap();
+        assert_eq!(h2.status(), Some(408));
+        assert_eq!(h2.description(), Some("Request Timeout"));
+        assert_eq!(h2.get("X-Foo"), Some("bar"));
+    }
+
+    #[test]
+    fn test_parse_headers_continuation_spacing() {
+        let data = b"NATS/1.0\r\nX-Multi: line1\r\n  line2\r\n\r\n";
+        let h = parse_headers(data).unwrap();
+        assert_eq!(h.get("X-Multi"), Some("line1 line2"));
     }
 }
