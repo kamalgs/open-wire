@@ -16,6 +16,7 @@
 //! Provides a lightweight NATS server that accepts local client connections
 //! and optionally forwards traffic to an upstream NATS hub server.
 
+pub mod config;
 pub mod nats_proto;
 pub(crate) mod protocol;
 pub mod server;

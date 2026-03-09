@@ -1,44 +1,67 @@
-# Backlog
+# Compatibility Gap Analysis
 
-Ideas to explore, roughly categorised. Nothing here is committed.
+Tracking the gap between open-wire and Go nats-server for leaf node workloads.
+Items marked ~~strikethrough~~ are already implemented.
 
-## Performance
+## Protocol Gaps
 
-- **io_uring** — replace epoll with io_uring for batched syscalls. Could reduce
-  syscall overhead on high-connection-count workloads.
-- **writev / vectored writes** — coalesce multiple small messages into a single
-  syscall instead of memcpy into a contiguous buffer.
-- **Connection affinity** — pin publisher and its subscribers to the same worker
-  to avoid cross-worker eventfd notifications.
-- **Trie-based subject matching** — replace the wildcard `Vec` linear scan with
-  a trie or radix tree for faster matching at scale.
-- **NUMA-aware allocation** — bind workers to CPU cores and allocate buffers
-  from local NUMA memory.
-- **Lock-free DirectWriter** — replace `Mutex<BytesMut>` with a lock-free SPSC
-  or MPSC ring buffer.
-
-## Features
-
-- **TLS** — accept TLS connections (rustls). Required for any non-loopback use.
-- **Queue groups** — distribute messages across subscribers in a group.
-- **Request-reply** — inbox-based request-reply with timeout.
-- **UNSUB max** — auto-unsubscribe after N messages.
+- **UNSUB max enforcement** — auto-unsubscribe after N messages (`UNSUB <sid> <max>`).
+  Currently parsed but not enforced.
+- **Drain protocol** — graceful client drain (`-ERR` + disconnect after flush).
+- **Subject deny import/export** — per-connection subject allow/deny lists on
+  leaf connections.
+- **HMSG header forwarding fidelity** — verify all header edge cases match Go
+  behavior (multi-value, empty headers, etc.).
+- **Request-reply timeout** — server-side request timeout support.
 - **Multiple hub connections** — connect to more than one upstream hub.
-- **Leaf node solicited** — accept inbound leaf connections from other servers.
+- **Inbound leaf connections** — accept solicited leaf connections from other servers.
 
-## Operational
+## Config / Operational Gaps
 
-- **Metrics endpoint** — HTTP `/varz` or Prometheus endpoint for connections,
-  messages, bytes, subscriptions.
-- **Config file** — load host/port/hub/workers from a TOML or JSON file instead
-  of CLI flags.
-- **Graceful drain** — stop accepting new connections, drain in-flight messages,
-  then shut down.
-- **Logging** — structured logging with configurable levels.
-- **Signal handling** — SIGHUP reload, SIGTERM graceful shutdown.
+- ~~**Config file**~~ — Go nats-server `.conf` format parser (`--config` flag).
+- **Config reload** — `SIGHUP` triggers config file reload (currently SIGHUP
+  triggers shutdown, not reload).
+- **pid_file** — write PID to a file on startup.
+- **log_file** — write logs to a file instead of stderr.
+- **Lame duck mode** — stop accepting new connections, send lame-duck INFO to
+  existing clients, drain, then shut down.
+- **Varz / Connz endpoints** — HTTP `/varz`, `/connz` monitoring endpoints
+  (Go-compatible JSON format).
+- ~~**Metrics endpoint**~~ — Prometheus metrics on a configurable port.
+- ~~**Signal handling**~~ — SIGTERM/SIGINT graceful shutdown.
+- ~~**Structured logging**~~ — `tracing` with env-filter.
+
+## Security Gaps
+
+- **mTLS** — mutual TLS with client certificate verification.
+- **TLS to upstream hub** — TLS on the leaf→hub connection (currently plaintext only).
+- ~~**TLS for clients**~~ — accept TLS client connections (rustls).
+- ~~**Token / user-pass auth**~~ — single token or user/password authentication.
+- ~~**NKey auth**~~ — NKey challenge-response authentication.
+- **Per-user permissions** — publish/subscribe allow/deny per user.
+- **Auth timeout** — disconnect clients that don't authenticate within a deadline.
+- **Accounts** — multi-tenant account isolation (non-goal for now, but noted for
+  completeness).
+
+## Performance Ideas
+
+- **io_uring** — replace epoll with io_uring for batched syscalls.
+- **writev / vectored writes** — coalesce messages into a single syscall.
+- **Connection affinity** — pin publisher and subscribers to the same worker.
+- **Trie-based subject matching** — replace wildcard `Vec` linear scan with a
+  trie or radix tree.
+- **NUMA-aware allocation** — bind workers to CPU cores, allocate from local memory.
+- **Lock-free DirectWriter** — replace `Mutex<BytesMut>` with a lock-free ring buffer.
+
+## Overload Safeguards
+
+- ~~**Slow consumer detection**~~ — disconnect clients exceeding `max_pending` write buffer.
+- ~~**Max payload enforcement**~~ — reject PUB/HPUB exceeding `max_payload`.
+- ~~**Max connections**~~ — reject new connections beyond `max_connections`.
+- ~~**Max subscriptions**~~ — reject SUB beyond per-connection limit.
+- ~~**Queue groups**~~ — load-balanced message delivery across subscriber groups.
 
 ## Platform
 
-- **Cross-platform portability** — run on any OS/arch, from Raspberry Pi to
-  CDN edge. Extract a reactor trait, add poll()/kqueue/IOCP/WASI backends.
-  See [portability.md](portability.md) for the full design direction.
+- **Cross-platform portability** — extract a reactor trait, add poll()/kqueue/IOCP/WASI
+  backends. See [portability.md](portability.md).

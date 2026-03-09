@@ -13,6 +13,8 @@
   dependency tree small and auditable.
 - **Single binary** — the server compiles to one static binary with no runtime
   dependencies beyond libc.
+- **Drop-in leaf node replacement** — read Go nats-server config files, accept
+  the same client connections, and relay to an upstream hub identically.
 - **Cross-platform** — run on any OS, any architecture, any scale. From a
   Raspberry Pi to a CDN edge node. See [portability.md](portability.md).
 - **Learning project** — explore what raw-syscall, zero-copy Rust can achieve
@@ -20,11 +22,10 @@
 
 ## Non-Goals
 
-- **Full NATS server** — no JetStream, clustering, accounts, authorization,
-  or multi-tenancy. This is a leaf node only.
-- **TLS / authentication** — not implemented. The server trusts its network.
+- **Full NATS server** — no JetStream, clustering, accounts, or multi-tenancy.
+  This is a leaf node only.
 - **Production use** — this is an experiment, not a hardened production system.
-  Error handling, observability, and operational tooling are minimal.
+  Operational tooling is improving but not yet production-grade.
 - **Protocol completeness** — only the subset of NATS client and leaf protocols
-  needed for pub/sub benchmarking is implemented (no queue groups, no request
-  headers, no UNSUB max-messages).
+  needed for leaf node relay is implemented (no UNSUB max-messages yet, no
+  drain protocol).

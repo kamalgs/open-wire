@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
+use open_wire::config;
 use open_wire::{ClientAuth, HubCredentials, LeafServer, LeafServerConfig};
 
 /// Global pointer to the shutdown flag, accessible from the signal handler.
@@ -43,7 +44,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let mut config = LeafServerConfig::default();
+    // First pass: look for --config / -c to load config file as base
+    let args: Vec<String> = std::env::args().collect();
+    let mut config = {
+        let mut cfg_path: Option<String> = None;
+        let mut i = 1;
+        while i < args.len() {
+            if matches!(args[i].as_str(), "--config" | "-c") {
+                i += 1;
+                if i < args.len() {
+                    cfg_path = Some(args[i].clone());
+                }
+            }
+            i += 1;
+        }
+        if let Some(path) = cfg_path {
+            config::load_config(std::path::Path::new(&path))
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+        } else {
+            LeafServerConfig::default()
+        }
+    };
 
     // Accumulate auth-related CLI values before building config
     let mut auth_token: Option<String> = None;
@@ -53,10 +74,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hub_creds = HubCredentials::default();
     let mut has_hub_creds = false;
 
-    let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--config" | "-c" => {
+                i += 1; // already handled above, skip value
+            }
             "--port" | "-p" => {
                 i += 1;
                 config.port = args[i].parse().expect("invalid port");
@@ -156,7 +179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
-                    "Usage: open-wire [--port PORT] [--host HOST] [--hub URL] [--name NAME] \
+                    "Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
+                     [--hub URL] [--name NAME] \
                      [--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N] \
                      [--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
                      [--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
