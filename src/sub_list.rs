@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::{Bytes, BytesMut};
@@ -188,6 +188,8 @@ pub struct SubList {
     exact: HashMap<String, Vec<Subscription>>,
     /// Wildcard subscriptions (patterns with `*` or `>`).
     wild: Vec<Subscription>,
+    /// Round-robin counter for queue group delivery.
+    queue_counter: AtomicUsize,
 }
 
 impl SubList {
@@ -271,22 +273,66 @@ impl SubList {
 
     /// Iterate over matching subscriptions without allocating a Vec.
     /// Returns the total number of matches.
+    ///
+    /// Queue group semantics: non-queue subs receive every message,
+    /// while each queue group delivers to exactly one member (round-robin).
     pub fn for_each_match(&self, subject: &str, mut f: impl FnMut(&Subscription)) -> usize {
         let mut count = 0;
+        // Collect queue group subs lazily — only allocate when needed.
+        // Uses indices to avoid lifetime issues with the closure.
+        // (source, index): source 0 = exact, source 1 = wild
+        let mut queue_groups: Vec<(&str, Vec<(u8, usize)>)> = Vec::new();
+
+        // Route a single matching sub: deliver non-queue immediately,
+        // collect queue subs by group name.
+        macro_rules! route_sub {
+            ($sub:expr, $source:expr, $idx:expr) => {
+                if let Some(ref q) = $sub.queue {
+                    if let Some(group) = queue_groups
+                        .iter_mut()
+                        .find(|(name, _)| *name == q.as_str())
+                    {
+                        group.1.push(($source, $idx));
+                    } else {
+                        queue_groups.push((q.as_str(), vec![($source, $idx)]));
+                    }
+                } else {
+                    f($sub);
+                    count += 1;
+                }
+            };
+        }
+
         // O(1) exact lookup
         if let Some(subs) = self.exact.get(subject) {
-            for sub in subs {
-                f(sub);
-                count += 1;
+            for (i, sub) in subs.iter().enumerate() {
+                route_sub!(sub, 0u8, i);
             }
         }
         // Linear scan of wildcard patterns only
-        for sub in &self.wild {
+        for (i, sub) in self.wild.iter().enumerate() {
             if subject_matches(&sub.subject, subject) {
+                route_sub!(sub, 1u8, i);
+            }
+        }
+
+        // Deliver to exactly one member per queue group (round-robin)
+        if !queue_groups.is_empty() {
+            let rr = self.queue_counter.fetch_add(1, Ordering::Relaxed);
+            let exact_subs = self.exact.get(subject);
+            for (_name, members) in &queue_groups {
+                let idx = rr % members.len();
+                let (source, sub_idx) = members[idx];
+                let sub = if source == 0 {
+                    &exact_subs.unwrap()[sub_idx]
+                } else {
+                    &self.wild[sub_idx]
+                };
                 f(sub);
                 count += 1;
             }
         }
+
         count
     }
 
@@ -302,6 +348,22 @@ impl SubList {
             subjects.insert(&sub.subject);
         }
         subjects
+    }
+
+    /// Returns unique (subject, queue) pairs for upstream interest sync.
+    /// Non-queue subs have `queue = None`. Queue subs are deduplicated
+    /// by (subject, queue_name) so each group is announced once.
+    pub fn unique_interests(&self) -> Vec<(&str, Option<&str>)> {
+        let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
+        for (subj, subs) in &self.exact {
+            for sub in subs {
+                set.insert((subj.as_str(), sub.queue.as_deref()));
+            }
+        }
+        for sub in &self.wild {
+            set.insert((sub.subject.as_str(), sub.queue.as_deref()));
+        }
+        set.into_iter().collect()
     }
 }
 
@@ -721,5 +783,109 @@ mod tests {
             }
         }
         assert_eq!(total_msgs_seen, total_msgs);
+    }
+
+    // --- Queue group tests ---
+
+    fn test_queue_sub(conn_id: u64, sid: u64, subject: &str, queue: &str) -> Subscription {
+        Subscription::new_dummy(conn_id, sid, subject.to_string(), Some(queue.to_string()))
+    }
+
+    #[test]
+    fn test_queue_group_delivers_to_one() {
+        let mut sl = SubList::new();
+        sl.insert(test_queue_sub(1, 1, "foo", "q1"));
+        sl.insert(test_queue_sub(2, 1, "foo", "q1"));
+        sl.insert(test_queue_sub(3, 1, "foo", "q1"));
+
+        let mut delivered = Vec::new();
+        let count = sl.for_each_match("foo", |sub| {
+            delivered.push(sub.conn_id);
+        });
+        assert_eq!(count, 1);
+        assert_eq!(delivered.len(), 1);
+    }
+
+    #[test]
+    fn test_queue_group_round_robin() {
+        let mut sl = SubList::new();
+        sl.insert(test_queue_sub(1, 1, "foo", "q1"));
+        sl.insert(test_queue_sub(2, 1, "foo", "q1"));
+
+        let mut counts = [0u32; 3]; // conn_id 1 and 2
+        for _ in 0..100 {
+            sl.for_each_match("foo", |sub| {
+                counts[sub.conn_id as usize] += 1;
+            });
+        }
+        // Both should get roughly half
+        assert!(counts[1] > 0);
+        assert!(counts[2] > 0);
+        assert_eq!(counts[1] + counts[2], 100);
+    }
+
+    #[test]
+    fn test_queue_and_non_queue_mix() {
+        let mut sl = SubList::new();
+        // 2 queue subs in group "q1"
+        sl.insert(test_queue_sub(1, 1, "foo", "q1"));
+        sl.insert(test_queue_sub(2, 1, "foo", "q1"));
+        // 1 non-queue sub
+        sl.insert(test_sub(3, 1, "foo"));
+
+        let mut delivered = Vec::new();
+        let count = sl.for_each_match("foo", |sub| {
+            delivered.push(sub.conn_id);
+        });
+        // Non-queue sub always delivered + 1 from queue group
+        assert_eq!(count, 2);
+        assert!(delivered.contains(&3)); // non-queue always present
+    }
+
+    #[test]
+    fn test_multiple_queue_groups() {
+        let mut sl = SubList::new();
+        sl.insert(test_queue_sub(1, 1, "foo", "q1"));
+        sl.insert(test_queue_sub(2, 1, "foo", "q1"));
+        sl.insert(test_queue_sub(3, 1, "foo", "q2"));
+        sl.insert(test_queue_sub(4, 1, "foo", "q2"));
+
+        let mut delivered = Vec::new();
+        let count = sl.for_each_match("foo", |sub| {
+            delivered.push(sub.conn_id);
+        });
+        // 1 from q1 + 1 from q2
+        assert_eq!(count, 2);
+        assert_eq!(delivered.len(), 2);
+    }
+
+    #[test]
+    fn test_queue_group_with_wildcard() {
+        let mut sl = SubList::new();
+        sl.insert(test_queue_sub(1, 1, "foo.*", "q1"));
+        sl.insert(test_queue_sub(2, 1, "foo.*", "q1"));
+
+        let mut delivered = Vec::new();
+        let count = sl.for_each_match("foo.bar", |sub| {
+            delivered.push(sub.conn_id);
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_unique_interests() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo"));
+        sl.insert(test_sub(2, 2, "foo"));
+        sl.insert(test_queue_sub(3, 1, "bar", "q1"));
+        sl.insert(test_queue_sub(4, 2, "bar", "q1"));
+        sl.insert(test_queue_sub(5, 3, "bar", "q2"));
+
+        let interests = sl.unique_interests();
+        // foo (no queue) + bar/q1 + bar/q2 = 3
+        assert_eq!(interests.len(), 3);
+        assert!(interests.contains(&("foo", None)));
+        assert!(interests.contains(&("bar", Some("q1"))));
+        assert!(interests.contains(&("bar", Some("q2"))));
     }
 }
