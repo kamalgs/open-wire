@@ -137,6 +137,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
                 config.tls_key = Some(std::path::PathBuf::from(&args[i]));
             }
+            "--max-payload" => {
+                i += 1;
+                config.max_payload = args[i].parse().expect("invalid max-payload");
+            }
+            "--max-connections" => {
+                i += 1;
+                config.max_connections = args[i].parse().expect("invalid max-connections");
+            }
+            "--max-control-line" => {
+                i += 1;
+                config.max_control_line = args[i].parse().expect("invalid max-control-line");
+            }
+            "--max-subscriptions" => {
+                i += 1;
+                config.max_subscriptions = args[i].parse().expect("invalid max-subscriptions");
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(
@@ -145,7 +161,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                      [--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
                      [--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
                      [--hub-token TOKEN] [--hub-creds PATH] \
-                     [--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH]"
+                     [--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH] \
+                     [--max-payload BYTES] [--max-connections N] \
+                     [--max-control-line BYTES] [--max-subscriptions N]"
                 );
                 std::process::exit(1);
             }

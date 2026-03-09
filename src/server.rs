@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use metrics::counter;
 use tracing::{error, info, warn};
 
 use crate::types::{ConnectInfo, ServerInfo};
@@ -132,6 +133,15 @@ pub struct LeafServerConfig {
     /// Maximum pending write bytes per connection before disconnecting as a
     /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
     pub max_pending: usize,
+    /// Maximum message payload size in bytes (default: 1 MB, matching Go nats-server).
+    /// Advertised in INFO and enforced on PUB/HPUB.
+    pub max_payload: usize,
+    /// Maximum simultaneous client connections (default: 65536). 0 = unlimited.
+    pub max_connections: usize,
+    /// Maximum control line length in bytes (default: 4096, matching Go nats-server).
+    pub max_control_line: usize,
+    /// Maximum subscriptions per client connection (default: 0 = unlimited).
+    pub max_subscriptions: usize,
     /// Interval between server-initiated PING keepalives (default: 2 minutes).
     /// Set to `Duration::ZERO` to disable keepalive.
     pub ping_interval: std::time::Duration,
@@ -164,6 +174,10 @@ impl Default for LeafServerConfig {
             workers,
             ws_port: None,
             max_pending: 64 * 1024 * 1024,
+            max_payload: 1_048_576,
+            max_connections: 65_536,
+            max_control_line: 4_096,
+            max_subscriptions: 0,
             ping_interval: std::time::Duration::from_secs(120),
             max_pings_outstanding: 2,
             client_auth: ClientAuth::None,
@@ -227,9 +241,20 @@ pub(crate) struct ServerState {
     next_cid: AtomicU64,
     /// TLS configuration for client connections. `None` = plaintext.
     pub tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// Global count of active client connections (across all workers).
+    pub active_connections: AtomicU64,
+    /// Maximum simultaneous client connections. 0 = unlimited.
+    pub max_connections: usize,
+    /// Maximum message payload size in bytes.
+    pub max_payload: usize,
+    /// Maximum control line length in bytes.
+    pub max_control_line: usize,
+    /// Maximum subscriptions per client connection. 0 = unlimited.
+    pub max_subscriptions: usize,
 }
 
 impl ServerState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         info: ServerInfo,
         auth: ClientAuth,
@@ -237,6 +262,10 @@ impl ServerState {
         max_pings_outstanding: u32,
         buf_config: BufConfig,
         tls_config: Option<Arc<rustls::ServerConfig>>,
+        max_connections: usize,
+        max_payload: usize,
+        max_control_line: usize,
+        max_subscriptions: usize,
     ) -> Self {
         Self {
             info,
@@ -250,6 +279,11 @@ impl ServerState {
             buf_config,
             next_cid: AtomicU64::new(1),
             tls_config,
+            active_connections: AtomicU64::new(0),
+            max_connections,
+            max_payload,
+            max_control_line,
+            max_subscriptions,
         }
     }
 
@@ -288,7 +322,7 @@ impl LeafServer {
             server_name: config.server_name.clone(),
             version: "0.5.0".to_string(),
             proto: 1,
-            max_payload: 1024 * 1024, // 1MB
+            max_payload: config.max_payload,
             headers: true,
             host: config.host.clone(),
             port: config.port,
@@ -314,6 +348,10 @@ impl LeafServer {
                 config.max_pings_outstanding,
                 buf_config,
                 tls_config,
+                config.max_connections,
+                config.max_payload,
+                config.max_control_line,
+                config.max_subscriptions,
             )),
         }
     }
@@ -370,6 +408,21 @@ impl LeafServer {
         next_worker: &mut usize,
         is_websocket: bool,
     ) {
+        // Enforce max_connections limit.
+        let max = self.state.max_connections;
+        if max > 0 {
+            let current = self.state.active_connections.load(Ordering::Relaxed);
+            if current >= max as u64 {
+                warn!(addr = %addr, max_connections = max, "maximum connections exceeded, rejecting");
+                counter!("connections_rejected_total").increment(1);
+                drop(tcp_stream);
+                return;
+            }
+        }
+        self.state
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
+
         let cid = self.state.next_client_id();
         let idx = *next_worker % workers.len();
         *next_worker = idx + 1;

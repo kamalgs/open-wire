@@ -165,6 +165,8 @@ struct ClientState {
     last_activity: Instant,
     /// Number of server-initiated PINGs sent without a PONG response.
     pings_outstanding: u32,
+    /// Number of active subscriptions for this connection.
+    sub_count: usize,
 }
 
 // --- Worker ---
@@ -433,6 +435,7 @@ impl Worker {
             echo: true,
             last_activity: Instant::now(),
             pings_outstanding: 0,
+            sub_count: 0,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -462,6 +465,9 @@ impl Worker {
                 );
             }
             self.fd_to_conn.remove(&client.fd);
+            self.state
+                .active_connections
+                .fetch_sub(1, Ordering::Relaxed);
             cleanup_conn(conn_id, &self.state);
             gauge!("connections_active", "worker" => self.worker_label.clone())
                 .set(self.conns.len() as f64);
@@ -1180,6 +1186,36 @@ impl Worker {
                 continue;
             }
 
+            // Max control line check: if the buffer is larger than the limit
+            // and there is no newline within the first max_control_line bytes,
+            // the client is sending an oversized control line.
+            if phase == 1 || phase == 2 {
+                let max_ctrl = self.state.max_control_line;
+                if max_ctrl > 0 {
+                    let exceeded = {
+                        let client = self.conns.get(&conn_id).unwrap();
+                        let buf: &[u8] = &client.read_buf;
+                        buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
+                    };
+                    if exceeded {
+                        warn!(
+                            conn_id,
+                            max_control_line = max_ctrl,
+                            "maximum control line exceeded"
+                        );
+                        counter!("connections_rejected_total").increment(1);
+                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                            client
+                                .write_buf
+                                .extend_from_slice(b"-ERR 'Maximum Control Line Exceeded'\r\n");
+                        }
+                        self.try_flush_conn(conn_id);
+                        self.remove_conn(conn_id);
+                        return;
+                    }
+                }
+            }
+
             if phase == 1 {
                 // WaitConnect: parse CONNECT
                 let op = {
@@ -1302,6 +1338,29 @@ impl Worker {
                 subject,
                 queue_group,
             } => {
+                let max_subs = self.state.max_subscriptions;
+                if max_subs > 0 {
+                    let at_limit = match self.conns.get(&conn_id) {
+                        Some(c) => c.sub_count >= max_subs,
+                        None => return Ok(()),
+                    };
+                    if at_limit {
+                        warn!(
+                            conn_id,
+                            max_subscriptions = max_subs,
+                            "maximum subscriptions exceeded"
+                        );
+                        counter!("subscriptions_rejected_total").increment(1);
+                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                            client
+                                .write_buf
+                                .extend_from_slice(b"-ERR 'Maximum Subscriptions Exceeded'\r\n");
+                        }
+                        self.try_flush_conn(conn_id);
+                        return Ok(());
+                    }
+                }
+
                 let subject_str = bytes_to_str(&subject);
                 let queue_str = queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
 
@@ -1337,6 +1396,10 @@ impl Worker {
                     }
                 }
 
+                if let Some(client) = self.conns.get_mut(&conn_id) {
+                    client.sub_count += 1;
+                }
+
                 gauge!(
                     "subscriptions_active",
                     "worker" => self.worker_label.clone()
@@ -1355,6 +1418,9 @@ impl Worker {
                 };
 
                 if let Some(ref removed) = removed {
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client.sub_count = client.sub_count.saturating_sub(1);
+                    }
                     let mut upstream = self.state.upstream.write().unwrap();
                     if let Some(ref mut up) = *upstream {
                         up.remove_interest(&removed.subject, removed.queue.as_deref());
@@ -1374,6 +1440,27 @@ impl Worker {
                 headers,
                 ..
             } => {
+                let max_payload = self.state.max_payload;
+                if max_payload > 0 && payload.len() > max_payload {
+                    warn!(
+                        conn_id,
+                        payload_len = payload.len(),
+                        max_payload,
+                        "maximum payload violation"
+                    );
+                    counter!("messages_rejected_total", "reason" => "max_payload").increment(1);
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client
+                            .write_buf
+                            .extend_from_slice(b"-ERR 'Maximum Payload Violation'\r\n");
+                    }
+                    self.try_flush_conn(conn_id);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "maximum payload violation",
+                    ));
+                }
+
                 let payload_len = payload.len() as u64;
                 self.msgs_received += 1;
                 self.msgs_received_bytes += payload_len;
