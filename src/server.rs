@@ -734,7 +734,16 @@ impl LeafServer {
         let n = self.config.workers.max(1);
         info!(workers = n, "spawning worker threads");
         (0..n)
-            .map(|i| Worker::spawn(i, Arc::clone(&self.state)))
+            .map(|i| {
+                #[cfg(feature = "io-uring")]
+                {
+                    Worker::spawn_uring(i, Arc::clone(&self.state))
+                }
+                #[cfg(not(feature = "io-uring"))]
+                {
+                    Worker::spawn(i, Arc::clone(&self.state))
+                }
+            })
             .collect()
     }
 

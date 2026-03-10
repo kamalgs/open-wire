@@ -10,6 +10,7 @@ autotests = false
 default = ["interest-collapse", "subject-mapping"]
 interest-collapse = []
 subject-mapping = []
+io-uring = ["dep:io-uring"]
 
 [dependencies]
 bytes = "1.4.0"
@@ -28,6 +29,7 @@ rustls = "0.23"
 rustls-pemfile = "2"
 rustls-pki-types = "1"
 webpki-roots = "0.26"
+io-uring = { version = "0.7", optional = true }
 
 [dev-dependencies]
 async-nats = { version = "0.46", default-features = false }

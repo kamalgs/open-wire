@@ -20,6 +20,7 @@ pub mod config;
 pub(crate) mod interest;
 pub mod nats_proto;
 pub(crate) mod protocol;
+pub(crate) mod reactor;
 pub mod server;
 pub mod sub_list;
 pub mod types;
