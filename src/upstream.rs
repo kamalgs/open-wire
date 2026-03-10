@@ -5,7 +5,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write as _};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
+use crate::interest::InterestPipeline;
 use crate::types::HeaderMap;
 
 use crate::protocol::{LeafConn, LeafOp, LeafReader, LeafWriter, UpstreamConnectCreds};
@@ -23,6 +24,7 @@ use crate::server::{HubCredentials, ServerState};
 use crate::sub_list::DirectWriter;
 
 /// Commands sent from the Upstream handle to the background writer thread.
+#[derive(Debug)]
 pub(crate) enum UpstreamCmd {
     Subscribe(String, Option<String>),
     Unsubscribe(String, Option<String>),
@@ -84,6 +86,8 @@ pub(crate) struct Upstream {
     /// Kept for shutdown: closing this breaks the reader thread's blocking read.
     /// Wrapped in Option because it may not exist if not yet connected.
     stream_shutdown: Option<TcpStream>,
+    /// Interest transform pipeline (mapping + collapse).
+    pipeline: InterestPipeline,
 }
 
 impl Upstream {
@@ -95,8 +99,9 @@ impl Upstream {
         hub_url: &str,
         config_creds: Option<&HubCredentials>,
         state: Arc<ServerState>,
+        pipeline: InterestPipeline,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let (cmd_tx, stream_shutdown) = connect_and_run(hub_url, config_creds, &state)?;
+        let (cmd_tx, stream_shutdown) = connect_and_run(hub_url, config_creds, &state, &pipeline)?;
 
         // Store the sender in server state for workers
         *state.upstream_tx.write().unwrap() = Some(cmd_tx.clone());
@@ -108,16 +113,21 @@ impl Upstream {
             interests: HashMap::new(),
             shutdown,
             stream_shutdown: Some(stream_shutdown),
+            pipeline,
         })
     }
 
     /// Spawn a supervisor that connects to the hub with automatic reconnection.
     /// Initial connection failure is non-fatal — the supervisor keeps retrying.
-    pub(crate) fn spawn_supervisor(
+    pub(crate) fn spawn_supervisor<F>(
         hub_url: String,
         config_creds: Option<HubCredentials>,
         state: Arc<ServerState>,
-    ) -> Self {
+        build_pipeline: F,
+    ) -> Self
+    where
+        F: Fn() -> InterestPipeline + Send + 'static,
+    {
         let shutdown = Arc::new(AtomicBool::new(false));
         let (cmd_tx, cmd_rx) = mpsc::channel();
 
@@ -134,6 +144,7 @@ impl Upstream {
                     supervisor_shutdown,
                     supervisor_tx,
                     cmd_rx,
+                    &build_pipeline,
                 );
             })
             .expect("failed to spawn upstream supervisor");
@@ -143,11 +154,20 @@ impl Upstream {
             interests: HashMap::new(),
             shutdown,
             stream_shutdown: None,
+            pipeline: InterestPipeline::new(
+                #[cfg(feature = "interest-collapse")]
+                vec![],
+                #[cfg(feature = "subject-mapping")]
+                vec![],
+            ),
         }
     }
 
     /// Add a subscription interest for the given subject and optional queue group.
-    /// If this is the first interest for this (subject, queue) pair, sends LS+ to the hub.
+    ///
+    /// Tracks exact (subject, queue) refcounts for dedup. On the first occurrence
+    /// of each unique subject, passes it through the interest pipeline (mapping +
+    /// collapse) to determine what `LS+` to send upstream (if any).
     pub(crate) fn add_interest(
         &mut self,
         subject: String,
@@ -156,9 +176,13 @@ impl Upstream {
         let key = (subject.clone(), queue.clone());
         let count = self.interests.entry(key).or_insert(0);
         *count += 1;
-        if *count == 1 {
+        if *count > 1 {
+            return Ok(()); // exact dedup
+        }
+
+        if let Some((subj, q)) = self.pipeline.on_subscribe(&subject, queue.as_deref()) {
             self.cmd_tx
-                .send(UpstreamCmd::Subscribe(subject, queue))
+                .send(UpstreamCmd::Subscribe(subj, q))
                 .map_err(|_| {
                     Box::new(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -169,17 +193,20 @@ impl Upstream {
         Ok(())
     }
 
-    /// Remove a subscription interest. If refcount reaches zero, sends LS- to the hub.
+    /// Remove a subscription interest. Sends `LS-` upstream when the pipeline
+    /// determines it is appropriate (last exact sub, or last collapsed sub).
     pub(crate) fn remove_interest(&mut self, subject: &str, queue: Option<&str>) {
         let key = (subject.to_string(), queue.map(|q| q.to_string()));
         if let Some(count) = self.interests.get_mut(&key) {
             *count -= 1;
             if *count == 0 {
                 self.interests.remove(&key);
-                let _ = self.cmd_tx.send(UpstreamCmd::Unsubscribe(
-                    subject.to_string(),
-                    queue.map(|q| q.to_string()),
-                ));
+            } else {
+                return; // still has exact refs
+            }
+
+            if let Some((subj, q)) = self.pipeline.on_unsubscribe(subject, queue) {
+                let _ = self.cmd_tx.send(UpstreamCmd::Unsubscribe(subj, q));
             }
         }
     }
@@ -210,6 +237,7 @@ fn connect_and_run(
     hub_url: &str,
     config_creds: Option<&HubCredentials>,
     state: &Arc<ServerState>,
+    pipeline: &InterestPipeline,
 ) -> Result<(mpsc::Sender<UpstreamCmd>, TcpStream), Box<dyn std::error::Error>> {
     let parsed = parse_hub_url(hub_url)?;
     let tcp = TcpStream::connect(&parsed.addr)?;
@@ -283,7 +311,7 @@ fn connect_and_run(
         }
     }
 
-    // Sync interests
+    // Sync interests through the pipeline (mapping + collapse dedup)
     {
         let interests: Vec<(String, Option<String>)> = {
             let subs = state.subs.read().unwrap();
@@ -292,11 +320,20 @@ fn connect_and_run(
                 .map(|(s, q)| (s.to_string(), q.map(|q| q.to_string())))
                 .collect()
         };
+
+        let mut sent_collapse_keys: HashSet<String> = HashSet::new();
         for (subject, queue) in &interests {
             if let Some(q) = queue {
-                leaf.send_leaf_sub_queue(subject, q)?;
+                // Queue subs: apply mapping only, no collapse
+                let mapped = pipeline.transform_for_sync(subject);
+                leaf.send_leaf_sub_queue(&mapped, q)?;
             } else {
-                leaf.send_leaf_sub(subject)?;
+                let mapped = pipeline.transform_for_sync(subject);
+                if let Some(send_subj) =
+                    pipeline.collapse_for_sync(&mapped, &mut sent_collapse_keys)
+                {
+                    leaf.send_leaf_sub(&send_subj)?;
+                }
             }
         }
         leaf.flush()?;
@@ -335,6 +372,7 @@ fn run_supervisor(
     shutdown: Arc<AtomicBool>,
     _supervisor_tx: mpsc::Sender<UpstreamCmd>,
     _supervisor_rx: mpsc::Receiver<UpstreamCmd>,
+    build_pipeline: &dyn Fn() -> InterestPipeline,
 ) {
     let mut backoff = Backoff::new(Duration::from_millis(250), Duration::from_secs(30));
 
@@ -344,7 +382,8 @@ fn run_supervisor(
             return;
         }
 
-        match connect_and_run(&hub_url, config_creds.as_ref(), &state) {
+        let pipeline = build_pipeline();
+        match connect_and_run(&hub_url, config_creds.as_ref(), &state, &pipeline) {
             Ok((cmd_tx, stream_shutdown)) => {
                 backoff.reset();
                 info!("connected to upstream hub");
@@ -952,5 +991,131 @@ mod tests {
         // Back to ~100ms ±25%
         assert!(d.as_millis() >= 75, "too small: {}ms", d.as_millis());
         assert!(d.as_millis() <= 125, "too large: {}ms", d.as_millis());
+    }
+
+    // --- add_interest / remove_interest with pipeline ---
+
+    use crate::interest::InterestPipeline;
+
+    /// Helper: create an Upstream with a pipeline but no real connection.
+    fn test_upstream(
+        #[cfg(feature = "interest-collapse")] templates: Vec<String>,
+    ) -> (Upstream, mpsc::Receiver<UpstreamCmd>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let pipeline = InterestPipeline::new(
+            #[cfg(feature = "interest-collapse")]
+            templates,
+            #[cfg(feature = "subject-mapping")]
+            vec![],
+        );
+        let upstream = Upstream {
+            cmd_tx,
+            interests: HashMap::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            stream_shutdown: None,
+            pipeline,
+        };
+        (upstream, cmd_rx)
+    }
+
+    #[cfg(feature = "interest-collapse")]
+    #[test]
+    fn add_interest_collapse_first_sends_wildcard() {
+        let (mut up, rx) = test_upstream(vec!["app.*.sessions.>".to_string()]);
+
+        up.add_interest("app.n1.sessions.s1".into(), None).unwrap();
+        // Should send the collapsed wildcard
+        match rx.try_recv().unwrap() {
+            UpstreamCmd::Subscribe(subj, queue) => {
+                assert_eq!(subj, "app.n1.sessions.>");
+                assert!(queue.is_none());
+            }
+            other => panic!("expected Subscribe, got {other:?}"),
+        }
+
+        // Second matching sub should NOT send another LS+
+        up.add_interest("app.n1.sessions.s2".into(), None).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(feature = "interest-collapse")]
+    #[test]
+    fn remove_interest_collapse_last_sends_unsub() {
+        let (mut up, rx) = test_upstream(vec!["app.*.sessions.>".to_string()]);
+
+        up.add_interest("app.n1.sessions.s1".into(), None).unwrap();
+        up.add_interest("app.n1.sessions.s2".into(), None).unwrap();
+        // Drain the subscribe
+        let _ = rx.try_recv();
+
+        up.remove_interest("app.n1.sessions.s1", None);
+        // Still one left — no LS-
+        assert!(rx.try_recv().is_err());
+
+        up.remove_interest("app.n1.sessions.s2", None);
+        // Last one — should send LS-
+        match rx.try_recv().unwrap() {
+            UpstreamCmd::Unsubscribe(subj, queue) => {
+                assert_eq!(subj, "app.n1.sessions.>");
+                assert!(queue.is_none());
+            }
+            other => panic!("expected Unsubscribe, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "interest-collapse")]
+    #[test]
+    fn queue_group_bypasses_collapse() {
+        let (mut up, rx) = test_upstream(vec!["app.*.sessions.>".to_string()]);
+
+        // Queue group subs should use exact interest even if subject matches
+        up.add_interest("app.n1.sessions.s1".into(), Some("q1".into()))
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            UpstreamCmd::Subscribe(subj, queue) => {
+                assert_eq!(subj, "app.n1.sessions.s1");
+                assert_eq!(queue.as_deref(), Some("q1"));
+            }
+            other => panic!("expected exact Subscribe for queue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_collapse_templates_uses_exact() {
+        let (mut up, rx) = test_upstream(
+            #[cfg(feature = "interest-collapse")]
+            vec![],
+        );
+
+        up.add_interest("app.n1.sessions.s1".into(), None).unwrap();
+        match rx.try_recv().unwrap() {
+            UpstreamCmd::Subscribe(subj, queue) => {
+                assert_eq!(subj, "app.n1.sessions.s1");
+                assert!(queue.is_none());
+            }
+            other => panic!("expected exact Subscribe, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "interest-collapse")]
+    #[test]
+    fn different_collapse_keys_tracked_independently() {
+        let (mut up, rx) = test_upstream(vec!["app.*.sessions.>".to_string()]);
+
+        // Two different nodes → two different collapse keys
+        up.add_interest("app.n1.sessions.s1".into(), None).unwrap();
+        up.add_interest("app.n2.sessions.s1".into(), None).unwrap();
+
+        let sub1 = rx.try_recv().unwrap();
+        let sub2 = rx.try_recv().unwrap();
+
+        match (sub1, sub2) {
+            (UpstreamCmd::Subscribe(s1, _), UpstreamCmd::Subscribe(s2, _)) => {
+                let mut keys = vec![s1, s2];
+                keys.sort();
+                assert_eq!(keys, vec!["app.n1.sessions.>", "app.n2.sessions.>"]);
+            }
+            _ => panic!("expected two Subscribe commands"),
+        }
     }
 }

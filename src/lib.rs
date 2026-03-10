@@ -17,6 +17,7 @@
 //! and optionally forwards traffic to an upstream NATS hub server.
 
 pub mod config;
+pub(crate) mod interest;
 pub mod nats_proto;
 pub(crate) mod protocol;
 pub mod server;
@@ -26,6 +27,8 @@ pub(crate) mod upstream;
 pub(crate) mod websocket;
 pub(crate) mod worker;
 
+#[cfg(feature = "subject-mapping")]
+pub use interest::SubjectMapping;
 pub use server::{
     ClientAuth, HubCredentials, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig,
 };

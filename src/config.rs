@@ -952,6 +952,39 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
                 hub_creds.creds_file = Some(as_string(rval)?);
                 has_creds = true;
             }
+            #[cfg(feature = "interest-collapse")]
+            "interest_collapse" => {
+                if let Some(arr) = rval.as_array() {
+                    let mut templates = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        templates.push(as_string(item)?);
+                    }
+                    config.interest_collapse = templates;
+                }
+            }
+            #[cfg(feature = "subject-mapping")]
+            "subject_mappings" => {
+                if let Some(arr) = rval.as_array() {
+                    let mut mappings = Vec::with_capacity(arr.len());
+                    for item in arr {
+                        if let Some(map_entries) = item.as_map() {
+                            let mut from = String::new();
+                            let mut to = String::new();
+                            for (mk, mv) in map_entries {
+                                match mk.as_str() {
+                                    "from" => from = as_string(mv)?,
+                                    "to" => to = as_string(mv)?,
+                                    _ => {}
+                                }
+                            }
+                            if !from.is_empty() && !to.is_empty() {
+                                mappings.push(crate::interest::SubjectMapping { from, to });
+                            }
+                        }
+                    }
+                    config.subject_mappings = mappings;
+                }
+            }
             _ => {
                 tracing::debug!("ignoring remote key: {rkey}");
             }
@@ -1507,5 +1540,75 @@ tls {
         let config = load_config_str(input).unwrap();
         assert!(config.tls_ca_cert.is_none());
         assert!(!config.tls_verify);
+    }
+
+    #[cfg(feature = "interest-collapse")]
+    #[test]
+    fn parse_interest_collapse() {
+        let input = r#"
+leafnodes {
+    remotes = [{
+        url: "nats://hub:7422"
+        interest_collapse: [
+            "app.*.sessions.>"
+            "telemetry.*.metrics.*"
+        ]
+    }]
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert_eq!(config.interest_collapse.len(), 2);
+        assert_eq!(config.interest_collapse[0], "app.*.sessions.>");
+        assert_eq!(config.interest_collapse[1], "telemetry.*.metrics.*");
+    }
+
+    #[cfg(feature = "interest-collapse")]
+    #[test]
+    fn parse_interest_collapse_empty() {
+        let input = r#"
+leafnodes {
+    remotes = [{
+        url: "nats://hub:7422"
+    }]
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert!(config.interest_collapse.is_empty());
+    }
+
+    #[cfg(feature = "subject-mapping")]
+    #[test]
+    fn parse_subject_mappings() {
+        let input = r#"
+leafnodes {
+    remotes = [{
+        url: "nats://hub:7422"
+        subject_mappings: [
+            { from: "local.>", to: "prod.region1.>" }
+            { from: "old.exact", to: "new.exact" }
+        ]
+    }]
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert_eq!(config.subject_mappings.len(), 2);
+        assert_eq!(config.subject_mappings[0].from, "local.>");
+        assert_eq!(config.subject_mappings[0].to, "prod.region1.>");
+        assert_eq!(config.subject_mappings[1].from, "old.exact");
+        assert_eq!(config.subject_mappings[1].to, "new.exact");
+    }
+
+    #[cfg(feature = "subject-mapping")]
+    #[test]
+    fn parse_subject_mappings_empty() {
+        let input = r#"
+leafnodes {
+    remotes = [{
+        url: "nats://hub:7422"
+    }]
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert!(config.subject_mappings.is_empty());
     }
 }

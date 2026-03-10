@@ -254,6 +254,21 @@ pub struct LeafServerConfig {
     pub lame_duck_grace_period: std::time::Duration,
     /// Port for the monitoring HTTP server (/varz, /healthz). `None` = disabled.
     pub monitoring_port: Option<u16>,
+    /// Interest collapse templates for upstream leaf subscriptions.
+    ///
+    /// Each template is a NATS subject pattern (e.g., `"app.*.sessions.>"`).
+    /// When a client subscribes to a subject matching a template, the leaf sends
+    /// a single collapsed wildcard `LS+` to the hub instead of per-subject `LS+`.
+    /// This reduces upstream interest propagation from O(N) to O(1) per template.
+    #[cfg(feature = "interest-collapse")]
+    pub interest_collapse: Vec<String>,
+    /// Subject mapping rules for upstream leaf subscriptions.
+    ///
+    /// Each mapping rewrites subjects matching the `from` pattern to the `to` pattern
+    /// before sending upstream. Supports prefix mappings (`local.>` → `prod.>`) and
+    /// exact mappings.
+    #[cfg(feature = "subject-mapping")]
+    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
 }
 
 impl Default for LeafServerConfig {
@@ -290,6 +305,10 @@ impl Default for LeafServerConfig {
             lame_duck_duration: std::time::Duration::from_secs(30),
             lame_duck_grace_period: std::time::Duration::from_secs(10),
             monitoring_port: None,
+            #[cfg(feature = "interest-collapse")]
+            interest_collapse: Vec::new(),
+            #[cfg(feature = "subject-mapping")]
+            subject_mappings: Vec::new(),
         }
     }
 }
@@ -668,11 +687,24 @@ impl LeafServer {
     fn connect_upstream(&self) {
         if let Some(ref hub_url) = self.config.hub_url {
             info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
+            #[cfg(feature = "interest-collapse")]
+            let collapse_templates = self.config.interest_collapse.clone();
+            #[cfg(feature = "subject-mapping")]
+            let subject_mappings = self.config.subject_mappings.clone();
+            let build_pipeline = move || {
+                crate::interest::InterestPipeline::new(
+                    #[cfg(feature = "interest-collapse")]
+                    collapse_templates.clone(),
+                    #[cfg(feature = "subject-mapping")]
+                    subject_mappings.clone(),
+                )
+            };
             // Try initial connect synchronously for fast startup
             match Upstream::connect(
                 hub_url,
                 self.config.hub_credentials.as_ref(),
                 Arc::clone(&self.state),
+                build_pipeline(),
             ) {
                 Ok(upstream) => {
                     let sender = upstream.sender();
@@ -687,6 +719,7 @@ impl LeafServer {
                         hub_url.clone(),
                         self.config.hub_credentials.clone(),
                         Arc::clone(&self.state),
+                        build_pipeline,
                     );
                     let sender = upstream.sender();
                     *self.state.upstream.write().unwrap() = Some(upstream);
