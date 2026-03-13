@@ -16,6 +16,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
+use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream};
 use crate::interest::InterestPipeline;
 use crate::types::HeaderMap;
 
@@ -568,32 +569,16 @@ fn handle_hub_op(
         } => {
             // SAFETY: NATS subjects are always ASCII
             let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
-            let subs = state.subs.read().unwrap();
-            let (_count, expired) = subs.for_each_match(subject_str, |sub| {
-                sub.writer.write_msg(
-                    &subject,
-                    &sub.sid_bytes,
-                    reply.as_deref(),
-                    headers.as_ref(),
-                    &payload,
-                );
-                dirty_writers.push(sub.writer.clone());
-            });
-            drop(subs);
-
-            // Remove expired subs (reached max delivery limit).
-            if !expired.is_empty() {
-                let mut subs = state.subs.write().unwrap();
-                for (conn_id, sid) in &expired {
-                    if let Some(removed) = subs.remove(*conn_id, *sid) {
-                        let mut upstream = state.upstream.write().unwrap();
-                        if let Some(ref mut up) = *upstream {
-                            up.remove_interest(&removed.subject, removed.queue.as_deref());
-                        }
-                    }
-                }
-                state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
-            }
+            let expired = deliver_to_subs_upstream(
+                state,
+                &subject,
+                subject_str,
+                reply.as_deref(),
+                headers.as_ref(),
+                &payload,
+                dirty_writers,
+            );
+            handle_expired_subs_upstream(&expired, state);
         }
         LeafOp::Ping => {
             // Send PONG via the writer thread

@@ -27,6 +27,10 @@ pub(crate) mod upstream;
 pub(crate) mod websocket;
 pub(crate) mod worker;
 
+pub(crate) mod client_handler;
+pub(crate) mod handler;
+pub(crate) mod leaf_handler;
+
 #[cfg(feature = "subject-mapping")]
 pub use interest::SubjectMapping;
 pub use server::{

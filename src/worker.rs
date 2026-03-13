@@ -15,19 +15,24 @@ use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
+use crate::client_handler::ClientHandler;
+use crate::handler::{
+    handle_expired_subs, send_existing_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx,
+};
+use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
 use crate::protocol::{AdaptiveBuf, ClientOp};
 use crate::server::ServerState;
-use crate::sub_list::{create_eventfd, DirectWriter, Subscription};
+use crate::sub_list::{create_eventfd, DirectWriter};
 use crate::upstream::UpstreamCmd;
 use crate::websocket::{self, DecodeStatus, WsCodec};
 
@@ -44,6 +49,12 @@ pub(crate) enum WorkerCmd {
         stream: TcpStream,
         addr: SocketAddr,
         is_websocket: bool,
+    },
+    /// Accept an inbound leaf node connection (hub mode).
+    NewLeafConn {
+        id: u64,
+        stream: TcpStream,
+        addr: SocketAddr,
     },
     /// Broadcast INFO line with ldm:true to all active connections.
     LameDuck(Vec<u8>),
@@ -68,6 +79,12 @@ impl WorkerHandle {
             addr,
             is_websocket,
         });
+        self.wake();
+    }
+
+    /// Send a new inbound leaf node connection to this worker and wake it.
+    pub fn send_leaf_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        let _ = self.tx.send(WorkerCmd::NewLeafConn { id, stream, addr });
         self.wake();
     }
 
@@ -162,7 +179,7 @@ struct TlsTransport {
     enc_out: BytesMut,
 }
 
-struct ClientState {
+pub(crate) struct ClientState {
     fd: RawFd,
     _stream: TcpStream,
     read_buf: AdaptiveBuf,
@@ -174,6 +191,7 @@ struct ClientState {
     transport: Transport,
     #[allow(dead_code)]
     conn_id: u64,
+    ext: ConnExt,
     upstream_tx: Option<mpsc::Sender<UpstreamCmd>>,
     /// Whether EPOLLOUT is currently registered for this fd.
     epoll_has_out: bool,
@@ -186,7 +204,7 @@ struct ClientState {
     /// Number of server-initiated PINGs sent without a PONG response.
     pings_outstanding: u32,
     /// Number of active subscriptions for this connection.
-    sub_count: usize,
+    pub(crate) sub_count: usize,
     /// Per-user permissions (set after CONNECT for Users auth).
     permissions: Option<crate::server::Permissions>,
 }
@@ -201,6 +219,8 @@ pub(crate) struct Worker {
     rx: mpsc::Receiver<WorkerCmd>,
     state: Arc<ServerState>,
     info_line: Vec<u8>,
+    /// INFO line for inbound leaf connections (port set to leafnode_port).
+    leaf_info_line: Vec<u8>,
     shutdown: bool,
     /// Accumulated eventfd notifications. Flushed after processing a read batch.
     /// Deduplicates across multiple PUBs in the same read buffer.
@@ -224,6 +244,21 @@ impl Worker {
         let info_json =
             serde_json::to_string(&state.info).expect("failed to serialize server info");
         let info_line = format!("INFO {info_json}\r\n").into_bytes();
+
+        // Build a separate INFO line for inbound leaf connections.
+        // Must have: port = leafnode_port, client_id != 0, leafnode_urls present.
+        // The Go nats-server checks CID != 0 && leafnode_urls != nil to confirm
+        // it connected to a leafnode port (not a client port).
+        let leaf_info_line = if let Some(lp) = state.leafnode_port {
+            let mut leaf_info = state.info.clone();
+            leaf_info.port = lp;
+            leaf_info.client_id = 1; // non-zero signals leafnode port
+            leaf_info.leafnode_urls = Some(vec![format!("{}:{}", leaf_info.host, lp)]);
+            let json = serde_json::to_string(&leaf_info).expect("failed to serialize leaf info");
+            format!("INFO {json}\r\n").into_bytes()
+        } else {
+            info_line.clone()
+        };
 
         let event_fd_clone = Arc::clone(&event_fd);
         let join_handle = std::thread::Builder::new()
@@ -256,6 +291,7 @@ impl Worker {
                     rx,
                     state,
                     info_line,
+                    leaf_info_line,
                     shutdown: false,
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
@@ -390,6 +426,9 @@ impl Worker {
                 } => {
                     self.add_conn(id, stream, addr, is_websocket);
                 }
+                WorkerCmd::NewLeafConn { id, stream, addr } => {
+                    self.add_leaf_conn(id, stream, addr);
+                }
                 WorkerCmd::LameDuck(info_line) => {
                     self.handle_lame_duck(&info_line);
                 }
@@ -473,6 +512,7 @@ impl Worker {
             phase,
             transport,
             conn_id: id,
+            ext: ConnExt::Client,
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
@@ -499,6 +539,74 @@ impl Worker {
         }
     }
 
+    /// Add an inbound leaf node connection (hub mode).
+    /// Sends INFO immediately and waits for CONNECT from the leaf.
+    fn add_leaf_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        stream.set_nonblocking(true).ok();
+        stream.set_nodelay(true).ok();
+        let fd = stream.as_raw_fd();
+
+        // Register with epoll (EPOLLIN, level-triggered)
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: id,
+        };
+        let ret =
+            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if ret != 0 {
+            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for leaf conn");
+            return;
+        }
+
+        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let has_pending = Arc::new(AtomicBool::new(false));
+        let direct_writer = DirectWriter::new(
+            Arc::clone(&direct_buf),
+            Arc::clone(&has_pending),
+            Arc::clone(&self.event_fd),
+        );
+
+        // Queue INFO in write_buf — use leaf_info_line (port = leafnode_port).
+        let mut write_buf = BytesMut::with_capacity(4096);
+        write_buf.extend_from_slice(&self.leaf_info_line);
+
+        let client = ClientState {
+            fd,
+            _stream: stream,
+            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
+            write_buf,
+            direct_writer,
+            direct_buf,
+            has_pending,
+            phase: ConnPhase::SendInfo,
+            transport: Transport::Raw,
+            conn_id: id,
+            ext: ConnExt::Leaf {
+                leaf_sid_counter: 0,
+                leaf_sids: HashMap::new(),
+            },
+            upstream_tx: None,
+            epoll_has_out: false,
+            echo: true,
+            accepted_at: Instant::now(),
+            last_activity: Instant::now(),
+            pings_outstanding: 0,
+            sub_count: 0,
+            permissions: None,
+        };
+
+        self.fd_to_conn.insert(fd, id);
+        self.conns.insert(id, client);
+
+        counter!("leaf_connections_total", "worker" => self.worker_label.clone()).increment(1);
+        gauge!("connections_active", "worker" => self.worker_label.clone())
+            .set(self.conns.len() as f64);
+
+        debug!(id, addr = %addr, "accepted inbound leaf connection on worker");
+        // Try to flush INFO immediately
+        self.try_flush_conn(id);
+    }
+
     fn remove_conn(&mut self, conn_id: u64) {
         if let Some(client) = self.conns.remove(&conn_id) {
             unsafe {
@@ -513,6 +621,12 @@ impl Worker {
             self.state
                 .active_connections
                 .fetch_sub(1, Ordering::Relaxed);
+
+            // Unregister leaf DirectWriter from shared registry.
+            if client.ext.is_leaf() {
+                self.state.leaf_writers.write().unwrap().remove(&conn_id);
+            }
+
             cleanup_conn(conn_id, &self.state);
             gauge!("connections_active", "worker" => self.worker_label.clone())
                 .set(self.conns.len() as f64);
@@ -1478,33 +1592,58 @@ impl Worker {
                 };
                 match op {
                     Some(ClientOp::Connect(connect_info)) => {
-                        if !self
-                            .state
-                            .auth
-                            .validate(&connect_info, &self.state.info.nonce)
-                        {
-                            warn!(conn_id, "authorization violation");
-                            counter!(
-                                "auth_failures_total",
-                                "worker" => self.worker_label.clone()
-                            )
-                            .increment(1);
-                            if let Some(client) = self.conns.get_mut(&conn_id) {
-                                client
-                                    .write_buf
-                                    .extend_from_slice(b"-ERR 'Authorization Violation'\r\n");
+                        let is_leaf = self
+                            .conns
+                            .get(&conn_id)
+                            .map(|c| c.ext.is_leaf())
+                            .unwrap_or(false);
+
+                        if is_leaf {
+                            // Inbound leaf node — skip client auth, send PING, go Active.
+                            let client = self.conns.get_mut(&conn_id).unwrap();
+                            client.phase = ConnPhase::Active;
+                            client.echo = false; // suppress echo for leaf conns
+                            client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                            client.write_buf.extend_from_slice(b"PING\r\n");
+
+                            // Register leaf DirectWriter so interest can be propagated.
+                            let dw = client.direct_writer.clone();
+                            self.state.leaf_writers.write().unwrap().insert(conn_id, dw);
+
+                            // Send existing subscriptions as LS+ to the new leaf.
+                            send_existing_subs(&self.state, &client.direct_writer);
+
+                            info!(conn_id, "inbound leaf connected");
+                        } else {
+                            // Regular client connection — validate auth.
+                            if !self
+                                .state
+                                .auth
+                                .validate(&connect_info, &self.state.info.nonce)
+                            {
+                                warn!(conn_id, "authorization violation");
+                                counter!(
+                                    "auth_failures_total",
+                                    "worker" => self.worker_label.clone()
+                                )
+                                .increment(1);
+                                if let Some(client) = self.conns.get_mut(&conn_id) {
+                                    client
+                                        .write_buf
+                                        .extend_from_slice(b"-ERR 'Authorization Violation'\r\n");
+                                }
+                                self.try_flush_conn(conn_id);
+                                self.remove_conn(conn_id);
+                                return;
                             }
-                            self.try_flush_conn(conn_id);
-                            self.remove_conn(conn_id);
-                            return;
+                            let perms = self.state.auth.lookup_permissions(&connect_info);
+                            let client = self.conns.get_mut(&conn_id).unwrap();
+                            client.phase = ConnPhase::Active;
+                            client.echo = connect_info.echo;
+                            client.permissions = perms;
+                            client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                            info!(conn_id, "client connected");
                         }
-                        let perms = self.state.auth.lookup_permissions(&connect_info);
-                        let client = self.conns.get_mut(&conn_id).unwrap();
-                        client.phase = ConnPhase::Active;
-                        client.echo = connect_info.echo;
-                        client.permissions = perms;
-                        client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
-                        info!(conn_id, "client connected");
                     }
                     Some(_) => {
                         // Wrong op
@@ -1520,45 +1659,162 @@ impl Worker {
                     None => return, // need more data
                 }
             } else {
-                // Active: parse client ops
-                let can_skip = {
-                    let client = self.conns.get(&conn_id).unwrap();
-                    client.upstream_tx.is_none() && !self.state.has_subs.load(Ordering::Relaxed)
-                };
+                // Active phase: parse ops (client or leaf protocol).
+                let is_leaf = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.ext.is_leaf())
+                    .unwrap_or(false);
 
-                let op = {
-                    let client = self.conns.get_mut(&conn_id).unwrap();
-                    let result = if can_skip {
-                        nats_proto::try_skip_or_parse_client_op(&mut client.read_buf)
-                    } else {
-                        nats_proto::try_parse_client_op(&mut client.read_buf)
+                if is_leaf {
+                    // Leaf connection: parse leaf protocol ops (LS+, LS-, LMSG, PING, PONG).
+                    let op = {
+                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        match nats_proto::try_parse_leaf_op(&mut client.read_buf) {
+                            Ok(op) => op,
+                            Err(_) => {
+                                self.remove_conn(conn_id);
+                                return;
+                            }
+                        }
                     };
-                    match result {
-                        Ok(op) => op,
-                        Err(_) => {
-                            self.remove_conn(conn_id);
+                    match op {
+                        Some(op) => {
+                            let (result, expired) = {
+                                let client = self.conns.get_mut(&conn_id).unwrap();
+                                let draining = matches!(client.phase, ConnPhase::Draining);
+                                let mut conn_ctx = ConnCtx {
+                                    conn_id,
+                                    write_buf: &mut client.write_buf,
+                                    direct_writer: &client.direct_writer,
+                                    echo: client.echo,
+                                    sub_count: &mut client.sub_count,
+                                    upstream_tx: &mut client.upstream_tx,
+                                    permissions: &client.permissions,
+                                    ext: &mut client.ext,
+                                    draining,
+                                };
+                                let mut worker_ctx = WorkerCtx {
+                                    state: &self.state,
+                                    event_fd: self.event_fd.as_raw_fd(),
+                                    pending_notify: &mut self.pending_notify,
+                                    pending_notify_count: &mut self.pending_notify_count,
+                                    msgs_received: &mut self.msgs_received,
+                                    msgs_received_bytes: &mut self.msgs_received_bytes,
+                                    msgs_delivered: &mut self.msgs_delivered,
+                                    msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                                    worker_label: &self.worker_label,
+                                };
+                                LeafHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+                            };
+                            handle_expired_subs(
+                                &expired,
+                                &self.state,
+                                &mut self.conns,
+                                &self.worker_label,
+                            );
+                            match result {
+                                HandleResult::Ok => {}
+                                HandleResult::Flush => self.try_flush_conn(conn_id),
+                                HandleResult::Disconnect => {
+                                    self.try_flush_conn(conn_id);
+                                    self.remove_conn(conn_id);
+                                    return;
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some(client) = self.conns.get_mut(&conn_id) {
+                                client.read_buf.try_shrink();
+                            }
                             return;
                         }
                     }
-                };
+                } else {
+                    // Client connection: parse client protocol ops.
+                    let can_skip = {
+                        let client = self.conns.get(&conn_id).unwrap();
+                        client.upstream_tx.is_none() && !self.state.has_subs.load(Ordering::Relaxed)
+                    };
 
-                match op {
-                    Some(ClientOp::Pong) if can_skip => {
-                        // Skipped PUB/HPUB, continue parsing
-                        continue;
-                    }
-                    Some(op) => {
-                        if self.handle_client_op(conn_id, op).is_err() {
-                            self.remove_conn(conn_id);
+                    let op = {
+                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        let result = if can_skip {
+                            nats_proto::try_skip_or_parse_client_op(&mut client.read_buf)
+                        } else {
+                            nats_proto::try_parse_client_op(&mut client.read_buf)
+                        };
+                        match result {
+                            Ok(op) => op,
+                            Err(_) => {
+                                self.remove_conn(conn_id);
+                                return;
+                            }
+                        }
+                    };
+
+                    match op {
+                        Some(ClientOp::Pong) if can_skip => {
+                            // Skipped PUB/HPUB, continue parsing
+                            continue;
+                        }
+                        Some(ClientOp::Pong) => {
+                            if let Some(client) = self.conns.get_mut(&conn_id) {
+                                client.pings_outstanding = 0;
+                                client.last_activity = Instant::now();
+                            }
+                        }
+                        Some(op) => {
+                            let (result, expired) = {
+                                let client = self.conns.get_mut(&conn_id).unwrap();
+                                let draining = matches!(client.phase, ConnPhase::Draining);
+                                let mut conn_ctx = ConnCtx {
+                                    conn_id,
+                                    write_buf: &mut client.write_buf,
+                                    direct_writer: &client.direct_writer,
+                                    echo: client.echo,
+                                    sub_count: &mut client.sub_count,
+                                    upstream_tx: &mut client.upstream_tx,
+                                    permissions: &client.permissions,
+                                    ext: &mut client.ext,
+                                    draining,
+                                };
+                                let mut worker_ctx = WorkerCtx {
+                                    state: &self.state,
+                                    event_fd: self.event_fd.as_raw_fd(),
+                                    pending_notify: &mut self.pending_notify,
+                                    pending_notify_count: &mut self.pending_notify_count,
+                                    msgs_received: &mut self.msgs_received,
+                                    msgs_received_bytes: &mut self.msgs_received_bytes,
+                                    msgs_delivered: &mut self.msgs_delivered,
+                                    msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                                    worker_label: &self.worker_label,
+                                };
+                                ClientHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+                            };
+                            handle_expired_subs(
+                                &expired,
+                                &self.state,
+                                &mut self.conns,
+                                &self.worker_label,
+                            );
+                            match result {
+                                HandleResult::Ok => {}
+                                HandleResult::Flush => self.try_flush_conn(conn_id),
+                                HandleResult::Disconnect => {
+                                    self.try_flush_conn(conn_id);
+                                    self.remove_conn(conn_id);
+                                    return;
+                                }
+                            }
+                        }
+                        None => {
+                            // No more complete ops — try_shrink and return
+                            if let Some(client) = self.conns.get_mut(&conn_id) {
+                                client.read_buf.try_shrink();
+                            }
                             return;
                         }
-                    }
-                    None => {
-                        // No more complete ops — try_shrink and return
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client.read_buf.try_shrink();
-                        }
-                        return;
                     }
                 }
             }
@@ -1567,336 +1823,6 @@ impl Worker {
 
     fn handle_write(&mut self, conn_id: u64) {
         self.try_flush_conn(conn_id);
-    }
-
-    fn handle_client_op(&mut self, conn_id: u64, op: ClientOp) -> io::Result<()> {
-        match op {
-            ClientOp::Ping => {
-                if let Some(client) = self.conns.get_mut(&conn_id) {
-                    client.write_buf.extend_from_slice(b"PONG\r\n");
-                }
-                self.try_flush_conn(conn_id);
-            }
-            ClientOp::Pong => {
-                if let Some(client) = self.conns.get_mut(&conn_id) {
-                    client.pings_outstanding = 0;
-                    client.last_activity = Instant::now();
-                }
-            }
-            ClientOp::Subscribe {
-                sid,
-                subject,
-                queue_group,
-            } => {
-                // Silently reject SUB during drain
-                if matches!(
-                    self.conns.get(&conn_id).map(|c| &c.phase),
-                    Some(ConnPhase::Draining)
-                ) {
-                    return Ok(());
-                }
-
-                // Check subscribe permissions
-                {
-                    let denied = self.conns.get(&conn_id).and_then(|c| {
-                        c.permissions.as_ref().map(|p| {
-                            let subj = bytes_to_str(&subject);
-                            !p.subscribe.is_allowed(subj)
-                        })
-                    });
-                    if denied == Some(true) {
-                        counter!("subscriptions_rejected_total", "reason" => "permissions")
-                            .increment(1);
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client.write_buf.extend_from_slice(
-                                b"-ERR 'Permissions Violation for Subscription'\r\n",
-                            );
-                        }
-                        self.try_flush_conn(conn_id);
-                        return Ok(());
-                    }
-                }
-
-                let max_subs = self.state.max_subscriptions.load(Ordering::Relaxed);
-                if max_subs > 0 {
-                    let at_limit = match self.conns.get(&conn_id) {
-                        Some(c) => c.sub_count >= max_subs,
-                        None => return Ok(()),
-                    };
-                    if at_limit {
-                        warn!(
-                            conn_id,
-                            max_subscriptions = max_subs,
-                            "maximum subscriptions exceeded"
-                        );
-                        counter!("subscriptions_rejected_total").increment(1);
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client
-                                .write_buf
-                                .extend_from_slice(b"-ERR 'Maximum Subscriptions Exceeded'\r\n");
-                        }
-                        self.try_flush_conn(conn_id);
-                        return Ok(());
-                    }
-                }
-
-                let subject_str = bytes_to_str(&subject);
-                let queue_str = queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
-
-                let direct_writer = match self.conns.get(&conn_id) {
-                    Some(c) => c.direct_writer.clone(),
-                    None => return Ok(()),
-                };
-
-                // Clone for upstream before moving into Subscription
-                let upstream_queue = queue_str.clone();
-
-                let sub = Subscription {
-                    conn_id,
-                    sid,
-                    sid_bytes: nats_proto::sid_to_bytes(sid),
-                    subject: subject_str.to_string(),
-                    queue: queue_str,
-                    writer: direct_writer,
-                    max_msgs: AtomicU64::new(0),
-                    delivered: AtomicU64::new(0),
-                };
-
-                {
-                    let mut subs = self.state.subs.write().unwrap();
-                    subs.insert(sub);
-                    self.state.has_subs.store(true, Ordering::Relaxed);
-                }
-
-                {
-                    let mut upstream = self.state.upstream.write().unwrap();
-                    if let Some(ref mut up) = *upstream {
-                        if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue) {
-                            warn!(error = %e, "failed to add upstream interest");
-                        }
-                    }
-                }
-
-                if let Some(client) = self.conns.get_mut(&conn_id) {
-                    client.sub_count += 1;
-                }
-
-                gauge!(
-                    "subscriptions_active",
-                    "worker" => self.worker_label.clone()
-                )
-                .increment(1.0);
-                debug!(conn_id, sid, subject = %subject_str, "client subscribed");
-            }
-            ClientOp::Unsubscribe { sid, max } => {
-                if let Some(n) = max {
-                    // UNSUB with max: set delivery limit, auto-remove when reached.
-                    let subs = self.state.subs.read().unwrap();
-                    let found = subs.set_unsub_max(conn_id, sid, n);
-                    let already_expired = found && subs.is_expired(conn_id, sid);
-                    drop(subs);
-
-                    if already_expired {
-                        // Already delivered >= max, remove immediately.
-                        let mut subs = self.state.subs.write().unwrap();
-                        if let Some(removed) = subs.remove(conn_id, sid) {
-                            self.state
-                                .has_subs
-                                .store(!subs.is_empty(), Ordering::Relaxed);
-                            if let Some(client) = self.conns.get_mut(&conn_id) {
-                                client.sub_count = client.sub_count.saturating_sub(1);
-                            }
-                            let mut upstream = self.state.upstream.write().unwrap();
-                            if let Some(ref mut up) = *upstream {
-                                up.remove_interest(&removed.subject, removed.queue.as_deref());
-                            }
-                            gauge!(
-                                "subscriptions_active",
-                                "worker" => self.worker_label.clone()
-                            )
-                            .decrement(1.0);
-                            debug!(
-                                conn_id, sid,
-                                subject = %removed.subject,
-                                "auto-unsubscribed (max already reached)"
-                            );
-                        }
-                    }
-                } else {
-                    // Immediate unsubscribe
-                    let removed = {
-                        let mut subs = self.state.subs.write().unwrap();
-                        let r = subs.remove(conn_id, sid);
-                        self.state
-                            .has_subs
-                            .store(!subs.is_empty(), Ordering::Relaxed);
-                        r
-                    };
-
-                    if let Some(ref removed) = removed {
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client.sub_count = client.sub_count.saturating_sub(1);
-                        }
-                        let mut upstream = self.state.upstream.write().unwrap();
-                        if let Some(ref mut up) = *upstream {
-                            up.remove_interest(&removed.subject, removed.queue.as_deref());
-                        }
-                        gauge!(
-                            "subscriptions_active",
-                            "worker" => self.worker_label.clone()
-                        )
-                        .decrement(1.0);
-                        debug!(conn_id, sid, subject = %removed.subject, "client unsubscribed");
-                    }
-                }
-            }
-            ClientOp::Publish {
-                subject,
-                payload,
-                respond,
-                headers,
-                ..
-            } => {
-                // Check publish permissions
-                {
-                    let denied = self.conns.get(&conn_id).and_then(|c| {
-                        c.permissions.as_ref().map(|p| {
-                            let subj = bytes_to_str(&subject);
-                            !p.publish.is_allowed(subj)
-                        })
-                    });
-                    if denied == Some(true) {
-                        counter!("messages_rejected_total", "reason" => "permissions").increment(1);
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client
-                                .write_buf
-                                .extend_from_slice(b"-ERR 'Permissions Violation for Publish'\r\n");
-                        }
-                        self.try_flush_conn(conn_id);
-                        return Ok(());
-                    }
-                }
-
-                let max_payload = self.state.max_payload.load(Ordering::Relaxed);
-                if max_payload > 0 && payload.len() > max_payload {
-                    warn!(
-                        conn_id,
-                        payload_len = payload.len(),
-                        max_payload,
-                        "maximum payload violation"
-                    );
-                    counter!("messages_rejected_total", "reason" => "max_payload").increment(1);
-                    if let Some(client) = self.conns.get_mut(&conn_id) {
-                        client
-                            .write_buf
-                            .extend_from_slice(b"-ERR 'Maximum Payload Violation'\r\n");
-                    }
-                    self.try_flush_conn(conn_id);
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "maximum payload violation",
-                    ));
-                }
-
-                let payload_len = payload.len() as u64;
-                self.msgs_received += 1;
-                self.msgs_received_bytes += payload_len;
-
-                {
-                    let my_event_fd = self.event_fd.as_raw_fd();
-                    let pending_notify = &mut self.pending_notify;
-                    let pending_count = &mut self.pending_notify_count;
-                    let pub_echo = self.conns.get(&conn_id).map(|c| c.echo).unwrap_or(true);
-                    let delivered = &mut self.msgs_delivered;
-                    let delivered_bytes = &mut self.msgs_delivered_bytes;
-
-                    let subject_str = bytes_to_str(&subject);
-                    let subs = self.state.subs.read().unwrap();
-                    let (_match_count, expired) = subs.for_each_match(subject_str, |sub| {
-                        // Suppress echo: don't deliver to the publisher itself
-                        // when the client set echo: false in CONNECT.
-                        if !pub_echo && sub.conn_id == conn_id {
-                            return;
-                        }
-                        sub.writer.write_msg(
-                            &subject,
-                            &sub.sid_bytes,
-                            respond.as_deref(),
-                            headers.as_ref(),
-                            &payload,
-                        );
-                        *delivered += 1;
-                        *delivered_bytes += payload_len;
-                        // Skip notification for our own worker — flush_pending
-                        // runs after the event loop iteration.
-                        let fd = sub.writer.event_raw_fd();
-                        if fd == my_event_fd {
-                            return;
-                        }
-                        // Accumulate notification (deduplicated across entire batch).
-                        if !pending_notify[..*pending_count].contains(&fd)
-                            && *pending_count < pending_notify.len()
-                        {
-                            pending_notify[*pending_count] = fd;
-                            *pending_count += 1;
-                        }
-                    });
-                    drop(subs);
-
-                    // Remove expired subs (reached max delivery limit).
-                    if !expired.is_empty() {
-                        let mut subs = self.state.subs.write().unwrap();
-                        for (exp_conn_id, exp_sid) in &expired {
-                            if let Some(removed) = subs.remove(*exp_conn_id, *exp_sid) {
-                                if let Some(client) = self.conns.get_mut(exp_conn_id) {
-                                    client.sub_count = client.sub_count.saturating_sub(1);
-                                }
-                                let mut upstream = self.state.upstream.write().unwrap();
-                                if let Some(ref mut up) = *upstream {
-                                    up.remove_interest(&removed.subject, removed.queue.as_deref());
-                                }
-                                gauge!(
-                                    "subscriptions_active",
-                                    "worker" => self.worker_label.clone()
-                                )
-                                .decrement(1.0);
-                                debug!(
-                                    conn_id = exp_conn_id,
-                                    sid = exp_sid,
-                                    subject = %removed.subject,
-                                    "auto-unsubscribed (max reached)"
-                                );
-                            }
-                        }
-                        self.state
-                            .has_subs
-                            .store(!subs.is_empty(), Ordering::Relaxed);
-                    }
-                }
-
-                let upstream_tx = self.conns.get(&conn_id).and_then(|c| c.upstream_tx.clone());
-                if let Some(ref tx) = upstream_tx {
-                    if tx
-                        .send(UpstreamCmd::Publish {
-                            subject,
-                            reply: respond,
-                            headers,
-                            payload,
-                        })
-                        .is_err()
-                    {
-                        // Writer thread gone — refresh from global state (may have reconnected)
-                        if let Some(client) = self.conns.get_mut(&conn_id) {
-                            client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
-                        }
-                    }
-                }
-            }
-            ClientOp::Connect(_) => {
-                // Duplicate CONNECT, ignore
-            }
-        }
-        Ok(())
     }
 }
 
@@ -1914,14 +1840,6 @@ fn epoll_mod(epoll_fd: RawFd, client_fd: RawFd, conn_id: u64, enable_out: bool) 
     unsafe {
         libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, client_fd, &mut ev);
     }
-}
-
-/// Convert `Bytes` to `&str` without UTF-8 validation.
-/// NATS subjects are restricted to ASCII printable characters.
-#[inline]
-fn bytes_to_str(b: &Bytes) -> &str {
-    // SAFETY: NATS protocol subjects/reply-to are always ASCII
-    unsafe { std::str::from_utf8_unchecked(b) }
 }
 
 fn cleanup_conn(id: u64, state: &ServerState) {
