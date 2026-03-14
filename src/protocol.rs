@@ -105,6 +105,8 @@ impl Write for HubStream {
 pub(crate) use crate::nats_proto::ClientOp;
 #[cfg(any(feature = "leaf", feature = "hub"))]
 pub(crate) use crate::nats_proto::LeafOp;
+#[cfg(feature = "cluster")]
+pub(crate) use crate::nats_proto::RouteOp;
 
 // --- Adaptive read buffer (Go-style dynamic sizing) ---
 

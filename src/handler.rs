@@ -22,7 +22,7 @@ use bytes::{Bytes, BytesMut};
 use metrics::gauge;
 use tracing::debug;
 
-#[cfg(feature = "hub")]
+#[cfg(any(feature = "hub", feature = "cluster"))]
 use crate::nats_proto;
 use crate::server::{Permissions, ServerState};
 use crate::sub_list::DirectWriter;
@@ -58,6 +58,12 @@ pub(crate) enum ConnExt {
         leaf_sid_counter: u64,
         leaf_sids: HashMap<(Bytes, Option<Bytes>), u64>,
     },
+    /// Inbound route connection (uses RMSG for delivery, RS+/RS- for interest).
+    #[cfg(feature = "cluster")]
+    Route {
+        route_sid_counter: u64,
+        route_sids: HashMap<(Bytes, Option<Bytes>), u64>,
+    },
 }
 
 impl ConnExt {
@@ -70,6 +76,18 @@ impl ConnExt {
     /// Returns `true` for inbound leaf connections.
     #[cfg(not(feature = "hub"))]
     pub fn is_leaf(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` for inbound route connections.
+    #[cfg(feature = "cluster")]
+    pub fn is_route(&self) -> bool {
+        matches!(self, Self::Route { .. })
+    }
+
+    /// Returns `true` for inbound route connections.
+    #[cfg(not(feature = "cluster"))]
+    pub fn is_route(&self) -> bool {
         false
     }
 }
@@ -115,6 +133,7 @@ pub(crate) fn deliver_to_subs(
     payload: &[u8],
     skip_conn_id: u64,
     skip_echo: bool,
+    #[cfg(feature = "cluster")] skip_routes: bool,
 ) -> Vec<(u64, u64)> {
     let payload_len = payload.len() as u64;
 
@@ -126,16 +145,39 @@ pub(crate) fn deliver_to_subs(
         if skip_echo && sub.conn_id == skip_conn_id {
             return;
         }
-        #[cfg(feature = "hub")]
-        if sub.is_leaf {
-            sub.writer.write_lmsg(subject, reply, headers, payload);
+        // One-hop rule: messages from routes are never re-forwarded to other routes.
+        #[cfg(feature = "cluster")]
+        if skip_routes && sub.is_route {
+            return;
+        }
+        #[cfg(feature = "cluster")]
+        if sub.is_route {
+            sub.writer.write_rmsg(subject, reply, headers, payload);
         } else {
+            #[cfg(feature = "hub")]
+            if sub.is_leaf {
+                sub.writer.write_lmsg(subject, reply, headers, payload);
+            } else {
+                sub.writer
+                    .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+            }
+            #[cfg(not(feature = "hub"))]
             sub.writer
                 .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
         }
-        #[cfg(not(feature = "hub"))]
-        sub.writer
-            .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+        #[cfg(not(feature = "cluster"))]
+        {
+            #[cfg(feature = "hub")]
+            if sub.is_leaf {
+                sub.writer.write_lmsg(subject, reply, headers, payload);
+            } else {
+                sub.writer
+                    .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+            }
+            #[cfg(not(feature = "hub"))]
+            sub.writer
+                .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+        }
         *wctx.msgs_delivered += 1;
         *wctx.msgs_delivered_bytes += payload_len;
         // Skip notification for our own worker — flush_pending
@@ -172,8 +214,43 @@ pub(crate) fn deliver_to_subs_upstream(
     payload: &[u8],
     dirty_writers: &mut Vec<DirectWriter>,
 ) -> Vec<(u64, u64)> {
+    deliver_to_subs_upstream_inner(
+        state,
+        subject,
+        subject_str,
+        reply,
+        headers,
+        payload,
+        dirty_writers,
+        #[cfg(feature = "cluster")]
+        false,
+    )
+}
+
+/// Deliver to local subs from an upstream-like source (hub or route reader thread).
+/// When `skip_routes` is true (cluster feature), route subs are skipped (one-hop rule).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deliver_to_subs_upstream_inner(
+    state: &ServerState,
+    subject: &[u8],
+    subject_str: &str,
+    reply: Option<&[u8]>,
+    headers: Option<&HeaderMap>,
+    payload: &[u8],
+    dirty_writers: &mut Vec<DirectWriter>,
+    #[cfg(feature = "cluster")] skip_routes: bool,
+) -> Vec<(u64, u64)> {
     let subs = state.subs.read().unwrap();
     let (_count, expired) = subs.for_each_match(subject_str, |sub| {
+        #[cfg(feature = "cluster")]
+        if sub.is_route {
+            if skip_routes {
+                return;
+            }
+            sub.writer.write_rmsg(subject, reply, headers, payload);
+            dirty_writers.push(sub.writer.clone());
+            return;
+        }
         #[cfg(feature = "hub")]
         if sub.is_leaf {
             sub.writer.write_lmsg(subject, reply, headers, payload);
@@ -303,6 +380,61 @@ pub(crate) fn send_existing_subs(state: &ServerState, writer: &DirectWriter) {
             builder.build_leaf_sub_queue(subject.as_bytes(), q.as_bytes())
         } else {
             builder.build_leaf_sub(subject.as_bytes())
+        };
+        writer.write_raw(data);
+    }
+    drop(subs);
+    writer.notify();
+}
+
+/// Propagate RS+ to all inbound route connections (interest advertisement).
+#[cfg(feature = "cluster")]
+pub(crate) fn propagate_route_sub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+    let writers = state.route_writers.read().unwrap();
+    if writers.is_empty() {
+        return;
+    }
+    let mut builder = nats_proto::MsgBuilder::new();
+    let data = if let Some(q) = queue {
+        builder.build_route_sub_queue(subject, q)
+    } else {
+        builder.build_route_sub(subject)
+    };
+    for writer in writers.values() {
+        writer.write_raw(data);
+        writer.notify();
+    }
+}
+
+/// Propagate RS- to all inbound route connections (interest removal).
+#[cfg(feature = "cluster")]
+pub(crate) fn propagate_route_unsub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
+    let writers = state.route_writers.read().unwrap();
+    if writers.is_empty() {
+        return;
+    }
+    let mut builder = nats_proto::MsgBuilder::new();
+    let data = if let Some(q) = queue {
+        builder.build_route_unsub_queue(subject, q)
+    } else {
+        builder.build_route_unsub(subject)
+    };
+    for writer in writers.values() {
+        writer.write_raw(data);
+        writer.notify();
+    }
+}
+
+/// Send RS+ for all existing local subscriptions to a given route's DirectWriter.
+#[cfg(feature = "cluster")]
+pub(crate) fn send_existing_subs_to_route(state: &ServerState, writer: &DirectWriter) {
+    let subs = state.subs.read().unwrap();
+    let mut builder = nats_proto::MsgBuilder::new();
+    for (subject, queue) in subs.local_interests() {
+        let data = if let Some(q) = queue {
+            builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
+        } else {
+            builder.build_route_sub(subject.as_bytes())
         };
         writer.write_raw(data);
     }

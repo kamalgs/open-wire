@@ -820,6 +820,10 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
             #[cfg(any(feature = "leaf", feature = "hub"))]
             "leafnodes" => apply_leafnodes(&mut config, value)?,
 
+            // --- cluster block ---
+            #[cfg(feature = "cluster")]
+            "cluster" => apply_cluster(&mut config, value)?,
+
             // --- websocket block ---
             "websocket" => {
                 if let Some(entries) = value.as_map() {
@@ -928,6 +932,43 @@ fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), C
             }
             _ => {
                 tracing::debug!("ignoring leafnodes key: {lkey}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `cluster { ... }` block.
+#[cfg(feature = "cluster")]
+fn apply_cluster(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+    let entries = match value.as_map() {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+
+    for (ckey, cval) in entries {
+        match ckey.as_str() {
+            "listen" => {
+                let s = as_string(cval)?;
+                let (_host, port) = parse_listen(&s)?;
+                if let Some(p) = port {
+                    config.cluster_port = Some(p);
+                }
+            }
+            "name" => {
+                config.cluster_name = Some(as_string(cval)?);
+            }
+            "routes" => {
+                if let Some(arr) = cval.as_array() {
+                    for v in arr {
+                        if let Ok(s) = as_string(v) {
+                            config.cluster_seeds.push(s);
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::debug!("ignoring cluster key: {ckey}");
             }
         }
     }

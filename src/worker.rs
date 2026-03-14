@@ -27,11 +27,17 @@ use tracing::{debug, info, warn};
 use crate::client_handler::ClientHandler;
 #[cfg(feature = "hub")]
 use crate::handler::send_existing_subs;
+#[cfg(feature = "cluster")]
+use crate::handler::send_existing_subs_to_route;
 use crate::handler::{handle_expired_subs, ConnCtx, ConnExt, HandleResult, WorkerCtx};
 #[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
+#[cfg(feature = "cluster")]
+use crate::protocol::RouteOp;
 use crate::protocol::{AdaptiveBuf, ClientOp};
+#[cfg(feature = "cluster")]
+use crate::route_handler::RouteHandler;
 use crate::server::ServerState;
 use crate::sub_list::{create_eventfd, DirectWriter};
 #[cfg(feature = "leaf")]
@@ -55,6 +61,13 @@ pub(crate) enum WorkerCmd {
     /// Accept an inbound leaf node connection (hub mode).
     #[cfg(feature = "hub")]
     NewLeafConn {
+        id: u64,
+        stream: TcpStream,
+        addr: SocketAddr,
+    },
+    /// Accept an inbound route connection (cluster mode).
+    #[cfg(feature = "cluster")]
+    NewRouteConn {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
@@ -89,6 +102,13 @@ impl WorkerHandle {
     #[cfg(feature = "hub")]
     pub fn send_leaf_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewLeafConn { id, stream, addr });
+        self.wake();
+    }
+
+    /// Send a new inbound route connection to this worker and wake it.
+    #[cfg(feature = "cluster")]
+    pub fn send_route_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        let _ = self.tx.send(WorkerCmd::NewRouteConn { id, stream, addr });
         self.wake();
     }
 
@@ -227,6 +247,9 @@ pub(crate) struct Worker {
     /// INFO line for inbound leaf connections (port set to leafnode_port).
     #[cfg(feature = "hub")]
     leaf_info_line: Vec<u8>,
+    /// INFO line for inbound route connections (port set to cluster_port).
+    #[cfg(feature = "cluster")]
+    route_info_line: Vec<u8>,
     shutdown: bool,
     /// Accumulated eventfd notifications. Flushed after processing a read batch.
     /// Deduplicates across multiple PUBs in the same read buffer.
@@ -267,6 +290,17 @@ impl Worker {
             info_line.clone()
         };
 
+        #[cfg(feature = "cluster")]
+        let route_info_line = if let Some(cp) = state.cluster_port {
+            let mut route_info = state.info.clone();
+            route_info.port = cp;
+            route_info.client_id = 0;
+            let json = serde_json::to_string(&route_info).expect("failed to serialize route info");
+            format!("INFO {json}\r\n").into_bytes()
+        } else {
+            info_line.clone()
+        };
+
         let event_fd_clone = Arc::clone(&event_fd);
         let join_handle = std::thread::Builder::new()
             .name(format!("worker-{index}"))
@@ -300,6 +334,8 @@ impl Worker {
                     info_line,
                     #[cfg(feature = "hub")]
                     leaf_info_line,
+                    #[cfg(feature = "cluster")]
+                    route_info_line,
                     shutdown: false,
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
@@ -437,6 +473,10 @@ impl Worker {
                 #[cfg(feature = "hub")]
                 WorkerCmd::NewLeafConn { id, stream, addr } => {
                     self.add_leaf_conn(id, stream, addr);
+                }
+                #[cfg(feature = "cluster")]
+                WorkerCmd::NewRouteConn { id, stream, addr } => {
+                    self.add_route_conn(id, stream, addr);
                 }
                 WorkerCmd::LameDuck(info_line) => {
                     self.handle_lame_duck(&info_line);
@@ -619,6 +659,76 @@ impl Worker {
         self.try_flush_conn(id);
     }
 
+    /// Add an inbound route connection (cluster mode).
+    /// Sends INFO immediately and waits for CONNECT from the route peer.
+    #[cfg(feature = "cluster")]
+    fn add_route_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        stream.set_nonblocking(true).ok();
+        stream.set_nodelay(true).ok();
+        let fd = stream.as_raw_fd();
+
+        // Register with epoll (EPOLLIN, level-triggered)
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: id,
+        };
+        let ret =
+            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if ret != 0 {
+            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for route conn");
+            return;
+        }
+
+        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let has_pending = Arc::new(AtomicBool::new(false));
+        let direct_writer = DirectWriter::new(
+            Arc::clone(&direct_buf),
+            Arc::clone(&has_pending),
+            Arc::clone(&self.event_fd),
+        );
+
+        // Queue INFO in write_buf — use route_info_line (port = cluster_port).
+        let mut write_buf = BytesMut::with_capacity(4096);
+        write_buf.extend_from_slice(&self.route_info_line);
+
+        let client = ClientState {
+            fd,
+            _stream: stream,
+            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
+            write_buf,
+            direct_writer,
+            direct_buf,
+            has_pending,
+            phase: ConnPhase::SendInfo,
+            transport: Transport::Raw,
+            conn_id: id,
+            ext: ConnExt::Route {
+                route_sid_counter: 0,
+                route_sids: std::collections::HashMap::new(),
+            },
+            #[cfg(feature = "leaf")]
+            upstream_tx: None,
+            epoll_has_out: false,
+            echo: true,
+            accepted_at: Instant::now(),
+            last_activity: Instant::now(),
+            pings_outstanding: 0,
+            sub_count: 0,
+            permissions: None,
+        };
+
+        self.fd_to_conn.insert(fd, id);
+        self.conns.insert(id, client);
+
+        counter!("route_connections_total", "worker" => self.worker_label.clone()).increment(1);
+        gauge!("connections_active", "worker" => self.worker_label.clone())
+            .set(self.conns.len() as f64);
+
+        debug!(id, addr = %addr, "accepted inbound route connection on worker");
+        // Try to flush INFO immediately
+        self.try_flush_conn(id);
+    }
+
     fn remove_conn(&mut self, conn_id: u64) {
         if let Some(client) = self.conns.remove(&conn_id) {
             unsafe {
@@ -638,6 +748,11 @@ impl Worker {
             #[cfg(feature = "hub")]
             if client.ext.is_leaf() {
                 self.state.leaf_writers.write().unwrap().remove(&conn_id);
+            }
+            // Unregister route DirectWriter from shared registry.
+            #[cfg(feature = "cluster")]
+            if client.ext.is_route() {
+                self.state.route_writers.write().unwrap().remove(&conn_id);
             }
 
             cleanup_conn(conn_id, &self.state);
@@ -1592,7 +1707,77 @@ impl Worker {
             }
 
             if phase == 1 {
-                // WaitConnect: parse CONNECT
+                // WaitConnect: parse CONNECT (or route INFO+CONNECT for route conns)
+
+                // Route connections use the route protocol parser (INFO+CONNECT+PING).
+                #[cfg(feature = "cluster")]
+                let is_route_conn = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.ext.is_route())
+                    .unwrap_or(false);
+                #[cfg(not(feature = "cluster"))]
+                let is_route_conn = false;
+
+                #[cfg(feature = "cluster")]
+                if is_route_conn {
+                    let route_op = {
+                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        match nats_proto::try_parse_route_op(&mut client.read_buf) {
+                            Ok(op) => op,
+                            Err(_) => {
+                                self.remove_conn(conn_id);
+                                return;
+                            }
+                        }
+                    };
+                    match route_op {
+                        Some(RouteOp::Info(_)) => {
+                            // Peer's INFO — skip it, continue waiting for CONNECT.
+                            continue;
+                        }
+                        Some(RouteOp::Connect(_)) => {
+                            // Peer's CONNECT — go Active, register, exchange subs.
+                            let client = self.conns.get_mut(&conn_id).unwrap();
+                            client.phase = ConnPhase::Active;
+                            client.echo = false;
+                            #[cfg(feature = "leaf")]
+                            {
+                                client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                            }
+                            client.write_buf.extend_from_slice(b"PONG\r\n");
+
+                            // Register route DirectWriter.
+                            let dw = client.direct_writer.clone();
+                            self.state
+                                .route_writers
+                                .write()
+                                .unwrap()
+                                .insert(conn_id, dw);
+
+                            // Send existing local subscriptions as RS+ to the new route.
+                            send_existing_subs_to_route(&self.state, &client.direct_writer);
+
+                            info!(conn_id, "inbound route connected");
+                        }
+                        Some(RouteOp::Ping) => {
+                            // Peer sent PING during handshake — respond with PONG.
+                            if let Some(client) = self.conns.get_mut(&conn_id) {
+                                client.write_buf.extend_from_slice(b"PONG\r\n");
+                            }
+                            continue;
+                        }
+                        Some(_) => {
+                            self.remove_conn(conn_id);
+                            return;
+                        }
+                        None => return, // need more data
+                    }
+                    // After route handshake ops, continue the outer loop to process
+                    // remaining data in the read buffer.
+                    continue;
+                }
+
                 let op = {
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     match nats_proto::try_parse_client_op(&mut client.read_buf) {
@@ -1695,6 +1880,15 @@ impl Worker {
                 #[cfg(not(feature = "hub"))]
                 let is_leaf = false;
 
+                #[cfg(feature = "cluster")]
+                let is_route = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.ext.is_route())
+                    .unwrap_or(false);
+                #[cfg(not(feature = "cluster"))]
+                let is_route = false;
+
                 if is_leaf {
                     // Leaf connection: parse leaf protocol ops (LS+, LS-, LMSG, PING, PONG).
                     #[cfg(feature = "hub")]
@@ -1738,6 +1932,74 @@ impl Worker {
                                         worker_label: &self.worker_label,
                                     };
                                     LeafHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+                                };
+                                handle_expired_subs(
+                                    &expired,
+                                    &self.state,
+                                    &mut self.conns,
+                                    &self.worker_label,
+                                );
+                                match result {
+                                    HandleResult::Ok => {}
+                                    HandleResult::Flush => self.try_flush_conn(conn_id),
+                                    HandleResult::Disconnect => {
+                                        self.try_flush_conn(conn_id);
+                                        self.remove_conn(conn_id);
+                                        return;
+                                    }
+                                }
+                            }
+                            None => {
+                                if let Some(client) = self.conns.get_mut(&conn_id) {
+                                    client.read_buf.try_shrink();
+                                }
+                                return;
+                            }
+                        }
+                    }
+                } else if is_route {
+                    // Route connection: parse route protocol ops (RS+, RS-, RMSG, PING, PONG).
+                    #[cfg(feature = "cluster")]
+                    {
+                        let op = {
+                            let client = self.conns.get_mut(&conn_id).unwrap();
+                            match nats_proto::try_parse_route_op(&mut client.read_buf) {
+                                Ok(op) => op,
+                                Err(_) => {
+                                    self.remove_conn(conn_id);
+                                    return;
+                                }
+                            }
+                        };
+                        match op {
+                            Some(op) => {
+                                let (result, expired) = {
+                                    let client = self.conns.get_mut(&conn_id).unwrap();
+                                    let draining = matches!(client.phase, ConnPhase::Draining);
+                                    let mut conn_ctx = ConnCtx {
+                                        conn_id,
+                                        write_buf: &mut client.write_buf,
+                                        direct_writer: &client.direct_writer,
+                                        echo: client.echo,
+                                        sub_count: &mut client.sub_count,
+                                        #[cfg(feature = "leaf")]
+                                        upstream_tx: &mut client.upstream_tx,
+                                        permissions: &client.permissions,
+                                        ext: &mut client.ext,
+                                        draining,
+                                    };
+                                    let mut worker_ctx = WorkerCtx {
+                                        state: &self.state,
+                                        event_fd: self.event_fd.as_raw_fd(),
+                                        pending_notify: &mut self.pending_notify,
+                                        pending_notify_count: &mut self.pending_notify_count,
+                                        msgs_received: &mut self.msgs_received,
+                                        msgs_received_bytes: &mut self.msgs_received_bytes,
+                                        msgs_delivered: &mut self.msgs_delivered,
+                                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                                        worker_label: &self.worker_label,
+                                    };
+                                    RouteHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
                                 handle_expired_subs(
                                     &expired,

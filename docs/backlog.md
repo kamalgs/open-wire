@@ -59,6 +59,18 @@ Items marked ~~strikethrough~~ are already implemented.
 - ~~**Max subscriptions**~~ — reject SUB beyond per-connection limit.
 - ~~**Queue groups**~~ — load-balanced message delivery across subscriber groups.
 
+## Clustering
+
+- ~~**Full-mesh clustering**~~ — route connections between peers using RS+/RS-/RMSG
+  protocol. One-hop message forwarding, subscription propagation, 3-node clusters
+  tested. See [ADR-010](adr/010-full-mesh-clustering.md).
+- **Duplicate route dedup** — reject inbound route connections from already-connected
+  server_id (currently connects but doesn't enforce uniqueness).
+- **Cluster gossip** — discover peers via INFO gossip (currently requires explicit seeds).
+- **Super-clusters / gateways** — cross-cluster routing (non-goal for now).
+- **Sharded clustering** — subject-prefix sharding for large clusters. See
+  [ADR-007](adr/007-sharded-cluster-mode.md) for the design spike.
+
 ## Platform
 
 - ~~**Cross-platform portability**~~ — extract a reactor trait, add poll()/kqueue/IOCP/WASI

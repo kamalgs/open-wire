@@ -33,6 +33,10 @@ pub(crate) mod client_handler;
 pub(crate) mod handler;
 #[cfg(feature = "hub")]
 pub(crate) mod leaf_handler;
+#[cfg(feature = "cluster")]
+pub(crate) mod route_conn;
+#[cfg(feature = "cluster")]
+pub(crate) mod route_handler;
 
 #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
 pub use interest::SubjectMapping;

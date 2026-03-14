@@ -214,6 +214,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let secs: u64 = args[i].parse().expect("invalid auth-timeout");
                 config.auth_timeout = std::time::Duration::from_secs(secs);
             }
+            #[cfg(feature = "cluster")]
+            "--cluster-port" => {
+                i += 1;
+                config.cluster_port = Some(args[i].parse().expect("invalid cluster-port"));
+            }
+            #[cfg(feature = "cluster")]
+            "--cluster-seeds" => {
+                i += 1;
+                config
+                    .cluster_seeds
+                    .extend(args[i].split(',').map(|s| s.trim().to_string()));
+            }
+            #[cfg(feature = "cluster")]
+            "--cluster-name" => {
+                i += 1;
+                config.cluster_name = Some(args[i].clone());
+            }
             _ => {
                 eprintln!("Unknown argument: {}", args[i]);
                 eprintln!(

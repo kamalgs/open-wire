@@ -10,8 +10,9 @@ autotests = false
 default = ["interest-collapse", "subject-mapping", "leaf", "hub"]
 interest-collapse = []
 subject-mapping = []
-leaf = []   # Upstream hub connection support
-hub = []    # Inbound leaf node connection support
+leaf = []      # Upstream hub connection support
+hub = []       # Inbound leaf node connection support
+cluster = []   # Full mesh route clustering support
 
 [dependencies]
 bytes = "1.4.0"

@@ -19,6 +19,9 @@
 #  11. Hub mode: fan-out   — 1 pub + 5 subs on Rust hub
 #  12. Hub mode: leaf→hub  — pub on Go leaf, sub on Rust hub
 #  13. Hub mode: hub→leaf  — pub on Rust hub, sub on Go leaf
+#  14. Cluster: pub/sub    — pub on A, sub on B (cross-node 1:1)
+#  15. Cluster: fan-out x3 — pub on A, sub on A+B+C (3-node fan-out)
+#  16. Cluster: remote B+C — pub on A, sub on B + sub on C (no local sub)
 #
 # Prerequisites:
 #   - nats-server in PATH  (go install github.com/nats-io/nats-server/v2@main)
@@ -73,6 +76,14 @@ RUST_HUB_CLIENT_PORT=6333
 RUST_HUB_LEAF_PORT=6422
 GO_LEAF_TO_RUST_PORT=6225
 
+# 3-node cluster ports (full mode only)
+GO_CLUSTER_A_PORT=7001;   GO_CLUSTER_A_ROUTE=7101
+GO_CLUSTER_B_PORT=7002;   GO_CLUSTER_B_ROUTE=7102
+GO_CLUSTER_C_PORT=7003;   GO_CLUSTER_C_ROUTE=7103
+RUST_CLUSTER_A_PORT=8001; RUST_CLUSTER_A_ROUTE=8101
+RUST_CLUSTER_B_PORT=8002; RUST_CLUSTER_B_ROUTE=8102
+RUST_CLUSTER_C_PORT=8003; RUST_CLUSTER_C_ROUTE=8103
+
 # PID tracking for cleanup
 PIDS=()
 BG_PIDS=()
@@ -100,7 +111,11 @@ done
 PORTS_TO_CHECK="$HUB_CLIENT_PORT $HUB_LEAF_PORT $GO_LEAF_PORT $GO_LEAF_WS_PORT \
   $RUST_LEAF_PORT $RUST_LEAF_WS_PORT"
 if [[ "$MODE" == "full" ]]; then
-  PORTS_TO_CHECK="$PORTS_TO_CHECK $RUST_HUB_CLIENT_PORT $RUST_HUB_LEAF_PORT $GO_LEAF_TO_RUST_PORT"
+  PORTS_TO_CHECK="$PORTS_TO_CHECK $RUST_HUB_CLIENT_PORT $RUST_HUB_LEAF_PORT $GO_LEAF_TO_RUST_PORT \
+    $GO_CLUSTER_A_PORT $GO_CLUSTER_A_ROUTE $GO_CLUSTER_B_PORT $GO_CLUSTER_B_ROUTE \
+    $GO_CLUSTER_C_PORT $GO_CLUSTER_C_ROUTE \
+    $RUST_CLUSTER_A_PORT $RUST_CLUSTER_A_ROUTE $RUST_CLUSTER_B_PORT $RUST_CLUSTER_B_ROUTE \
+    $RUST_CLUSTER_C_PORT $RUST_CLUSTER_C_ROUTE"
 fi
 for port in $PORTS_TO_CHECK; do
   if ss -tln 2>/dev/null | grep -q ":${port} "; then
@@ -117,8 +132,13 @@ echo ""
 
 # --- Build Rust leaf server ---
 echo "Building Rust leaf server (release)..."
-cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-  --release 2>&1 | tail -1
+if [[ "$MODE" == "full" ]]; then
+  cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
+    --release --features cluster 2>&1 | tail -1
+else
+  cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
+    --release 2>&1 | tail -1
+fi
 RUST_BIN="$REPO_ROOT/target/release/open-wire"
 echo ""
 
@@ -654,6 +674,229 @@ if [[ "$MODE" == "full" ]]; then
   echo "================================================================"
   echo ""
   run_cross_pubsub "Rust Hub → Go Leaf"  "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Cluster mode: start 3-node Go cluster + 3-node Rust cluster
+  # ──────────────────────────────────────────────────────────────────────
+  echo ""
+  echo "Starting 3-node Go cluster..."
+  nats-server -c "$SCRIPT_DIR/configs/bench_go_cluster_a.conf" &
+  PIDS+=($!); GO_CLUSTER_A_PID=$!
+  nats-server -c "$SCRIPT_DIR/configs/bench_go_cluster_b.conf" &
+  PIDS+=($!)
+  nats-server -c "$SCRIPT_DIR/configs/bench_go_cluster_c.conf" &
+  PIDS+=($!)
+  sleep 2
+
+  echo "Starting 3-node Rust cluster..."
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_a.conf" &
+  PIDS+=($!); RUST_CLUSTER_A_PID=$!
+  sleep 0.5
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_b.conf" &
+  PIDS+=($!)
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_c.conf" &
+  PIDS+=($!)
+  sleep 2
+
+  # Verify cluster connectivity
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT"   >/dev/null 2>&1 || { echo "FAIL: go cluster A"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_CLUSTER_B_PORT"   >/dev/null 2>&1 || { echo "FAIL: go cluster B"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_CLUSTER_C_PORT"   >/dev/null 2>&1 || { echo "FAIL: go cluster C"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" >/dev/null 2>&1 || { echo "FAIL: rust cluster A"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" >/dev/null 2>&1 || { echo "FAIL: rust cluster B"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_CLUSTER_C_PORT" >/dev/null 2>&1 || { echo "FAIL: rust cluster C"; exit 1; }
+  echo "All cluster nodes responding."
+  echo ""
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 14: Cluster pub/sub (pub on A, sub on B)
+  # ──────────────────────────────────────────────────────────────────────
+  echo "================================================================"
+  echo "  14. CLUSTER PUB/SUB (pub on A, sub on B — cross-node)"
+  echo "      ${MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+  run_cross_pubsub_capture "Go Cluster A→B" \
+    "nats://127.0.0.1:$GO_CLUSTER_A_PORT" "nats://127.0.0.1:$GO_CLUSTER_B_PORT" "$GO_CLUSTER_A_PID"
+  go_cl_ps_rate=$CAPTURED_RATE go_cl_ps_cpu=$CAPTURED_CPU go_cl_ps_rss=$CAPTURED_RSS go_cl_ps_ctx=$CAPTURED_CTX
+
+  run_cross_pubsub_capture "Rust Cluster A→B" \
+    "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" "$RUST_CLUSTER_A_PID"
+  rust_cl_ps_rate=$CAPTURED_RATE rust_cl_ps_cpu=$CAPTURED_CPU rust_cl_ps_rss=$CAPTURED_RSS rust_cl_ps_ctx=$CAPTURED_CTX
+
+  record_summary "Cluster A→B" \
+    "$rust_cl_ps_rate" "$go_cl_ps_rate" \
+    "$rust_cl_ps_cpu" "$go_cl_ps_cpu" \
+    "$rust_cl_ps_rss" "$go_cl_ps_rss" \
+    "$rust_cl_ps_ctx" "$go_cl_ps_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 15: Cluster fan-out (pub on A, 1 sub on each of A, B, C)
+  # ──────────────────────────────────────────────────────────────────────
+  echo "================================================================"
+  echo "  15. CLUSTER FAN-OUT x3 (pub on A, sub on A+B+C)"
+  echo "      ${MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+
+  # Go cluster fan-out x3
+  echo "--- Go Cluster fan-out x3 ---"
+  cpu_before=$(cpu_ticks "$GO_CLUSTER_A_PID")
+  ctx_before=$(ctx_switches "$GO_CLUSTER_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" >"/tmp/bench_cl_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_CLUSTER_B_PORT" >"/tmp/bench_cl_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_CLUSTER_C_PORT" >"/tmp/bench_cl_sub_3.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:"
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2 3; do
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      rm -f "/tmp/bench_cl_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  go_cl_fan_rate=$(( rate_sum / RUNS ))
+  go_cl_fan_cpu=$(( ($(cpu_ticks "$GO_CLUSTER_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  go_cl_fan_rss=$(rss_kb "$GO_CLUSTER_A_PID")
+  go_cl_fan_ctx=$(( $(ctx_switches "$GO_CLUSTER_A_PID") - ctx_before ))
+
+  # Rust cluster fan-out x3
+  echo "--- Rust Cluster fan-out x3 ---"
+  cpu_before=$(cpu_ticks "$RUST_CLUSTER_A_PID")
+  ctx_before=$(ctx_switches "$RUST_CLUSTER_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" >"/tmp/bench_cl_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" >"/tmp/bench_cl_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_CLUSTER_C_PORT" >"/tmp/bench_cl_sub_3.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:"
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2 3; do
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      rm -f "/tmp/bench_cl_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  rust_cl_fan_rate=$(( rate_sum / RUNS ))
+  rust_cl_fan_cpu=$(( ($(cpu_ticks "$RUST_CLUSTER_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  rust_cl_fan_rss=$(rss_kb "$RUST_CLUSTER_A_PID")
+  rust_cl_fan_ctx=$(( $(ctx_switches "$RUST_CLUSTER_A_PID") - ctx_before ))
+
+  record_summary "Cluster fan x3" \
+    "$rust_cl_fan_rate" "$go_cl_fan_rate" \
+    "$rust_cl_fan_cpu" "$go_cl_fan_cpu" \
+    "$rust_cl_fan_rss" "$go_cl_fan_rss" \
+    "$rust_cl_fan_ctx" "$go_cl_fan_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 16: Cluster pub on A, sub on B and C (no local sub)
+  # ──────────────────────────────────────────────────────────────────────
+  echo "================================================================"
+  echo "  16. CLUSTER REMOTE-ONLY (pub on A, sub on B + sub on C)"
+  echo "      ${MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+
+  # Go cluster remote-only
+  echo "--- Go Cluster remote B+C ---"
+  cpu_before=$(cpu_ticks "$GO_CLUSTER_A_PID")
+  ctx_before=$(ctx_switches "$GO_CLUSTER_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_CLUSTER_B_PORT" >"/tmp/bench_cl_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_CLUSTER_C_PORT" >"/tmp/bench_cl_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:"
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2; do
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      rm -f "/tmp/bench_cl_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  go_cl_rem_rate=$(( rate_sum / RUNS ))
+  go_cl_rem_cpu=$(( ($(cpu_ticks "$GO_CLUSTER_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  go_cl_rem_rss=$(rss_kb "$GO_CLUSTER_A_PID")
+  go_cl_rem_ctx=$(( $(ctx_switches "$GO_CLUSTER_A_PID") - ctx_before ))
+
+  # Rust cluster remote-only
+  echo "--- Rust Cluster remote B+C ---"
+  cpu_before=$(cpu_ticks "$RUST_CLUSTER_A_PID")
+  ctx_before=$(ctx_switches "$RUST_CLUSTER_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" >"/tmp/bench_cl_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_CLUSTER_C_PORT" >"/tmp/bench_cl_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:"
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2; do
+      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /"
+      rm -f "/tmp/bench_cl_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  rust_cl_rem_rate=$(( rate_sum / RUNS ))
+  rust_cl_rem_cpu=$(( ($(cpu_ticks "$RUST_CLUSTER_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  rust_cl_rem_rss=$(rss_kb "$RUST_CLUSTER_A_PID")
+  rust_cl_rem_ctx=$(( $(ctx_switches "$RUST_CLUSTER_A_PID") - ctx_before ))
+
+  record_summary "Cluster B+C" \
+    "$rust_cl_rem_rate" "$go_cl_rem_rate" \
+    "$rust_cl_rem_cpu" "$go_cl_rem_cpu" \
+    "$rust_cl_rem_rss" "$go_cl_rem_rss" \
+    "$rust_cl_rem_ctx" "$go_cl_rem_ctx"
 fi
 
 # ──────────────────────────────────────────────────────────────────────

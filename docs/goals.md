@@ -22,8 +22,9 @@
 
 ## Non-Goals
 
-- **Full NATS server** — no JetStream, clustering, accounts, or multi-tenancy.
-  This is a leaf node only.
+- **Full NATS server** — no JetStream, accounts, or multi-tenancy. Full-mesh
+  clustering is supported but advanced features like super-clusters and gateways
+  are not.
 - **Production use** — this is an experiment, not a hardened production system.
   Operational tooling is improving but not yet production-grade.
 - **Protocol completeness** — only the subset of NATS client and leaf protocols

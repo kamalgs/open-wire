@@ -3,11 +3,13 @@
 A high-performance NATS-compatible message relay written in Rust. It accepts
 client connections over TCP, routes messages between local subscribers, and
 optionally forwards traffic to an upstream NATS hub via the leaf node protocol.
-It can also accept inbound leaf connections from other servers (hub mode).
+It can also accept inbound leaf connections from other servers (hub mode) and
+form full-mesh clusters with peer nodes via the route protocol (cluster mode).
 
-Both upstream (`leaf` feature) and inbound leaf (`hub` feature) capabilities are
-Cargo feature-gated and default-enabled. Deployments can compile with neither
-(pure local relay), one, or both. See [ADR-009](adr/009-leaf-hub-feature-flags.md).
+Upstream (`leaf`), inbound leaf (`hub`), and cluster (`cluster`) capabilities
+are Cargo feature-gated. `leaf` and `hub` are default-enabled; `cluster` is
+opt-in. See [ADR-009](adr/009-leaf-hub-feature-flags.md) and
+[ADR-010](adr/010-full-mesh-clustering.md).
 
 ## System Diagram
 
@@ -39,10 +41,22 @@ Cargo feature-gated and default-enabled. Deployments can compile with neither
                           │   Inbound Leaf Connections  │
                           │  (other leaf node servers)  │
                           └────────────────────────────┘
+
+                    ┌──────────┐
+          RS+/RS-   │  Node B  │   RS+/RS-
+        ┌──────────►│          │◄──────────┐
+        │    RMSG   │          │   RMSG    │
+        │           └──────────┘           │
+   ┌────┴─────┐                      ┌────┴─────┐
+   │  Node A  │       RS+/RS-        │  Node C  │
+   │          │◄─────────────────────►│          │
+   │          │       RMSG           │          │
+   └──────────┘                      └──────────┘
+        Full-mesh cluster [cluster]
 ```
 
 Features marked `[leaf]` require the `leaf` Cargo feature; `[hub]` requires
-`hub`. Both are default-enabled.
+`hub`; `[cluster]` requires `cluster`. `leaf` and `hub` are default-enabled.
 
 ## Module Map
 
@@ -59,6 +73,8 @@ Features marked `[leaf]` require the `leaf` Cargo feature; `[hub]` requires
 | `sub_list.rs` | Subscription storage and fan-out | `SubList`, `Subscription`, `DirectWriter` | — |
 | `upstream.rs` | Hub connection (reader + writer threads) | `Upstream`, `UpstreamCmd` | `leaf` |
 | `interest.rs` | Interest collapse + subject mapping pipeline | `InterestPipeline` | `leaf` |
+| `route_handler.rs` | Route protocol dispatch (RS+/RS-/RMSG) | `RouteHandler` | `cluster` |
+| `route_conn.rs` | Outbound route connection manager | `RouteConnManager` | `cluster` |
 | `config.rs` | Go nats-server `.conf` file parser | `load_config` | — |
 
 \* These modules are always compiled but individual types/functions within
@@ -147,6 +163,38 @@ The upstream module reference-counts local subscriptions. The first SUB sends
 `LS+` to the hub; the last UNSUB sends `LS-`. The reader and writer each run
 on their own OS thread with blocking I/O.
 
+## Message Flow: Cluster Route (RS+/RS-/RMSG)
+
+```
+  Node A                  Route TCP              Node B
+  ──────                  ─────────              ──────
+  Client SUB "foo"             │                    │
+       │                       │                    │
+  propagate_route_sub()        │                    │
+       │──── RS+ $G foo ──────►│                    │
+       │                       │──► insert route    │
+       │                       │    Subscription    │
+       │                       │    (is_route=true) │
+       │                       │                    │
+  Client PUB "foo"             │                    │
+       │                       │                    │
+  deliver_to_subs()            │                    │
+       │──► local subs (MSG)   │                    │
+       │──► route subs (RMSG)  │                    │
+       │              RMSG $G foo payload           │
+       │                       │──────────────────►│
+       │                       │         deliver_to_subs(skip_routes=true)
+       │                       │              local subs only (MSG)
+       │                       │         (one-hop: never re-forward to routes)
+```
+
+Each node propagates RS+/RS- for local subscription changes to all route peers.
+Messages received from a route are delivered only to local client and leaf
+subscribers — never re-forwarded to other routes (one-hop rule).
+
+Route connections are managed by `RouteConnManager` (outbound, dedicated threads)
+and the worker epoll loop (inbound, multiplexed like client connections).
+
 ## Subscription Model
 
 `SubList` splits subscriptions into two collections:
@@ -168,3 +216,4 @@ single eventfd notification per remote worker.
 - [ADR-003: Zero-copy parsing](adr/003-zero-copy-parsing.md)
 - [ADR-004: Adaptive buffers](adr/004-adaptive-buffers.md)
 - [ADR-005: Batched notifications](adr/005-batched-notifications.md)
+- [ADR-010: Full-mesh clustering](adr/010-full-mesh-clustering.md)

@@ -5,7 +5,7 @@
 //
 // http://www.apache.org/licenses/LICENSE-2.0
 
-#[cfg(feature = "hub")]
+#[cfg(any(feature = "hub", feature = "cluster"))]
 use std::collections::HashMap;
 use std::io;
 use std::net::{TcpListener, TcpStream};
@@ -23,7 +23,7 @@ use tracing::{error, info, warn};
 use crate::types::{ConnectInfo, ServerInfo};
 
 use crate::protocol::BufConfig;
-#[cfg(feature = "hub")]
+#[cfg(any(feature = "hub", feature = "cluster"))]
 use crate::sub_list::DirectWriter;
 use crate::sub_list::SubList;
 #[cfg(feature = "leaf")]
@@ -282,6 +282,16 @@ pub struct LeafServerConfig {
     /// exact mappings.
     #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
     pub subject_mappings: Vec<crate::interest::SubjectMapping>,
+    /// Port for cluster route connections. When set, the server listens for
+    /// inbound route connections and participates in full mesh clustering.
+    #[cfg(feature = "cluster")]
+    pub cluster_port: Option<u16>,
+    /// Seed route URLs for outbound connections (e.g., `["nats-route://host2:4248"]`).
+    #[cfg(feature = "cluster")]
+    pub cluster_seeds: Vec<String>,
+    /// Cluster name. All nodes in a cluster must use the same name.
+    #[cfg(feature = "cluster")]
+    pub cluster_name: Option<String>,
 }
 
 impl Default for LeafServerConfig {
@@ -326,6 +336,12 @@ impl Default for LeafServerConfig {
             interest_collapse: Vec::new(),
             #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
             subject_mappings: Vec::new(),
+            #[cfg(feature = "cluster")]
+            cluster_port: None,
+            #[cfg(feature = "cluster")]
+            cluster_seeds: Vec::new(),
+            #[cfg(feature = "cluster")]
+            cluster_name: None,
         }
     }
 }
@@ -593,6 +609,19 @@ pub(crate) struct ServerState {
     /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
     #[cfg(feature = "hub")]
     pub leaf_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
+    /// Registry of DirectWriters for inbound route connections.
+    /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
+    #[cfg(feature = "cluster")]
+    pub route_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
+    /// Port for inbound route connections. `None` when cluster mode is not enabled.
+    #[cfg(feature = "cluster")]
+    pub cluster_port: Option<u16>,
+    /// Cluster name. Must match between peers.
+    #[cfg(feature = "cluster")]
+    pub cluster_name: Option<String>,
+    /// Seed route URLs for outbound connections.
+    #[cfg(feature = "cluster")]
+    pub cluster_seeds: Vec<String>,
 }
 
 impl ServerState {
@@ -610,6 +639,9 @@ impl ServerState {
         max_control_line: usize,
         max_subscriptions: usize,
         #[cfg(feature = "hub")] leafnode_port: Option<u16>,
+        #[cfg(feature = "cluster")] cluster_port: Option<u16>,
+        #[cfg(feature = "cluster")] cluster_name: Option<String>,
+        #[cfg(feature = "cluster")] cluster_seeds: Vec<String>,
     ) -> Self {
         Self {
             info,
@@ -636,6 +668,14 @@ impl ServerState {
             leafnode_port,
             #[cfg(feature = "hub")]
             leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "cluster")]
+            route_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "cluster")]
+            cluster_port,
+            #[cfg(feature = "cluster")]
+            cluster_name,
+            #[cfg(feature = "cluster")]
+            cluster_seeds,
         }
     }
 
@@ -713,6 +753,12 @@ impl LeafServer {
                 config.max_subscriptions,
                 #[cfg(feature = "hub")]
                 config.leafnode_port,
+                #[cfg(feature = "cluster")]
+                config.cluster_port,
+                #[cfg(feature = "cluster")]
+                config.cluster_name.clone(),
+                #[cfg(feature = "cluster")]
+                config.cluster_seeds.clone(),
             )),
         }
     }
@@ -824,6 +870,21 @@ impl LeafServer {
         workers[idx].send_leaf_conn(cid, tcp_stream, addr);
     }
 
+    /// Distribute a new inbound route TCP connection to the next worker (round-robin).
+    #[cfg(feature = "cluster")]
+    fn accept_route_tcp(
+        &self,
+        tcp_stream: TcpStream,
+        addr: std::net::SocketAddr,
+        workers: &[WorkerHandle],
+        next_worker: &mut usize,
+    ) {
+        let cid = self.state.next_client_id();
+        let idx = *next_worker % workers.len();
+        *next_worker = idx + 1;
+        workers[idx].send_route_conn(cid, tcp_stream, addr);
+    }
+
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -838,6 +899,17 @@ impl LeafServer {
 
         #[cfg(feature = "leaf")]
         self.connect_upstream();
+
+        // Spawn outbound route connections to seed peers
+        #[cfg(feature = "cluster")]
+        let _route_mgr = if !self.state.cluster_seeds.is_empty() {
+            info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
+            Some(crate::route_conn::RouteConnManager::spawn(Arc::clone(
+                &self.state,
+            )))
+        } else {
+            None
+        };
 
         let workers = self.spawn_workers();
         let mut next_worker = 0usize;
@@ -867,7 +939,20 @@ impl LeafServer {
         #[cfg(not(feature = "hub"))]
         let leaf_listener: Option<TcpListener> = None;
 
-        let has_extra_listeners = ws_listener.is_some() || leaf_listener.is_some();
+        #[cfg(feature = "cluster")]
+        let cluster_listener = if let Some(cluster_port) = self.config.cluster_port {
+            let cluster_addr = format!("{}:{}", self.config.host, cluster_port);
+            let cl = TcpListener::bind(&cluster_addr)?;
+            info!(addr = %cluster_addr, "leaf server listening (cluster route)");
+            Some(cl)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cluster"))]
+        let cluster_listener: Option<TcpListener> = None;
+
+        let has_extra_listeners =
+            ws_listener.is_some() || leaf_listener.is_some() || cluster_listener.is_some();
         if has_extra_listeners {
             // Poll multiple listeners
             listener.set_nonblocking(true)?;
@@ -876,6 +961,9 @@ impl LeafServer {
             }
             if let Some(ref ll) = leaf_listener {
                 ll.set_nonblocking(true)?;
+            }
+            if let Some(ref cl) = cluster_listener {
+                cl.set_nonblocking(true)?;
             }
 
             let mut pfds = [
@@ -894,12 +982,21 @@ impl LeafServer {
                     events: libc::POLLIN,
                     revents: 0,
                 },
+                libc::pollfd {
+                    fd: cluster_listener
+                        .as_ref()
+                        .map(|l| l.as_raw_fd())
+                        .unwrap_or(-1),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             loop {
                 pfds[0].revents = 0;
                 pfds[1].revents = 0;
                 pfds[2].revents = 0;
-                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 3, -1) };
+                pfds[3].revents = 0;
+                let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, -1) };
                 if ret < 0 {
                     let err = std::io::Error::last_os_error();
                     if err.kind() == std::io::ErrorKind::Interrupted {
@@ -924,6 +1021,14 @@ impl LeafServer {
                     if let Some(ref ll) = leaf_listener {
                         while let Ok((stream, addr)) = ll.accept() {
                             self.accept_leaf_tcp(stream, addr, &workers, &mut next_worker);
+                        }
+                    }
+                }
+                #[cfg(feature = "cluster")]
+                if pfds[3].revents & libc::POLLIN != 0 {
+                    if let Some(ref cl) = cluster_listener {
+                        while let Ok((stream, addr)) = cl.accept() {
+                            self.accept_route_tcp(stream, addr, &workers, &mut next_worker);
                         }
                     }
                 }
@@ -965,6 +1070,17 @@ impl LeafServer {
         #[cfg(feature = "leaf")]
         self.connect_upstream();
 
+        // Spawn outbound route connections to seed peers
+        #[cfg(feature = "cluster")]
+        let _route_mgr = if !self.state.cluster_seeds.is_empty() {
+            info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
+            Some(crate::route_conn::RouteConnManager::spawn(Arc::clone(
+                &self.state,
+            )))
+        } else {
+            None
+        };
+
         let workers = self.spawn_workers();
         let mut next_worker = 0usize;
 
@@ -996,6 +1112,19 @@ impl LeafServer {
         #[cfg(not(feature = "hub"))]
         let leaf_listener: Option<TcpListener> = None;
 
+        #[cfg(feature = "cluster")]
+        let cluster_listener = if let Some(cluster_port) = self.config.cluster_port {
+            let cluster_addr = format!("{}:{}", self.config.host, cluster_port);
+            let cl = TcpListener::bind(&cluster_addr)?;
+            cl.set_nonblocking(true)?;
+            info!(addr = %cluster_addr, "leaf server listening (cluster route)");
+            Some(cl)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cluster"))]
+        let cluster_listener: Option<TcpListener> = None;
+
         let mut pfds = [
             libc::pollfd {
                 fd: listener.as_raw_fd(),
@@ -1009,6 +1138,14 @@ impl LeafServer {
             },
             libc::pollfd {
                 fd: leaf_listener.as_ref().map(|l| l.as_raw_fd()).unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: cluster_listener
+                    .as_ref()
+                    .map(|l| l.as_raw_fd())
+                    .unwrap_or(-1),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1033,7 +1170,8 @@ impl LeafServer {
             pfds[0].revents = 0;
             pfds[1].revents = 0;
             pfds[2].revents = 0;
-            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 3, 1000) };
+            pfds[3].revents = 0;
+            let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 4, 1000) };
 
             if ret < 0 {
                 let err = std::io::Error::last_os_error();
@@ -1062,6 +1200,15 @@ impl LeafServer {
                 if let Some(ref ll) = leaf_listener {
                     while let Ok((tcp_stream, addr)) = ll.accept() {
                         self.accept_leaf_tcp(tcp_stream, addr, &workers, &mut next_worker);
+                    }
+                }
+            }
+
+            #[cfg(feature = "cluster")]
+            if ret > 0 && pfds[3].revents & libc::POLLIN != 0 {
+                if let Some(ref cl) = cluster_listener {
+                    while let Ok((stream, addr)) = cl.accept() {
+                        self.accept_route_tcp(stream, addr, &workers, &mut next_worker);
                     }
                 }
             }

@@ -466,3 +466,233 @@ async fn hub_mode_hub_to_leaf() {
 
     shutdown_tx.store(true, Ordering::Release);
 }
+
+// --- Cluster mode helpers ---
+
+/// Start a LeafServer in cluster mode, returning the shutdown sender.
+#[cfg(feature = "cluster")]
+fn spawn_cluster_node(
+    client_port: u16,
+    cluster_port: u16,
+    seeds: Vec<String>,
+    name: &str,
+) -> Arc<AtomicBool> {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_clone = Arc::clone(&shutdown);
+    let reload = Arc::new(AtomicBool::new(false));
+
+    let config = LeafServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: client_port,
+        server_name: name.to_string(),
+        cluster_port: Some(cluster_port),
+        cluster_seeds: seeds,
+        cluster_name: Some("test-cluster".to_string()),
+        ..Default::default()
+    };
+    let server = LeafServer::new(config);
+    std::thread::Builder::new()
+        .name(format!("cluster-{}", name))
+        .spawn(move || {
+            if let Err(e) = server.run_until_shutdown(shutdown_clone, reload, None) {
+                eprintln!("cluster node error: {}", e);
+            }
+        })
+        .expect("failed to spawn cluster node thread");
+
+    shutdown
+}
+
+// --- Cluster mode tests ---
+
+#[tokio::test]
+#[cfg(feature = "cluster")]
+async fn cluster_two_node_pub_sub() {
+    // Node A: cluster port, no seeds
+    let port_a = free_port();
+    let cluster_port_a = free_port();
+    let shutdown_a = spawn_cluster_node(port_a, cluster_port_a, vec![], "node-a");
+    wait_for_leaf(port_a).await;
+
+    // Node B: connects to Node A as seed
+    let port_b = free_port();
+    let cluster_port_b = free_port();
+    let shutdown_b = spawn_cluster_node(
+        port_b,
+        cluster_port_b,
+        vec![format!("nats-route://127.0.0.1:{}", cluster_port_a)],
+        "node-b",
+    );
+    wait_for_leaf(port_b).await;
+
+    // Let route connection establish
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client on Node A subscribes
+    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
+        .await
+        .expect("connect to node A failed");
+
+    let mut sub_a = client_a
+        .subscribe("cluster.test")
+        .await
+        .expect("subscribe on A failed");
+
+    // Let subscription propagate via RS+ to Node B
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Client on Node B publishes
+    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
+        .await
+        .expect("connect to node B failed");
+
+    client_b
+        .publish("cluster.test", "hello-cluster".into())
+        .await
+        .expect("publish on B failed");
+
+    client_b.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), sub_a.next())
+        .await
+        .expect("timed out waiting for cluster message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "cluster.test");
+    assert_eq!(&msg.payload[..], b"hello-cluster");
+
+    shutdown_a.store(true, Ordering::Release);
+    shutdown_b.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+#[cfg(feature = "cluster")]
+async fn cluster_reverse_direction() {
+    // Test message flow: publish on A, subscribe on B
+    let port_a = free_port();
+    let cluster_port_a = free_port();
+    let shutdown_a = spawn_cluster_node(port_a, cluster_port_a, vec![], "node-a-rev");
+    wait_for_leaf(port_a).await;
+
+    let port_b = free_port();
+    let cluster_port_b = free_port();
+    let shutdown_b = spawn_cluster_node(
+        port_b,
+        cluster_port_b,
+        vec![format!("nats-route://127.0.0.1:{}", cluster_port_a)],
+        "node-b-rev",
+    );
+    wait_for_leaf(port_b).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Subscribe on Node B
+    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
+        .await
+        .expect("connect to B failed");
+    let mut sub_b = client_b
+        .subscribe("reverse.>")
+        .await
+        .expect("subscribe on B failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish on Node A
+    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
+        .await
+        .expect("connect to A failed");
+    client_a
+        .publish("reverse.hello", "from-a".into())
+        .await
+        .expect("publish on A failed");
+    client_a.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), sub_b.next())
+        .await
+        .expect("timed out waiting for reverse message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "reverse.hello");
+    assert_eq!(&msg.payload[..], b"from-a");
+
+    shutdown_a.store(true, Ordering::Release);
+    shutdown_b.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+#[cfg(feature = "cluster")]
+async fn cluster_three_node() {
+    // Three-node cluster: A ← B (seed A), A ← C (seed A)
+    let port_a = free_port();
+    let cport_a = free_port();
+    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "tri-a");
+    wait_for_leaf(port_a).await;
+
+    let port_b = free_port();
+    let cport_b = free_port();
+    let shutdown_b = spawn_cluster_node(
+        port_b,
+        cport_b,
+        vec![format!("nats-route://127.0.0.1:{}", cport_a)],
+        "tri-b",
+    );
+    wait_for_leaf(port_b).await;
+
+    let port_c = free_port();
+    let cport_c = free_port();
+    let shutdown_c = spawn_cluster_node(
+        port_c,
+        cport_c,
+        vec![format!("nats-route://127.0.0.1:{}", cport_a)],
+        "tri-c",
+    );
+    wait_for_leaf(port_c).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Subscribe on B and C
+    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
+        .await
+        .expect("connect to B failed");
+    let mut sub_b = client_b
+        .subscribe("tri.test")
+        .await
+        .expect("subscribe on B failed");
+
+    let client_c = async_nats::connect(format!("127.0.0.1:{}", port_c))
+        .await
+        .expect("connect to C failed");
+    let mut sub_c = client_c
+        .subscribe("tri.test")
+        .await
+        .expect("subscribe on C failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish on A
+    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
+        .await
+        .expect("connect to A failed");
+    client_a
+        .publish("tri.test", "from-a".into())
+        .await
+        .expect("publish on A failed");
+    client_a.flush().await.expect("flush failed");
+
+    // Both B and C should receive
+    let msg_b = timeout(Duration::from_secs(5), sub_b.next())
+        .await
+        .expect("timed out waiting for message on B")
+        .expect("sub B ended");
+    assert_eq!(msg_b.subject.as_str(), "tri.test");
+    assert_eq!(&msg_b.payload[..], b"from-a");
+
+    let msg_c = timeout(Duration::from_secs(5), sub_c.next())
+        .await
+        .expect("timed out waiting for message on C")
+        .expect("sub C ended");
+    assert_eq!(msg_c.subject.as_str(), "tri.test");
+    assert_eq!(&msg_c.payload[..], b"from-a");
+
+    shutdown_a.store(true, Ordering::Release);
+    shutdown_b.store(true, Ordering::Release);
+    shutdown_c.store(true, Ordering::Release);
+}

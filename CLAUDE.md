@@ -2,9 +2,10 @@
 
 ## Project Overview
 
-**open-wire** is a high-performance NATS-compatible message relay (leaf node server) written in Rust.
-It speaks the standard NATS client and leaf node protocols, routes messages between local clients,
-and optionally bridges traffic to an upstream NATS hub server.
+**open-wire** is a high-performance NATS-compatible message relay written in Rust.
+It speaks the standard NATS client, leaf node, and route protocols, routes messages between
+local clients, optionally bridges traffic to an upstream NATS hub server, and can form
+full-mesh clusters with peer nodes.
 
 Built with raw epoll, zero-copy parsing, and no async runtime.
 
@@ -12,13 +13,18 @@ Built with raw epoll, zero-copy parsing, and no async runtime.
 
 ```
 src/
-├── main.rs          # CLI binary (--port, --hub, --ws-port, --workers)
+├── main.rs          # CLI binary (--port, --hub, --ws-port, --workers, --cluster-*)
 ├── lib.rs           # Public API: LeafServer, LeafServerConfig
 ├── server.rs        # Accept loop, worker spawning, shutdown
 ├── worker.rs        # Per-thread epoll event loop, connection state machine
 ├── nats_proto.rs    # Zero-copy protocol parser + MsgBuilder
 ├── sub_list.rs      # SubList (exact + wildcard), DirectWriter fan-out
 ├── upstream.rs      # Hub connection via leaf node protocol
+├── handler.rs       # Shared handler types, ConnExt, deliver_to_subs, propagation
+├── client_handler.rs # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
+├── leaf_handler.rs  # Inbound leaf protocol dispatch (LS+/LS-/LMSG) [hub]
+├── route_handler.rs # Route protocol dispatch (RS+/RS-/RMSG) [cluster]
+├── route_conn.rs    # Outbound route connection manager [cluster]
 ├── protocol.rs      # Connection I/O wrappers, AdaptiveBuf
 ├── websocket.rs     # HTTP upgrade handshake, WS frame codec
 └── types.rs         # ServerInfo, ConnectInfo, HeaderMap
@@ -58,26 +64,43 @@ CLAUDE.md  LICENSE  NOTICE  README.md
 # Check
 cargo check
 
+# Check with cluster feature
+cargo check --features cluster
+
 # Test (unit — no external deps)
 cargo test --lib
 
+# Test with cluster feature
+cargo test --lib --features cluster
+
 # Test (all — requires nats-server in PATH)
 cargo test
+
+# Test cluster integration tests
+cargo test --test e2e --features cluster -- cluster
 
 # Format (required: nightly toolchain)
 cargo +nightly fmt
 
 # Lint
 cargo clippy --all-targets -- --deny clippy::all
+cargo clippy --all-targets --features cluster -- --deny clippy::all
 
 # Build release
 cargo build --release
 
+# Build release with cluster
+cargo build --release --features cluster
+
 # Build release with frame pointers (for perf profiling)
 RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
 
-# Benchmarks
+# Benchmarks (quick — 5 core scenarios)
 cd tests && ./throughput.sh
+
+# Benchmarks (full — all 16 scenarios including cluster)
+cd tests && ./throughput.sh --full
+
 cd tests && ./smoke_test.sh
 ```
 
@@ -129,6 +152,8 @@ Always run `cargo +nightly fmt` before committing.
 - **No async runtime**: Pure `std::thread` + `epoll` + `std::sync::mpsc`.
 - **Connection state machine**: `SendInfo → WaitConnect → Active` phases in worker.
 - **AdaptiveBuf**: Go-style dynamic buffer sizing (512B → 64KB).
+- **Full-mesh clustering** (`cluster` feature): Route connections between peers using RS+/RS-/RMSG
+  protocol. One-hop message forwarding — messages from routes are never re-forwarded to other routes.
 
 ### Key Types
 
@@ -142,6 +167,8 @@ Always run `cargo +nightly fmt` before committing.
 | `ServerConn` / `LeafConn` | `protocol.rs` | Connection I/O wrappers |
 | `AdaptiveBuf` | `protocol.rs` | Dynamic read buffer |
 | `Upstream` | `upstream.rs` | Hub connection management |
+| `RouteHandler` | `route_handler.rs` | Route protocol dispatch (`cluster`) |
+| `RouteConnManager` | `route_conn.rs` | Outbound route connections (`cluster`) |
 
 ## Dependencies
 
@@ -170,7 +197,7 @@ New dependencies should use permissive licenses: MIT, Apache-2.0, ISC, BSD-2-Cla
 - **No `unwrap()` or `expect()`** in library code.
 - **Imports**: Group std → external crates → crate-internal.
 - All public items should have doc comments.
-- Tests go in `#[cfg(test)] mod tests` within each source file (106 unit tests currently).
+- Tests go in `#[cfg(test)] mod tests` within each source file (260 unit tests currently).
 - Integration tests in `tests/e2e.rs` use `async-nats` client against a real `nats-server`.
 
 ## Commit & PR Standards

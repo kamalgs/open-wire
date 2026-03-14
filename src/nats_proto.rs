@@ -839,6 +839,273 @@ fn leaf_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Route-side parsed operations (cluster mode)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A parsed route protocol operation (RS+, RS-, RMSG, INFO, CONNECT, PING, PONG).
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+pub enum RouteOp {
+    Info(Box<ServerInfo>),
+    Connect(Box<ConnectInfo>),
+    Ping,
+    Pong,
+    /// RS+ account subject [queue [weight]]
+    RouteSub {
+        subject: Bytes,
+        queue: Option<Bytes>,
+    },
+    /// RS- account subject
+    RouteUnsub {
+        subject: Bytes,
+    },
+    /// RMSG account subject [reply] [hdr_size] total_size\r\n<payload>\r\n
+    RouteMsg {
+        subject: Bytes,
+        reply: Option<Bytes>,
+        headers: Option<HeaderMap>,
+        payload: Bytes,
+    },
+}
+
+/// Try to parse the next route protocol operation from `buf`.
+#[cfg(feature = "cluster")]
+pub fn try_parse_route_op(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
+    if buf.is_empty() {
+        return Ok(None);
+    }
+
+    match buf[0] {
+        b'P' | b'p' => {
+            if buf.len() < 4 {
+                return Ok(None);
+            }
+            match buf[1] {
+                b'I' | b'i' => {
+                    let nl = match find_newline(buf) {
+                        Some(i) => i,
+                        None => return Ok(None),
+                    };
+                    buf.advance(nl + 1);
+                    Ok(Some(RouteOp::Ping))
+                }
+                b'O' | b'o' => {
+                    let nl = match find_newline(buf) {
+                        Some(i) => i,
+                        None => return Ok(None),
+                    };
+                    buf.advance(nl + 1);
+                    Ok(Some(RouteOp::Pong))
+                }
+                _ => route_proto_err(buf, "unknown op starting with P"),
+            }
+        }
+        b'I' | b'i' => {
+            let nl = match find_newline(buf) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            let line_end = trim_cr(buf, nl);
+            let space = match memchr::memchr(b' ', &buf[..line_end]) {
+                Some(i) => i,
+                None => return route_proto_err(buf, "INFO missing args"),
+            };
+            let json = &buf[space + 1..line_end];
+            let info: ServerInfo = serde_json::from_slice(json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            buf.advance(nl + 1);
+            Ok(Some(RouteOp::Info(Box::new(info))))
+        }
+        b'C' | b'c' => {
+            let nl = match find_newline(buf) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            let line_end = trim_cr(buf, nl);
+            let space = match memchr::memchr(b' ', &buf[..line_end]) {
+                Some(i) => i,
+                None => return route_proto_err(buf, "CONNECT missing args"),
+            };
+            let json = &buf[space + 1..line_end];
+            let info: ConnectInfo = serde_json::from_slice(json)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            buf.advance(nl + 1);
+            Ok(Some(RouteOp::Connect(Box::new(info))))
+        }
+        b'+' => {
+            let nl = match find_newline(buf) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            buf.advance(nl + 1);
+            Ok(None) // +OK — ignore
+        }
+        b'-' => {
+            let nl = match find_newline(buf) {
+                Some(i) => i,
+                None => return Ok(None),
+            };
+            buf.advance(nl + 1);
+            Ok(None) // -ERR — ignore
+        }
+        b'R' | b'r' => {
+            if buf.len() < 3 {
+                return Ok(None);
+            }
+            match buf[1] {
+                b'S' | b's' => parse_route_sub_unsub(buf),
+                b'M' | b'm' => parse_rmsg(buf),
+                _ => route_proto_err(buf, "unknown route op"),
+            }
+        }
+        _ => route_proto_err(buf, "unknown route operation"),
+    }
+}
+
+/// Parse `RS+ account subject [queue [weight]]` or `RS- account subject`.
+#[cfg(feature = "cluster")]
+fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
+    let nl = match find_newline(buf) {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    let line_end = trim_cr(buf, nl);
+    if line_end < 4 {
+        return route_proto_err(buf, "RS+/RS- too short");
+    }
+    // buf[0..2] = "RS", buf[2] = '+' or '-'
+    let is_sub = buf[2] == b'+';
+    // Skip "RS+ " or "RS- " (4 bytes)
+    let args_bytes = &buf[4..line_end];
+    let (args, argc) = split_args::<4>(args_bytes);
+
+    let op = if is_sub {
+        match argc {
+            // RS+ account subject
+            2 => RouteOp::RouteSub {
+                subject: Bytes::copy_from_slice(args[1]),
+                queue: None,
+            },
+            // RS+ account subject queue weight
+            3 | 4 => RouteOp::RouteSub {
+                subject: Bytes::copy_from_slice(args[1]),
+                queue: Some(Bytes::copy_from_slice(args[2])),
+            },
+            _ => return route_proto_err(buf, "invalid RS+ arguments"),
+        }
+    } else {
+        match argc {
+            // RS- account subject
+            2 => RouteOp::RouteUnsub {
+                subject: Bytes::copy_from_slice(args[1]),
+            },
+            _ => return route_proto_err(buf, "invalid RS- arguments"),
+        }
+    };
+    buf.advance(nl + 1);
+    Ok(Some(op))
+}
+
+/// Parse `RMSG account subject [reply] [hdr_size] total_size\r\n<payload>\r\n`.
+#[cfg(feature = "cluster")]
+fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
+    let nl = match find_newline(buf) {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    let line_end = trim_cr(buf, nl);
+    if line_end < 5 {
+        return route_proto_err(buf, "RMSG too short");
+    }
+    // Skip "RMSG " (5 bytes)
+    let args_bytes = &buf[5..line_end];
+    let (args, argc) = split_args::<5>(args_bytes);
+
+    // Compute offsets for zero-copy slicing (same approach as parse_lmsg).
+    let buf_ptr = buf.as_ptr() as usize;
+    // args[0] = account (skip), args[1] = subject
+    let subj_off = args[1].as_ptr() as usize - buf_ptr;
+    let subj_len = args[1].len();
+
+    match argc {
+        // RMSG account subject size
+        3 => {
+            let size = parse_size(args[2])?;
+            let total = nl + 1 + size + 2; // header line + payload + \r\n
+            if buf.len() < total {
+                return Ok(None); // need more data
+            }
+            let payload_start = nl + 1;
+            let frozen = buf.split_to(total).freeze();
+            let subject = frozen.slice(subj_off..subj_off + subj_len);
+            let payload = frozen.slice(payload_start..payload_start + size);
+            Ok(Some(RouteOp::RouteMsg {
+                subject,
+                reply: None,
+                headers: None,
+                payload,
+            }))
+        }
+        // RMSG account subject reply size
+        4 => {
+            let reply_off = args[2].as_ptr() as usize - buf_ptr;
+            let reply_len = args[2].len();
+            let size = parse_size(args[3])?;
+            let total = nl + 1 + size + 2;
+            if buf.len() < total {
+                return Ok(None);
+            }
+            let payload_start = nl + 1;
+            let frozen = buf.split_to(total).freeze();
+            let subject = frozen.slice(subj_off..subj_off + subj_len);
+            let reply = frozen.slice(reply_off..reply_off + reply_len);
+            let payload = frozen.slice(payload_start..payload_start + size);
+            Ok(Some(RouteOp::RouteMsg {
+                subject,
+                reply: Some(reply),
+                headers: None,
+                payload,
+            }))
+        }
+        // RMSG account subject reply hdr_size total_size
+        5 => {
+            let reply_off = args[2].as_ptr() as usize - buf_ptr;
+            let reply_len = args[2].len();
+            let hdr_size = parse_size(args[3])?;
+            let total_size = parse_size(args[4])?;
+            let total = nl + 1 + total_size + 2;
+            if buf.len() < total {
+                return Ok(None);
+            }
+            let payload_start = nl + 1;
+            let frozen = buf.split_to(total).freeze();
+            let subject = frozen.slice(subj_off..subj_off + subj_len);
+            let reply = frozen.slice(reply_off..reply_off + reply_len);
+            let hdr_data = &frozen[payload_start..payload_start + hdr_size];
+            let headers = parse_headers(hdr_data)?;
+            let payload = frozen.slice(payload_start + hdr_size..payload_start + total_size);
+            Ok(Some(RouteOp::RouteMsg {
+                subject,
+                reply: Some(reply),
+                headers: Some(headers),
+                payload,
+            }))
+        }
+        _ => route_proto_err(buf, "invalid RMSG arguments"),
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn route_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
+    if let Some(nl) = find_newline(buf) {
+        buf.advance(nl + 1);
+    } else {
+        buf.clear();
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Header parser (shared)
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1109,6 +1376,102 @@ impl MsgBuilder {
         self.buf.extend_from_slice(subject);
         self.buf.extend_from_slice(b" ");
         self.buf.extend_from_slice(queue);
+        self.buf.extend_from_slice(b"\r\n");
+        &self.buf
+    }
+
+    /// Build `RMSG $G subject [reply] [hdr_len] total_len\r\npayload\r\n`.
+    #[cfg(feature = "cluster")]
+    pub fn build_rmsg(
+        &mut self,
+        subject: &[u8],
+        reply: Option<&[u8]>,
+        headers: Option<&HeaderMap>,
+        payload: &[u8],
+    ) -> &[u8] {
+        self.buf.clear();
+        let mut tmp = [0u8; 20];
+        match headers {
+            Some(hdrs) if !hdrs.is_empty() => {
+                let hdr_bytes = hdrs.to_bytes();
+                let hdr_len = hdr_bytes.len();
+                let total_len = hdr_len + payload.len();
+
+                self.buf.extend_from_slice(b"RMSG $G ");
+                self.buf.extend_from_slice(subject);
+                self.buf.push(b' ');
+                if let Some(r) = reply {
+                    self.buf.extend_from_slice(r);
+                    self.buf.push(b' ');
+                }
+                self.buf.extend_from_slice(usize_to_buf(hdr_len, &mut tmp));
+                self.buf.push(b' ');
+                self.buf
+                    .extend_from_slice(usize_to_buf(total_len, &mut tmp));
+                self.buf.extend_from_slice(b"\r\n");
+                self.buf.extend_from_slice(&hdr_bytes);
+                self.buf.extend_from_slice(payload);
+                self.buf.extend_from_slice(b"\r\n");
+            }
+            _ => {
+                self.buf.extend_from_slice(b"RMSG $G ");
+                self.buf.extend_from_slice(subject);
+                self.buf.push(b' ');
+                if let Some(r) = reply {
+                    self.buf.extend_from_slice(r);
+                    self.buf.push(b' ');
+                }
+                self.buf
+                    .extend_from_slice(usize_to_buf(payload.len(), &mut tmp));
+                self.buf.extend_from_slice(b"\r\n");
+                self.buf.extend_from_slice(payload);
+                self.buf.extend_from_slice(b"\r\n");
+            }
+        }
+        &self.buf
+    }
+
+    /// Build `RS+ $G subject\r\n`.
+    #[cfg(feature = "cluster")]
+    pub fn build_route_sub(&mut self, subject: &[u8]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(b"RS+ $G ");
+        self.buf.extend_from_slice(subject);
+        self.buf.extend_from_slice(b"\r\n");
+        &self.buf
+    }
+
+    /// Build `RS- $G subject\r\n`.
+    #[cfg(feature = "cluster")]
+    pub fn build_route_unsub(&mut self, subject: &[u8]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(b"RS- $G ");
+        self.buf.extend_from_slice(subject);
+        self.buf.extend_from_slice(b"\r\n");
+        &self.buf
+    }
+
+    /// Build `RS+ $G subject queue weight\r\n` for queue group route subscriptions.
+    #[cfg(feature = "cluster")]
+    pub fn build_route_sub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
+        self.buf.clear();
+        self.buf.extend_from_slice(b"RS+ $G ");
+        self.buf.extend_from_slice(subject);
+        self.buf.push(b' ');
+        self.buf.extend_from_slice(queue);
+        self.buf.extend_from_slice(b" 1\r\n");
+        &self.buf
+    }
+
+    /// Build `RS- $G subject\r\n` for queue group route unsubscriptions.
+    #[cfg(feature = "cluster")]
+    pub fn build_route_unsub_queue(&mut self, subject: &[u8], queue: &[u8]) -> &[u8] {
+        // RS- doesn't use queue — it unsubscribes the subject entirely
+        // (Go nats-server just uses RS- $G subject)
+        let _ = queue;
+        self.buf.clear();
+        self.buf.extend_from_slice(b"RS- $G ");
+        self.buf.extend_from_slice(subject);
         self.buf.extend_from_slice(b"\r\n");
         &self.buf
     }
@@ -1756,5 +2119,188 @@ mod tests {
         let data = b"NATS/1.0\r\nX-Multi: line1\r\n  line2\r\n\r\n";
         let h = parse_headers(data).unwrap();
         assert_eq!(h.get("X-Multi"), Some("line1 line2"));
+    }
+
+    // -- Route protocol parser tests -------------------------------------------
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_route_sub() {
+        let mut buf = BytesMut::from("RS+ $G test.subject\r\n");
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        match op {
+            RouteOp::RouteSub { subject, queue } => {
+                assert_eq!(&subject[..], b"test.subject");
+                assert!(queue.is_none());
+            }
+            _ => panic!("expected RouteSub"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_route_sub_queue() {
+        let mut buf = BytesMut::from("RS+ $G test.subject myqueue 1\r\n");
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        match op {
+            RouteOp::RouteSub { subject, queue } => {
+                assert_eq!(&subject[..], b"test.subject");
+                assert_eq!(&queue.unwrap()[..], b"myqueue");
+            }
+            _ => panic!("expected RouteSub with queue"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_route_unsub() {
+        let mut buf = BytesMut::from("RS- $G test.subject\r\n");
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        match op {
+            RouteOp::RouteUnsub { subject } => {
+                assert_eq!(&subject[..], b"test.subject");
+            }
+            _ => panic!("expected RouteUnsub"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_rmsg_no_reply() {
+        let mut buf = BytesMut::from("RMSG $G test.sub 5\r\nhello\r\n");
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        match op {
+            RouteOp::RouteMsg {
+                subject,
+                reply,
+                headers,
+                payload,
+            } => {
+                assert_eq!(&subject[..], b"test.sub");
+                assert!(reply.is_none());
+                assert!(headers.is_none());
+                assert_eq!(&payload[..], b"hello");
+            }
+            _ => panic!("expected RouteMsg"),
+        }
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_rmsg_with_reply() {
+        let mut buf = BytesMut::from("RMSG $G test.sub reply.to 2\r\nhi\r\n");
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        match op {
+            RouteOp::RouteMsg {
+                subject,
+                reply,
+                payload,
+                ..
+            } => {
+                assert_eq!(&subject[..], b"test.sub");
+                assert_eq!(&reply.unwrap()[..], b"reply.to");
+                assert_eq!(&payload[..], b"hi");
+            }
+            _ => panic!("expected RouteMsg"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_rmsg_incomplete() {
+        let mut buf = BytesMut::from("RMSG $G test.sub 10\r\nhel");
+        let op = try_parse_route_op(&mut buf).unwrap();
+        assert!(op.is_none()); // need more data
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_route_ping_pong() {
+        let mut buf = BytesMut::from("PING\r\nPONG\r\n");
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        assert!(matches!(op, RouteOp::Ping));
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        assert!(matches!(op, RouteOp::Pong));
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_parse_route_info() {
+        let mut buf = BytesMut::from(
+            "INFO {\"server_id\":\"test\",\"server_name\":\"node1\",\"port\":4248}\r\n",
+        );
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        match op {
+            RouteOp::Info(info) => {
+                assert_eq!(info.server_id, "test");
+                assert_eq!(info.server_name, "node1");
+                assert_eq!(info.port, 4248);
+            }
+            _ => panic!("expected Info"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_build_rmsg() {
+        let mut b = MsgBuilder::new();
+        let data = b.build_rmsg(b"test.sub", None, None, b"hello");
+        assert_eq!(data, b"RMSG $G test.sub 5\r\nhello\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_build_rmsg_with_reply() {
+        let mut b = MsgBuilder::new();
+        let data = b.build_rmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
+        assert_eq!(data, b"RMSG $G test.sub reply.to 2\r\nhi\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_build_route_sub() {
+        let mut b = MsgBuilder::new();
+        let data = b.build_route_sub(b"test.subject");
+        assert_eq!(data, b"RS+ $G test.subject\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_build_route_unsub() {
+        let mut b = MsgBuilder::new();
+        let data = b.build_route_unsub(b"test.subject");
+        assert_eq!(data, b"RS- $G test.subject\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_build_route_sub_queue() {
+        let mut b = MsgBuilder::new();
+        let data = b.build_route_sub_queue(b"test.subject", b"q1");
+        assert_eq!(data, b"RS+ $G test.subject q1 1\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_rmsg_roundtrip() {
+        let mut builder = MsgBuilder::new();
+        let wire = builder.build_rmsg(b"foo.bar", Some(b"reply"), None, b"payload");
+        let mut buf = BytesMut::from(wire);
+        let op = try_parse_route_op(&mut buf).unwrap().unwrap();
+        match op {
+            RouteOp::RouteMsg {
+                subject,
+                reply,
+                payload,
+                ..
+            } => {
+                assert_eq!(&subject[..], b"foo.bar");
+                assert_eq!(&reply.unwrap()[..], b"reply");
+                assert_eq!(&payload[..], b"payload");
+            }
+            _ => panic!("expected RouteMsg"),
+        }
     }
 }

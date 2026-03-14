@@ -1,8 +1,8 @@
 # open-wire
 
-A high-performance NATS-compatible message relay written in Rust. It speaks the standard NATS client and leaf node protocols, routes messages between local clients, and optionally bridges traffic to an upstream NATS hub server.
+A high-performance NATS-compatible message relay written in Rust. It speaks the standard NATS client, leaf node, and route protocols, routes messages between local clients, optionally bridges traffic to an upstream NATS hub server, and can form full-mesh clusters with peer nodes.
 
-Built with raw epoll, zero-copy parsing, and no async runtime — to see how close bare-metal Rust can get to the Go nats-server on leaf node workloads.
+Built with raw epoll, zero-copy parsing, and no async runtime — to see how close bare-metal Rust can get to the Go nats-server.
 
 [![License Apache 2](https://img.shields.io/badge/License-Apache2-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
@@ -17,6 +17,8 @@ Benchmarked against Go nats-server v2.14.0-dev leaf node, 128B messages, 3-run a
 | Fan-out x5 | 210% |
 | Leaf → Hub | 128% |
 | Hub → Leaf | 104% |
+| Cluster A→B | 192% |
+| Cluster fan-out x3 | 162% |
 | WS fan-out x5 | 238% |
 | WS fan-out x10 | 295% |
 
@@ -34,6 +36,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the full results log.
 - **WebSocket** — accepts browser and WS-capable NATS clients on a separate port
 - **N-worker epoll** — multi-threaded event loop with batched cross-worker notifications
 - **Zero-copy parsing** — protocol parsed directly from read buffers, no intermediate allocations
+- **Full-mesh clustering** — route connections between peers with one-hop message forwarding (`cluster` feature)
 - **Minimal dependencies** — no async runtime, no TLS library, ~886 KB binary
 
 ## Quick Start
@@ -50,6 +53,14 @@ cargo build --release
 
 # Run with WebSocket support
 ./target/release/open-wire --port 4222 --ws-port 4223
+
+# Build with cluster support
+cargo build --release --features cluster
+
+# Run a 3-node cluster
+./target/release/open-wire -c node-a.conf
+./target/release/open-wire -c node-b.conf
+./target/release/open-wire -c node-c.conf
 ```
 
 ### Docker
@@ -70,6 +81,10 @@ docker run -p 4222:4222 open-wire --hub nats://hub:4111
 | `--name` | `leaf-node` | Server name |
 | `--workers`, `-w` | CPU count | Number of worker threads |
 | `--ws-port` | *(none)* | WebSocket listen port |
+| `--cluster-port` | *(none)* | Cluster route listen port (requires `cluster` feature) |
+| `--cluster-seeds` | *(none)* | Comma-separated route seed URLs |
+| `--cluster-name` | *(none)* | Cluster name |
+| `-c`, `--config` | *(none)* | Config file path (Go nats-server `.conf` format) |
 
 ## Usage Examples
 
@@ -100,6 +115,31 @@ nats sub "test.>" -s nats://localhost:4222
 
 # Terminal 4 — publish to the hub; message arrives at the leaf subscriber
 nats pub test.hello "from hub" -s nats://localhost:4111
+```
+
+### 3-Node Cluster
+
+```bash
+# node-a.conf
+# listen: 127.0.0.1:4222
+# server_name: node-a
+# cluster {
+#   name: my-cluster
+#   listen: 0.0.0.0:4248
+#   routes = [
+#     "nats-route://node-b:4248"
+#     "nats-route://node-c:4248"
+#   ]
+# }
+
+# Start all three nodes (requires --features cluster)
+./target/release/open-wire -c node-a.conf
+./target/release/open-wire -c node-b.conf
+./target/release/open-wire -c node-c.conf
+
+# Subscribe on node A, publish on node B — message flows across the cluster
+nats sub test.hello -s nats://node-a:4222
+nats pub test.hello "from node B" -s nats://node-b:4222
 ```
 
 ### As a library
@@ -152,6 +192,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `nats_proto.rs` | Zero-copy protocol parser and message builder |
 | `sub_list.rs` | Subscription storage, wildcard matching, DirectWriter fan-out |
 | `upstream.rs` | Hub connection via leaf node protocol |
+| `route_handler.rs` | Route protocol dispatch (RS+/RS-/RMSG) — `cluster` feature |
+| `route_conn.rs` | Outbound route connection manager — `cluster` feature |
 | `protocol.rs` | Connection I/O wrappers, adaptive buffers |
 | `websocket.rs` | HTTP upgrade handshake, WS frame codec |
 | `types.rs` | ServerInfo, ConnectInfo, HeaderMap |
@@ -161,8 +203,9 @@ See [architecture.md](docs/architecture.md) for detailed message flow diagrams.
 ## Tests
 
 ```bash
-cargo test --lib                    # 106 unit tests
+cargo test --lib                    # 260 unit tests (with --features cluster)
 cargo test                          # unit + integration (requires nats-server in PATH)
+cargo test --test e2e --features cluster -- cluster   # cluster integration tests
 ```
 
 ## License

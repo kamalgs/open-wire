@@ -107,8 +107,25 @@ impl DirectWriter {
         self.has_pending.store(true, Ordering::Release);
     }
 
+    /// Format and append an RMSG to the shared buffer (for route delivery).
+    #[cfg(feature = "cluster")]
+    pub(crate) fn write_rmsg(
+        &self,
+        subject: &[u8],
+        reply: Option<&[u8]>,
+        headers: Option<&HeaderMap>,
+        payload: &[u8],
+    ) {
+        let mut builder = self.msg_builder.lock().unwrap();
+        let data = builder.build_rmsg(subject, reply, headers, payload);
+        let mut buf = self.buf.lock().unwrap();
+        buf.extend_from_slice(data);
+        drop(buf);
+        self.has_pending.store(true, Ordering::Release);
+    }
+
     /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS- lines).
-    #[cfg(feature = "hub")]
+    #[cfg(any(feature = "hub", feature = "cluster"))]
     pub(crate) fn write_raw(&self, data: &[u8]) {
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
@@ -131,7 +148,7 @@ impl DirectWriter {
     }
 
     /// Drain all buffered data. Returns `None` if buffer was empty.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "cluster"))]
     pub(crate) fn drain(&self) -> Option<BytesMut> {
         let mut buf = self.buf.lock().unwrap();
         if buf.is_empty() {
@@ -186,6 +203,9 @@ pub struct Subscription {
     pub(crate) delivered: AtomicU64,
     /// True for inbound leaf node subscriptions (deliver via LMSG, not MSG).
     pub is_leaf: bool,
+    /// True for route peer subscriptions (deliver via RMSG, not MSG).
+    #[cfg(feature = "cluster")]
+    pub is_route: bool,
 }
 
 impl Clone for Subscription {
@@ -200,6 +220,8 @@ impl Clone for Subscription {
             max_msgs: AtomicU64::new(self.max_msgs.load(Ordering::Relaxed)),
             delivered: AtomicU64::new(self.delivered.load(Ordering::Relaxed)),
             is_leaf: self.is_leaf,
+            #[cfg(feature = "cluster")]
+            is_route: self.is_route,
         }
     }
 }
@@ -219,6 +241,8 @@ impl Subscription {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
+            #[cfg(feature = "cluster")]
+            is_route: false,
         }
     }
 }
@@ -474,20 +498,48 @@ impl SubList {
         subjects
     }
 
-    /// Returns unique non-leaf (subject, queue) pairs for leaf interest propagation.
-    /// Only includes subscriptions from client connections (not leaf connections).
+    /// Returns unique non-leaf, non-route (subject, queue) pairs for leaf interest propagation.
+    /// Only includes subscriptions from client connections (not leaf or route connections).
     #[cfg(feature = "hub")]
     pub fn client_interests(&self) -> Vec<(&str, Option<&str>)> {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
             for sub in subs {
                 if !sub.is_leaf {
+                    #[cfg(feature = "cluster")]
+                    if sub.is_route {
+                        continue;
+                    }
                     set.insert((subj.as_str(), sub.queue.as_deref()));
                 }
             }
         }
         for sub in &self.wild {
             if !sub.is_leaf {
+                #[cfg(feature = "cluster")]
+                if sub.is_route {
+                    continue;
+                }
+                set.insert((sub.subject.as_str(), sub.queue.as_deref()));
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Returns unique local (client + leaf) (subject, queue) pairs for route interest propagation.
+    /// Excludes route subscriptions (avoids loops).
+    #[cfg(feature = "cluster")]
+    pub fn local_interests(&self) -> Vec<(&str, Option<&str>)> {
+        let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
+        for (subj, subs) in &self.exact {
+            for sub in subs {
+                if !sub.is_route {
+                    set.insert((subj.as_str(), sub.queue.as_deref()));
+                }
+            }
+        }
+        for sub in &self.wild {
+            if !sub.is_route {
                 set.insert((sub.subject.as_str(), sub.queue.as_deref()));
             }
         }
@@ -1173,6 +1225,26 @@ mod tests {
         writer.write_raw(b"LS- baz\r\n");
         let data = writer.drain().unwrap();
         assert_eq!(&data[..], b"LS+ bar\r\nLS- baz\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_direct_writer_formats_rmsg() {
+        let writer = DirectWriter::new_dummy();
+        writer.write_rmsg(b"test.sub", None, None, b"hello");
+        let data = writer.drain().expect("should have data");
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "RMSG $G test.sub 5\r\nhello\r\n");
+    }
+
+    #[test]
+    #[cfg(feature = "cluster")]
+    fn test_direct_writer_formats_rmsg_with_reply() {
+        let writer = DirectWriter::new_dummy();
+        writer.write_rmsg(b"test.sub", Some(b"reply.to"), None, b"hi");
+        let data = writer.drain().unwrap();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert_eq!(s, "RMSG $G test.sub reply.to 2\r\nhi\r\n");
     }
 
     #[test]
