@@ -5,6 +5,137 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-03-14 — Standalone apples-to-apples comparison
+
+**Motivation:** Cross-check our leaf mode results against the official NATS benchmark setup.
+Run the same `nats bench` scenarios used in the [NATS docs](https://docs.nats.io/using-nats/nats-tools/nats_cli/natsbench)
+(standalone nats-server v2.12.1, MacBook Pro M4: 14.8M pub-only 16B, 4.9M pub/sub 16B,
+1.0M fan-out 1:4 128B) on our hardware with both Go nats-server and Rust open-wire in
+standalone mode (no leaf, no hub).
+
+### Results (1M msgs, 3-run average, standalone on shared VM)
+
+#### Pub only (fire-and-forget)
+
+| Size | Go standalone | Rust standalone | Rust/Go | Official M4 | Our/M4 |
+|---|---|---|---|---|---|
+| 16B | ~1,880K | ~1,796K | **96%** | 14,787K | 13% |
+| 128B | ~1,314K | ~1,345K | **102%** | — | — |
+
+#### Pub/Sub 1:1 (pub rate)
+
+| Size | Go standalone | Rust standalone | Rust/Go | Official M4 | Our/M4 |
+|---|---|---|---|---|---|
+| 16B | ~650K | ~1,488K | **229%** | 4,926K | 13% |
+| 128B | ~438K | ~962K\* | **~220%** | — | — |
+
+\* Rust 128B pub/sub hit slow consumer disconnect at 1M msgs (pub far outpaces sub).
+
+#### Fan-out (pub rate, 128B)
+
+| Scenario | Go standalone | Rust standalone | Rust/Go | Official M4 |
+|---|---|---|---|---|
+| Fan-out 1:4 | ~200K | ~450K | **~225%** | 1,012K |
+| Fan-out 1:5 | ~165K | ~390K | **~236%** | — |
+
+**Takeaways:**
+- **Hardware baseline: our VM is ~13% of M4 Mac** — consistent across pub-only and pub/sub.
+  Entirely explained by shared VM (CPU steal, NUMA) vs dedicated Apple M4 silicon.
+- **Go numbers confirmed legitimate** — our Go standalone numbers are the expected order of
+  magnitude for this hardware class. No misconfiguration.
+- **Pub-only: Rust matches Go (96-102%)** in standalone mode. The leaf mode deficit (79%)
+  comes from upstream connection overhead, not a fundamental ingestion gap.
+- **Pub/sub: Rust 2.3x Go** — DirectWriter + epoll architecture gives a decisive advantage
+  on local message routing. Even stronger than leaf mode (167%) because there's no upstream
+  interest checking overhead.
+- **Fan-out: Rust ~2.3x Go** — consistent with leaf mode results (212%).
+- **Slow consumer tradeoff** — at 1M × 128B, Rust's pub rate (~960K) overwhelms the sub rate,
+  causing write buffer overflow and subscriber disconnect. Go's goroutine scheduler provides
+  natural backpressure that prevents this. A bounded write buffer with backpressure would fix
+  this at some throughput cost.
+
+---
+
+## 2026-03-14 — Hub mode + full 13-scenario benchmark
+
+**Changes since last benchmark:**
+Hub mode (inbound leaf connections), handler refactor (`ConnExt`, `ClientHandler`,
+`LeafHandler`), interest pipeline (subject mapping + interest collapse), io_uring
+readiness support behind feature flag.
+
+**Config change:** Added explicit `compression: off` on all leaf node connections
+(hub listener + leaf remotes). Default `s2_auto` should negotiate to "off" on loopback
+(RTT < 10ms threshold), but explicit disabling eliminates RTT measurement overhead and
+removes any ambiguity.
+
+**Cross-check against published benchmarks:** Go nats-server standalone on M4 MacBook Pro
+achieves ~14.8M msgs/sec (16B pub-only) and ~1M msgs/sec (128B fan-out). Our Go leaf node
+numbers (~1.5M pub-only, ~140K fan-out x5 at 128B) are consistent with: (a) leaf node
+overhead vs standalone, (b) shared VM vs dedicated hardware, (c) 128B vs 16B payload.
+Go numbers are within the expected order of magnitude.
+
+### Throughput (500K msgs x 128B, 3-run average)
+
+#### Core leaf scenarios (Rust leaf vs Go leaf)
+
+| Scenario | Go Leaf | Rust Leaf | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~1,539K | ~1,218K | **79%** | 87% |
+| Local pub/sub (pub) | ~417K | ~695K | **167%** | 109% |
+| Fan-out x5 (pub) | ~138K | ~293K | **212%** | 178% |
+| Leaf -> Hub (pub) | ~345K | ~787K | **228%** | 136% |
+| Hub -> Leaf (pub) | ~351K | ~401K | **114%** | 106% |
+
+#### WebSocket scenarios
+
+| Scenario | Go Leaf WS | Rust Leaf WS | Rust/Go % | Previous |
+|---|---|---|---|---|
+| WS pub/sub (pub) | ~445K | ~610K | **137%** | 127% |
+| WS fan-out x5 (pub) | ~108K | ~321K | **297%** | 252% |
+| WS fan-out x10 (pub) | ~45K | ~156K | **344%** | 335% |
+
+#### Hub mode scenarios (Rust as hub server, new)
+
+| Scenario | Go Hub (baseline) | Rust Hub | Rust/Go % |
+|---|---|---|---|
+| Pub only | ~1,127K | ~1,266K | **112%** |
+| Local pub/sub (pub) | ~492K | ~949K | **193%** |
+| Fan-out x5 (pub) | ~144K | ~472K | **328%** |
+| Leaf -> Rust Hub (pub) | — | ~385K | — |
+| Rust Hub -> Leaf (pub) | — | ~1,100K | — |
+
+### Server resources (scenarios 1-5, from /proc)
+
+| Scenario | CPU(ms) Rust/Go | RSS(KB) Rust/Go | CtxSw Rust/Go |
+|---|---|---|---|
+| Pub only | 1,920 / 940 | 16K / 20K | 3 / 0 |
+| Pub/sub | 2,990 / 4,560 | 95K / 20K | 10 / 0 |
+| Fan-out x5 | 5,230 / 13,660 | 218K / 20K | 28 / 0 |
+| Leaf -> Hub | 2,090 / 4,330 | 314K / 21K | 11 / 0 |
+| Hub -> Leaf | 3,330 / 4,350 | 231K / 21K | 6 / 0 |
+
+**Takeaways:**
+- **Fan-out x5: 178% -> 212%** — handler refactor reduced per-message dispatch overhead.
+- **Leaf -> Hub: 136% -> 228%** — strongest scenario; Rust's upstream forwarding path is
+  highly optimized with zero-copy parsing + direct LMSG assembly.
+- **Local pub/sub: 109% -> 167%** — significant improvement from handler refactoring.
+  Rust now delivers 67% more messages than Go on local routing.
+- **Hub -> Leaf: 106% -> 114%** — consistent cross-server advantage.
+- **WS fan-out x10: 344%** — Rust 3.4x Go, consistent with previous results. Batched
+  eventfd + single WS encode per flush scales better than goroutine-per-connection.
+- **WS fan-out x5: 252% -> 297%** — WS fan-out dominance continues to grow.
+- **Hub mode pub only: 112% of Go** — Rust hub ingests 12% faster than Go hub.
+- **Hub mode pub/sub: 193% of Go** — Rust hub routes local messages nearly 2x faster.
+- **Hub mode fan-out: 328% of Go** — Rust hub fan-out is 3.3x Go hub, matching leaf pattern.
+- **Pub-only: 87% -> 79%** — regression on fire-and-forget ingest. Handler dispatch adds
+  a small cost to the no-subscriber path. High variance on shared VMs.
+- **CPU efficiency**: Rust uses less CPU than Go on all routing scenarios (pub/sub: 66%,
+  fan-out: 38%, leaf->hub: 48%, hub->leaf: 77% of Go's CPU). Only pub-only uses more CPU.
+- **RSS higher for Rust under load** (16-314K vs 20-21K) — Go RSS stays flat at ~20K across
+  all scenarios. Rust grows due to unbounded write buffers when publisher outpaces delivery.
+
+---
+
 ## 2026-03-08 — v0.5 repo restructure validation
 
 **Changes:**
