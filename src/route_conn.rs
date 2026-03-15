@@ -14,7 +14,7 @@
 //! One-hop rule: messages received from a route are never re-forwarded
 //! to other routes (enforced by deliver_to_subs_upstream skipping route subs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,21 +47,44 @@ pub(crate) struct RouteConnManager {
 }
 
 impl RouteConnManager {
-    /// Spawn outbound route connections to all configured seed peers.
+    /// Spawn outbound route connections to all configured seed peers,
+    /// plus a coordinator thread that handles gossip-discovered URLs.
     pub(crate) fn spawn(state: Arc<ServerState>) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let seeds = state.cluster_seeds.clone();
 
-        for seed_url in seeds {
+        // Create the coordinator channel and store sender in state.
+        let (coord_tx, coord_rx) = std::sync::mpsc::channel::<String>();
+        {
+            let mut tx_lock = state.route_connect_tx.lock().unwrap();
+            *tx_lock = Some(coord_tx);
+        }
+
+        // Spawn seed supervisors.
+        for seed_url in &seeds {
+            let st = Arc::clone(&state);
+            let sd = Arc::clone(&shutdown);
+            let url = seed_url.clone();
+
+            std::thread::Builder::new()
+                .name(format!("route-{}", url))
+                .spawn(move || {
+                    run_route_supervisor(url, st, sd);
+                })
+                .expect("failed to spawn route supervisor");
+        }
+
+        // Spawn coordinator thread for gossip-discovered routes.
+        {
             let st = Arc::clone(&state);
             let sd = Arc::clone(&shutdown);
 
             std::thread::Builder::new()
-                .name(format!("route-{}", seed_url))
+                .name("route-coordinator".into())
                 .spawn(move || {
-                    run_route_supervisor(seed_url, st, sd);
+                    run_route_coordinator(coord_rx, seeds, st, sd);
                 })
-                .expect("failed to spawn route supervisor");
+                .expect("failed to spawn route coordinator");
         }
 
         Self { shutdown }
@@ -71,6 +94,69 @@ impl RouteConnManager {
 impl Drop for RouteConnManager {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+    }
+}
+
+/// Coordinator thread: receives new gossip-discovered URLs and spawns
+/// supervisors for each new unique route peer.
+fn run_route_coordinator(
+    rx: std::sync::mpsc::Receiver<String>,
+    seeds: Vec<String>,
+    state: Arc<ServerState>,
+    shutdown: Arc<AtomicBool>,
+) {
+    // Track which URLs already have active supervisors.
+    let mut active_urls: HashSet<String> = HashSet::new();
+    for seed in &seeds {
+        active_urls.insert(normalize_route_url(seed));
+    }
+
+    // Also add own cluster address.
+    if let Some(cp) = state.cluster_port {
+        active_urls.insert(format!("0.0.0.0:{cp}"));
+        active_urls.insert(format!("127.0.0.1:{cp}"));
+    }
+
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Block with timeout so we can check shutdown.
+        let url = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(url) => url,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+
+        let normalized = normalize_route_url(&url);
+
+        // Skip own address.
+        if let Some(cp) = state.cluster_port {
+            if normalized == format!("0.0.0.0:{cp}")
+                || normalized == format!("127.0.0.1:{cp}")
+                || normalized == format!("{host}:{cp}", host = state.info.host)
+            {
+                continue;
+            }
+        }
+
+        if active_urls.contains(&normalized) {
+            continue;
+        }
+
+        info!(url = %normalized, "gossip: discovered new route peer, connecting");
+        active_urls.insert(normalized.clone());
+
+        let st = Arc::clone(&state);
+        let sd = Arc::clone(&shutdown);
+
+        std::thread::Builder::new()
+            .name(format!("route-gossip-{}", normalized))
+            .spawn(move || {
+                run_route_supervisor(normalized, st, sd);
+            })
+            .expect("failed to spawn gossip route supervisor");
     }
 }
 
@@ -117,6 +203,11 @@ fn run_route_supervisor(seed_url: String, state: Arc<ServerState>, shutdown: Arc
     }
 }
 
+/// Normalize a route URL: strip scheme, ensure host:port format.
+pub(crate) fn normalize_route_url(url: &str) -> String {
+    parse_route_url(url)
+}
+
 /// Parse a route URL like "nats-route://host:port" into a TCP address.
 fn parse_route_url(url: &str) -> String {
     let stripped = url
@@ -128,6 +219,22 @@ fn parse_route_url(url: &str) -> String {
         stripped.to_string()
     } else {
         format!("{stripped}:4248")
+    }
+}
+
+/// Process `connect_urls` from a peer's INFO, adding new URLs to
+/// `known_urls` and sending them to the coordinator channel.
+pub(crate) fn process_gossip_urls(state: &ServerState, connect_urls: &[String]) {
+    let mut peers = state.route_peers.lock().unwrap();
+    let tx = state.route_connect_tx.lock().unwrap();
+    for url in connect_urls {
+        let normalized = normalize_route_url(url);
+        if peers.known_urls.insert(normalized.clone()) {
+            // New URL discovered via gossip — notify coordinator.
+            if let Some(ref sender) = *tx {
+                let _ = sender.send(normalized);
+            }
+        }
     }
 }
 
@@ -150,13 +257,13 @@ fn connect_route(
 
     // --- Read peer's INFO ---
     read_into_buf(&tcp, &mut read_buf)?;
-    let _peer_info = match nats_proto::try_parse_route_op(&mut read_buf)? {
+    let peer_info = match nats_proto::try_parse_route_op(&mut read_buf)? {
         Some(RouteOp::Info(info)) => {
             debug!(peer_id = %info.server_id, "received route INFO from peer");
             // Self-connect check
             if info.server_id == state.info.server_id {
                 debug!("detected self-connect on route, closing");
-                return Ok(());
+                return Err("self-connect on route".into());
             }
             info
         }
@@ -167,6 +274,24 @@ fn connect_route(
             return Err("route peer closed connection before INFO".into());
         }
     };
+
+    // --- server_id dedup check ---
+    let peer_server_id = peer_info.server_id.clone();
+    {
+        let peers = state.route_peers.lock().unwrap();
+        if peers.connected.contains_key(&peer_server_id) {
+            debug!(
+                peer_id = %peer_server_id,
+                "duplicate outbound route connection, closing"
+            );
+            return Err("route peer already connected (dedup)".into());
+        }
+    }
+
+    // Process connect_urls from peer INFO.
+    if !peer_info.connect_urls.is_empty() {
+        process_gossip_urls(state, &peer_info.connect_urls);
+    }
 
     // --- Send our INFO + CONNECT + PING ---
     {
@@ -189,12 +314,30 @@ fn connect_route(
                 w.write_all(b"PONG\r\n")?;
                 w.flush()?;
             }
-            RouteOp::Info(_) | RouteOp::Connect(_) => {}
+            RouteOp::Info(info) => {
+                if !info.connect_urls.is_empty() {
+                    process_gossip_urls(state, &info.connect_urls);
+                }
+            }
+            RouteOp::Connect(_) => {}
             RouteOp::RouteSub { .. } | RouteOp::RouteUnsub { .. } => {}
             other => {
                 return Err(format!("unexpected op during route handshake: {other:?}").into());
             }
         }
+    }
+
+    // --- Register peer in RoutePeerRegistry (double-check for races) ---
+    {
+        let mut peers = state.route_peers.lock().unwrap();
+        if peers.connected.contains_key(&peer_server_id) {
+            debug!(
+                peer_id = %peer_server_id,
+                "duplicate outbound route (race dedup), closing"
+            );
+            return Err("route peer already connected (race dedup)".into());
+        }
+        peers.connected.insert(peer_server_id.clone(), addr.clone());
     }
 
     // --- Create DirectWriter for this route ---
@@ -222,6 +365,9 @@ fn connect_route(
         drop(subs);
         w.flush()?;
     }
+
+    // --- Broadcast updated INFO to all route peers (topology changed) ---
+    broadcast_route_info(state);
 
     // --- Spawn writer thread ---
     // The writer thread polls the DirectWriter's eventfd and drains buffered
@@ -253,6 +399,12 @@ fn connect_route(
     {
         let mut writers = state.route_writers.write().unwrap();
         writers.remove(&conn_id);
+    }
+
+    // Remove from RoutePeerRegistry
+    {
+        let mut peers = state.route_peers.lock().unwrap();
+        peers.connected.remove(&peer_server_id);
     }
 
     info!(conn_id, "outbound route connection closed");
@@ -433,7 +585,11 @@ fn handle_route_op(
             w.flush()?;
         }
         RouteOp::Pong => {}
-        RouteOp::Info(_) => {
+        RouteOp::Info(info) => {
+            // Gossip: process connect_urls from active-phase INFO updates.
+            if !info.connect_urls.is_empty() {
+                process_gossip_urls(state, &info.connect_urls);
+            }
             debug!("received updated INFO from route peer");
         }
         RouteOp::Connect(_) => {
@@ -443,14 +599,30 @@ fn handle_route_op(
     Ok(())
 }
 
-/// Build INFO JSON for route protocol.
-fn build_route_info(state: &ServerState) -> String {
+/// Build INFO JSON for route protocol, including `connect_urls` from known peers.
+pub(crate) fn build_route_info(state: &ServerState) -> String {
     let cluster_name = state.cluster_name.as_deref().unwrap_or("default");
     let cluster_port = state.cluster_port.unwrap_or(0);
+
+    // Collect known route URLs for gossip.
+    let connect_urls = {
+        let peers = state.route_peers.lock().unwrap();
+        let urls: Vec<&str> = peers.known_urls.iter().map(|s| s.as_str()).collect();
+        if urls.is_empty() {
+            String::new()
+        } else {
+            let items: Vec<String> = urls
+                .iter()
+                .map(|u| format!("\"nats-route://{}\"", u))
+                .collect();
+            format!(",\"connect_urls\":[{}]", items.join(","))
+        }
+    };
+
     format!(
         "INFO {{\"server_id\":\"{}\",\"server_name\":\"{}\",\"version\":\"{}\",\
          \"host\":\"{}\",\"port\":{},\"max_payload\":{},\"proto\":1,\
-         \"cluster\":\"{}\",\"cluster_port\":{}}}\r\n",
+         \"cluster\":\"{}\",\"cluster_port\":{}{}}}\r\n",
         state.info.server_id,
         state.info.server_name,
         state.info.version,
@@ -459,6 +631,7 @@ fn build_route_info(state: &ServerState) -> String {
         state.info.max_payload,
         cluster_name,
         cluster_port,
+        connect_urls,
     )
 }
 
@@ -469,6 +642,17 @@ fn build_route_connect(state: &ServerState) -> String {
         "CONNECT {{\"server_id\":\"{}\",\"name\":\"{}\",\"cluster\":\"{}\"}}\r\n",
         state.info.server_id, state.info.server_name, cluster_name,
     )
+}
+
+/// Broadcast updated INFO (with current `connect_urls`) to all connected route peers.
+pub(crate) fn broadcast_route_info(state: &ServerState) {
+    let info_line = build_route_info(state);
+    let info_bytes = info_line.as_bytes();
+    let writers = state.route_writers.read().unwrap();
+    for writer in writers.values() {
+        writer.write_raw(info_bytes);
+        writer.notify();
+    }
 }
 
 /// Read from TCP into the buffer, blocking until data is available.
@@ -526,5 +710,12 @@ mod tests {
     fn route_conn_id_is_high() {
         let id = next_route_conn_id();
         assert!(id >= ROUTE_CONN_ID_BASE);
+    }
+
+    #[test]
+    fn normalize_route_url_strips_scheme() {
+        assert_eq!(normalize_route_url("nats-route://host:4248"), "host:4248");
+        assert_eq!(normalize_route_url("host:4248"), "host:4248");
+        assert_eq!(normalize_route_url("host"), "host:4248");
     }
 }

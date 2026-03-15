@@ -84,6 +84,8 @@ pub struct ConnectInfo {
     #[serde(default)]
     pub tls_required: bool,
     #[serde(default)]
+    pub server_id: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub user: Option<String>,

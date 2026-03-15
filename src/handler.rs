@@ -63,6 +63,8 @@ pub(crate) enum ConnExt {
     Route {
         route_sid_counter: u64,
         route_sids: HashMap<(Bytes, Option<Bytes>), u64>,
+        /// Peer's server_id, stored for cleanup deregistration from RoutePeerRegistry.
+        peer_server_id: Option<String>,
     },
 }
 

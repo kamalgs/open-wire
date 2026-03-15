@@ -7,6 +7,8 @@
 
 #[cfg(any(feature = "hub", feature = "cluster"))]
 use std::collections::HashMap;
+#[cfg(feature = "cluster")]
+use std::collections::HashSet;
 use std::io;
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
@@ -15,6 +17,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 #[cfg(feature = "leaf")]
 use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(feature = "cluster")]
+use std::sync::Mutex;
 use std::time::Instant;
 
 use metrics::counter;
@@ -568,6 +572,15 @@ impl Default for ServerStats {
     }
 }
 
+/// Registry of connected route peers and known route URLs for gossip discovery.
+#[cfg(feature = "cluster")]
+pub(crate) struct RoutePeerRegistry {
+    /// server_id → route address for all connected peers.
+    pub connected: HashMap<String, String>,
+    /// All known route URLs (own endpoint + all peers). Normalized via parse_route_url().
+    pub known_urls: HashSet<String>,
+}
+
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
@@ -622,6 +635,13 @@ pub(crate) struct ServerState {
     /// Seed route URLs for outbound connections.
     #[cfg(feature = "cluster")]
     pub cluster_seeds: Vec<String>,
+    /// Registry of connected route peers and known route URLs.
+    #[cfg(feature = "cluster")]
+    pub route_peers: Mutex<RoutePeerRegistry>,
+    /// Channel sender for the route coordinator thread. New gossip-discovered URLs
+    /// are sent here to trigger outbound connections.
+    #[cfg(feature = "cluster")]
+    pub route_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
 }
 
 impl ServerState {
@@ -643,6 +663,13 @@ impl ServerState {
         #[cfg(feature = "cluster")] cluster_name: Option<String>,
         #[cfg(feature = "cluster")] cluster_seeds: Vec<String>,
     ) -> Self {
+        #[cfg(feature = "cluster")]
+        let cluster_self_host = if info.host.is_empty() || info.host == "0.0.0.0" {
+            "127.0.0.1".to_string()
+        } else {
+            info.host.clone()
+        };
+
         Self {
             info,
             auth,
@@ -674,6 +701,25 @@ impl ServerState {
             cluster_port,
             #[cfg(feature = "cluster")]
             cluster_name,
+            #[cfg(feature = "cluster")]
+            route_peers: {
+                let mut known_urls = HashSet::new();
+                // Add own cluster endpoint (use configured host or 127.0.0.1;
+                // never 0.0.0.0 which isn't a routable address for peers).
+                if let Some(cp) = cluster_port {
+                    known_urls.insert(format!("{}:{cp}", cluster_self_host));
+                }
+                // Add all configured seeds
+                for seed in &cluster_seeds {
+                    known_urls.insert(crate::route_conn::normalize_route_url(seed));
+                }
+                Mutex::new(RoutePeerRegistry {
+                    connected: HashMap::new(),
+                    known_urls,
+                })
+            },
+            #[cfg(feature = "cluster")]
+            route_connect_tx: Mutex::new(None),
             #[cfg(feature = "cluster")]
             cluster_seeds,
         }

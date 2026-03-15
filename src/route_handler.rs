@@ -55,8 +55,24 @@ impl RouteHandler {
                 headers,
                 payload,
             } => Self::handle_rmsg(conn, wctx, subject, reply, headers, payload),
-            RouteOp::Info(_) | RouteOp::Connect(_) => {
-                // Ignore INFO/CONNECT from inbound route in Active phase.
+            RouteOp::Info(info) => {
+                // Gossip: process connect_urls from active-phase INFO updates.
+                if !info.connect_urls.is_empty() {
+                    let mut peers = wctx.state.route_peers.lock().unwrap();
+                    let tx = wctx.state.route_connect_tx.lock().unwrap();
+                    for url in &info.connect_urls {
+                        let normalized = crate::route_conn::normalize_route_url(url);
+                        if peers.known_urls.insert(normalized.clone()) {
+                            if let Some(ref sender) = *tx {
+                                let _ = sender.send(normalized);
+                            }
+                        }
+                    }
+                }
+                (HandleResult::Ok, Vec::new())
+            }
+            RouteOp::Connect(_) => {
+                // Ignore CONNECT from inbound route in Active phase.
                 (HandleResult::Ok, Vec::new())
             }
         }
@@ -76,6 +92,7 @@ impl RouteHandler {
             ConnExt::Route {
                 ref mut route_sid_counter,
                 ref mut route_sids,
+                ..
             } => {
                 *route_sid_counter += 1;
                 let sid = *route_sid_counter;

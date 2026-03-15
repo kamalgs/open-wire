@@ -494,9 +494,7 @@ fn spawn_cluster_node(
     std::thread::Builder::new()
         .name(format!("cluster-{}", name))
         .spawn(move || {
-            if let Err(e) = server.run_until_shutdown(shutdown_clone, reload, None) {
-                eprintln!("cluster node error: {}", e);
-            }
+            let _ = server.run_until_shutdown(shutdown_clone, reload, None);
         })
         .expect("failed to spawn cluster node thread");
 
@@ -691,6 +689,146 @@ async fn cluster_three_node() {
         .expect("sub C ended");
     assert_eq!(msg_c.subject.as_str(), "tri.test");
     assert_eq!(&msg_c.payload[..], b"from-a");
+
+    shutdown_a.store(true, Ordering::Release);
+    shutdown_b.store(true, Ordering::Release);
+    shutdown_c.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+#[cfg(feature = "cluster")]
+async fn cluster_gossip_discovery() {
+    // Three-node cluster where B and C only seed A.
+    // B and C should discover each other via A's gossip and form a direct route.
+    let port_a = free_port();
+    let cport_a = free_port();
+    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "gossip-a");
+    wait_for_leaf(port_a).await;
+
+    let port_b = free_port();
+    let cport_b = free_port();
+    let shutdown_b = spawn_cluster_node(
+        port_b,
+        cport_b,
+        vec![format!("nats-route://127.0.0.1:{}", cport_a)],
+        "gossip-b",
+    );
+    wait_for_leaf(port_b).await;
+
+    let port_c = free_port();
+    let cport_c = free_port();
+    let shutdown_c = spawn_cluster_node(
+        port_c,
+        cport_c,
+        vec![format!("nats-route://127.0.0.1:{}", cport_a)],
+        "gossip-c",
+    );
+    wait_for_leaf(port_c).await;
+
+    // Allow time for gossip discovery and route formation between B↔C.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Now shut down node A to prove B↔C have a direct route.
+    shutdown_a.store(true, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Subscribe on C
+    let client_c = async_nats::connect(format!("127.0.0.1:{}", port_c))
+        .await
+        .expect("connect to C failed");
+    let mut sub_c = client_c
+        .subscribe("gossip.test")
+        .await
+        .expect("subscribe on C failed");
+
+    // Let subscription propagate via RS+ over B↔C route
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish on B
+    let client_b = async_nats::connect(format!("127.0.0.1:{}", port_b))
+        .await
+        .expect("connect to B failed");
+    client_b
+        .publish("gossip.test", "from-b-via-gossip".into())
+        .await
+        .expect("publish on B failed");
+    client_b.flush().await.expect("flush failed");
+
+    // C should receive the message via the B↔C direct route
+    let msg = timeout(Duration::from_secs(5), sub_c.next())
+        .await
+        .expect("timed out waiting for gossip-routed message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "gossip.test");
+    assert_eq!(&msg.payload[..], b"from-b-via-gossip");
+
+    shutdown_b.store(true, Ordering::Release);
+    shutdown_c.store(true, Ordering::Release);
+}
+
+#[tokio::test]
+#[cfg(feature = "cluster")]
+async fn cluster_partial_seed() {
+    // Chain topology: A seeds B, B seeds C.
+    // C should discover A via transitive gossip and form a full mesh.
+    let port_a = free_port();
+    let cport_a = free_port();
+    let shutdown_a = spawn_cluster_node(port_a, cport_a, vec![], "chain-a");
+    wait_for_leaf(port_a).await;
+
+    let port_b = free_port();
+    let cport_b = free_port();
+    let shutdown_b = spawn_cluster_node(
+        port_b,
+        cport_b,
+        vec![format!("nats-route://127.0.0.1:{}", cport_a)],
+        "chain-b",
+    );
+    wait_for_leaf(port_b).await;
+
+    // C only seeds B — should discover A via gossip.
+    let port_c = free_port();
+    let cport_c = free_port();
+    let shutdown_c = spawn_cluster_node(
+        port_c,
+        cport_c,
+        vec![format!("nats-route://127.0.0.1:{}", cport_b)],
+        "chain-c",
+    );
+    wait_for_leaf(port_c).await;
+
+    // Allow time for gossip discovery and full mesh formation.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Subscribe on C
+    let client_c = async_nats::connect(format!("127.0.0.1:{}", port_c))
+        .await
+        .expect("connect to C failed");
+    let mut sub_c = client_c
+        .subscribe("chain.test")
+        .await
+        .expect("subscribe on C failed");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Publish on A — should reach C via full mesh
+    let client_a = async_nats::connect(format!("127.0.0.1:{}", port_a))
+        .await
+        .expect("connect to A failed");
+    client_a
+        .publish("chain.test", "from-a-chain".into())
+        .await
+        .expect("publish on A failed");
+    client_a.flush().await.expect("flush failed");
+
+    let msg = timeout(Duration::from_secs(5), sub_c.next())
+        .await
+        .expect("timed out waiting for chain-routed message")
+        .expect("subscription stream ended");
+
+    assert_eq!(msg.subject.as_str(), "chain.test");
+    assert_eq!(&msg.payload[..], b"from-a-chain");
 
     shutdown_a.store(true, Ordering::Release);
     shutdown_b.store(true, Ordering::Release);

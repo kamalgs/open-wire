@@ -247,9 +247,6 @@ pub(crate) struct Worker {
     /// INFO line for inbound leaf connections (port set to leafnode_port).
     #[cfg(feature = "hub")]
     leaf_info_line: Vec<u8>,
-    /// INFO line for inbound route connections (port set to cluster_port).
-    #[cfg(feature = "cluster")]
-    route_info_line: Vec<u8>,
     shutdown: bool,
     /// Accumulated eventfd notifications. Flushed after processing a read batch.
     /// Deduplicates across multiple PUBs in the same read buffer.
@@ -290,17 +287,6 @@ impl Worker {
             info_line.clone()
         };
 
-        #[cfg(feature = "cluster")]
-        let route_info_line = if let Some(cp) = state.cluster_port {
-            let mut route_info = state.info.clone();
-            route_info.port = cp;
-            route_info.client_id = 0;
-            let json = serde_json::to_string(&route_info).expect("failed to serialize route info");
-            format!("INFO {json}\r\n").into_bytes()
-        } else {
-            info_line.clone()
-        };
-
         let event_fd_clone = Arc::clone(&event_fd);
         let join_handle = std::thread::Builder::new()
             .name(format!("worker-{index}"))
@@ -334,8 +320,6 @@ impl Worker {
                     info_line,
                     #[cfg(feature = "hub")]
                     leaf_info_line,
-                    #[cfg(feature = "cluster")]
-                    route_info_line,
                     shutdown: false,
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
@@ -687,9 +671,11 @@ impl Worker {
             Arc::clone(&self.event_fd),
         );
 
-        // Queue INFO in write_buf — use route_info_line (port = cluster_port).
+        // Queue INFO in write_buf — use dynamic route INFO (includes connect_urls).
         let mut write_buf = BytesMut::with_capacity(4096);
-        write_buf.extend_from_slice(&self.route_info_line);
+        let info_str = crate::route_conn::build_route_info(&self.state);
+        // Use the dynamic info
+        write_buf.extend_from_slice(info_str.as_bytes());
 
         let client = ClientState {
             fd,
@@ -705,6 +691,7 @@ impl Worker {
             ext: ConnExt::Route {
                 route_sid_counter: 0,
                 route_sids: std::collections::HashMap::new(),
+                peer_server_id: None,
             },
             #[cfg(feature = "leaf")]
             upstream_tx: None,
@@ -749,10 +736,17 @@ impl Worker {
             if client.ext.is_leaf() {
                 self.state.leaf_writers.write().unwrap().remove(&conn_id);
             }
-            // Unregister route DirectWriter from shared registry.
+            // Unregister route DirectWriter and peer from shared registries.
             #[cfg(feature = "cluster")]
             if client.ext.is_route() {
                 self.state.route_writers.write().unwrap().remove(&conn_id);
+                if let ConnExt::Route {
+                    peer_server_id: Some(ref sid),
+                    ..
+                } = client.ext
+                {
+                    self.state.route_peers.lock().unwrap().connected.remove(sid);
+                }
             }
 
             cleanup_conn(conn_id, &self.state);
@@ -1732,11 +1726,28 @@ impl Worker {
                         }
                     };
                     match route_op {
-                        Some(RouteOp::Info(_)) => {
-                            // Peer's INFO — skip it, continue waiting for CONNECT.
+                        Some(RouteOp::Info(peer_info)) => {
+                            // Process gossip connect_urls from peer's INFO.
+                            if !peer_info.connect_urls.is_empty() {
+                                crate::route_conn::process_gossip_urls(
+                                    &self.state,
+                                    &peer_info.connect_urls,
+                                );
+                            }
                             continue;
                         }
-                        Some(RouteOp::Connect(_)) => {
+                        Some(RouteOp::Connect(connect_info)) => {
+                            let peer_sid = connect_info.server_id.clone();
+
+                            // Self-connect check.
+                            if let Some(ref sid) = peer_sid {
+                                if *sid == self.state.info.server_id {
+                                    debug!(conn_id, "self-connect on inbound route, closing");
+                                    self.remove_conn(conn_id);
+                                    return;
+                                }
+                            }
+
                             // Peer's CONNECT — go Active, register, exchange subs.
                             let client = self.conns.get_mut(&conn_id).unwrap();
                             client.phase = ConnPhase::Active;
@@ -1746,6 +1757,22 @@ impl Worker {
                                 client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
                             }
                             client.write_buf.extend_from_slice(b"PONG\r\n");
+
+                            // Store peer_server_id for cleanup.
+                            if let ConnExt::Route {
+                                ref mut peer_server_id,
+                                ..
+                            } = client.ext
+                            {
+                                *peer_server_id = peer_sid.clone();
+                            }
+
+                            // Note: we intentionally do NOT register inbound peers
+                            // in route_peers.connected here. The outbound side handles
+                            // its own registration in connect_route(). Having both an
+                            // inbound and outbound route to the same peer is harmless
+                            // (one-hop enforcement prevents message loops) and avoids
+                            // a retry storm when outbound dedup rejects connections.
 
                             // Register route DirectWriter.
                             let dw = client.direct_writer.clone();
@@ -1757,6 +1784,9 @@ impl Worker {
 
                             // Send existing local subscriptions as RS+ to the new route.
                             send_existing_subs_to_route(&self.state, &client.direct_writer);
+
+                            // Broadcast updated INFO to all routes (gossip re-broadcast).
+                            crate::route_conn::broadcast_route_info(&self.state);
 
                             info!(conn_id, "inbound route connected");
                         }
