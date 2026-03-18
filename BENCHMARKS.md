@@ -249,7 +249,7 @@ Benchmark re-run to confirm no regressions.
 ## 2026-03-08 — WebSocket transport support
 
 **Feature added:**
-WebSocket support for the leaf server. Clients can connect via `ws://` in addition to raw TCP.
+WebSocket support for open-wire. Clients can connect via `ws://` in addition to raw TCP.
 The NATS text protocol runs unchanged inside WebSocket binary frames, with an HTTP upgrade
 handshake on connect.
 

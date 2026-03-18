@@ -3,6 +3,8 @@ name = "open-wire"
 version = "0.5.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "High-performance NATS-compatible message relay"
+repository = "https://github.com/kamalgs/open-wire"
 autobenches = false
 autotests = false
 

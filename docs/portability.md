@@ -2,13 +2,13 @@
 
 ## Goal
 
-Run the leaf server on any OS, any architecture, any scale — from a
+Run open-wire on any OS, any architecture, any scale — from a
 Raspberry Pi to a CDN edge node to a bare-metal server. One codebase,
 maximum reach.
 
 ## Why This Matters
 
-NATS is a connectivity fabric. The leaf server's value comes from running
+NATS is a connectivity fabric. open-wire's value comes from running
 *everywhere* — close to the data, close to the devices, close to the users.
 A leaf that only runs on Linux x86_64 misses most of the deployment surface:
 
@@ -151,7 +151,7 @@ single-threaded event loop. Fine for edge workloads.
 
 #### Edge CDN platforms (Cloudflare, Fastly, Spin)
 
-These are request-driven, not connection-driven. The leaf server would
+These are request-driven, not connection-driven. open-wire would
 need a different integration layer:
 
 - Platform handles inbound WebSocket upgrade

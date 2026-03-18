@@ -9,7 +9,7 @@ of CPU time spent in the Tokio runtime: task scheduling, waker management,
 and multi-layer polling. On a pub-only benchmark the Rust server achieved
 ~95% of Go nats-server throughput, with the async runtime as the primary gap.
 
-The NATS leaf server has a simple concurrency model — N workers each
+open-wire has a simple concurrency model — N workers each
 multiplexing many connections — that maps directly to epoll. There is no need
 for Tokio's general-purpose task scheduler, timers, or spawn model.
 

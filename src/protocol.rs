@@ -1,10 +1,3 @@
-// Copyright 2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-
 use std::io::{self, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
@@ -105,7 +98,7 @@ impl Write for HubStream {
 pub(crate) use crate::nats_proto::ClientOp;
 #[cfg(any(feature = "leaf", feature = "hub"))]
 pub(crate) use crate::nats_proto::LeafOp;
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(feature = "cluster")]
 pub(crate) use crate::nats_proto::RouteOp;
 
 // --- Adaptive read buffer (Go-style dynamic sizing) ---

@@ -1,10 +1,3 @@
-// Copyright 2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-
 //! Leaf node protocol handler: LS+, LS-, LMSG, PING, PONG.
 //!
 //! Dispatched by the worker for connections with `ConnExt::Leaf`.

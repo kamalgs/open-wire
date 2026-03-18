@@ -1,10 +1,3 @@
-// Copyright 2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
 use std::collections::HashMap;
 #[cfg(any(feature = "cluster", feature = "gateway"))]
@@ -353,7 +346,7 @@ impl Default for LeafServerConfig {
             port: 4222,
             #[cfg(feature = "leaf")]
             hub_url: None,
-            server_name: "leaf-node".to_string(),
+            server_name: "open-wire".to_string(),
             max_read_buf_capacity: 65536,
             write_buf_capacity: 65536,
             workers,
@@ -905,7 +898,7 @@ impl ServerState {
     }
 }
 
-/// A NATS leaf node gateway server.
+/// An open-wire NATS-compatible message relay server.
 ///
 /// Accepts local client connections, routes messages between them,
 /// and optionally forwards traffic to an upstream NATS hub.

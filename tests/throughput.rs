@@ -1,6 +1,3 @@
-// Copyright 2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0
-
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use open_wire::sub_list::{subject_matches, SubList};

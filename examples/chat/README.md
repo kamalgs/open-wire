@@ -1,10 +1,10 @@
 # NATS Chat — Browser-based IRC over NATS
 
-A single-file browser chat app that connects directly to the leaf node gateway via WebSocket using `nats.ws`.
+A single-file browser chat app that connects directly to open-wire via WebSocket using `nats.ws`.
 
 ## Quick Start
 
-### 1. Run the leaf server with WebSocket support
+### 1. Run open-wire with WebSocket support
 
 ```bash
 cargo run -- --port 4222 --ws-port 4223
@@ -23,6 +23,6 @@ Open two browser tabs to http://localhost:8080. Pick different usernames, join t
 
 ## How It Works
 
-- Browsers connect directly to the leaf server's WebSocket port using the `nats.ws` client (loaded from CDN)
+- Browsers connect directly to open-wire's WebSocket port using the `nats.ws` client (loaded from CDN)
 - Messages are published/subscribed on `chat.<channel>` subjects as JSON: `{"user":"alice","text":"hello","ts":1709...}`
 - No backend or build step required — just static HTML + JS

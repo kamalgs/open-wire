@@ -1,10 +1,3 @@
-// Copyright 2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-
 //! N-worker epoll event loop.
 //!
 //! Each worker owns one epoll instance multiplexing many client connections.
@@ -37,7 +30,7 @@ use crate::handler::{handle_expired_subs, ConnCtx, ConnExt, HandleResult, Worker
 #[cfg(feature = "hub")]
 use crate::leaf_handler::LeafHandler;
 use crate::nats_proto;
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(feature = "cluster")]
 use crate::protocol::RouteOp;
 use crate::protocol::{AdaptiveBuf, ClientOp};
 #[cfg(feature = "cluster")]
@@ -1830,7 +1823,7 @@ impl Worker {
                     .map(|c| c.ext.is_route())
                     .unwrap_or(false);
                 #[cfg(not(feature = "cluster"))]
-                let is_route_conn = false;
+                let _is_route_conn = false;
 
                 #[cfg(feature = "cluster")]
                 if is_route_conn {

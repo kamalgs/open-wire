@@ -1,10 +1,3 @@
-// Copyright 2024 The NATS Authors
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-
 //! Shared handler types and delivery functions for protocol command dispatch.
 //!
 //! Defines per-connection (`ConnCtx`) and per-worker (`WorkerCtx`) context views,
@@ -102,6 +95,7 @@ impl ConnExt {
 
     /// Returns `true` for inbound route connections.
     #[cfg(not(feature = "cluster"))]
+    #[allow(dead_code)]
     pub fn is_route(&self) -> bool {
         false
     }
@@ -114,6 +108,7 @@ impl ConnExt {
 
     /// Returns `true` for inbound gateway connections.
     #[cfg(not(feature = "gateway"))]
+    #[allow(dead_code)]
     pub fn is_gateway(&self) -> bool {
         false
     }

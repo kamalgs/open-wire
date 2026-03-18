@@ -78,7 +78,7 @@ docker run -p 4222:4222 open-wire --hub nats://hub:4111
 | `--port`, `-p` | `4222` | TCP listen port |
 | `--host` | `0.0.0.0` | Bind address |
 | `--hub` | *(none)* | Upstream NATS server URL |
-| `--name` | `leaf-node` | Server name |
+| `--name` | `open-wire` | Server name |
 | `--workers`, `-w` | CPU count | Number of worker threads |
 | `--ws-port` | *(none)* | WebSocket listen port |
 | `--cluster-port` | *(none)* | Cluster route listen port (requires `cluster` feature) |
@@ -208,8 +208,15 @@ cargo test                          # unit + integration (requires nats-server i
 cargo test --test e2e --features cluster -- cluster   # cluster integration tests
 ```
 
+## Acknowledgments
+
+open-wire began as a fork of [nats-io/nats.rs](https://github.com/nats-io/nats.rs) and owes
+a debt of gratitude to the NATS Authors and the broader [NATS](https://nats.io) community.
+The protocol design, wire format, and many architectural ideas — particularly the parser
+structure and adaptive buffering — were directly informed by studying the Go
+[nats-server](https://github.com/nats-io/nats-server). Thank you for building such an
+excellent foundation in the open.
+
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
-
-This project is a fork of [nats-io/nats.rs](https://github.com/nats-io/nats.rs). See [NOTICE](NOTICE) for attribution details.
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE) for attribution details.

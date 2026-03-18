@@ -1,4 +1,4 @@
-// NATS Leaf Node Gateway Server
+// open-wire — NATS-compatible message relay
 //
 // Usage:
 //   cargo run -- --port 4222
