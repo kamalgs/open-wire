@@ -268,17 +268,286 @@ fn is_wildcard(subject: &str) -> bool {
     memchr::memchr2(b'*', b'>', subject.as_bytes()).is_some()
 }
 
+/// A trie node for wildcard subject matching.
+///
+/// Each level corresponds to one token in a dotted subject (e.g. `foo.bar.baz`).
+/// Literal tokens index into `children`, `*` wildcards use the `star` branch,
+/// and `>` (full wildcard) subs are stored in `gt_subs` at the parent level.
+#[derive(Debug, Default)]
+struct TrieNode {
+    /// Subs whose pattern terminates at this node (non-`>` terminal).
+    subs: Vec<Subscription>,
+    /// Children indexed by literal token.
+    children: HashMap<String, TrieNode>,
+    /// Child node for `*` wildcard token.
+    star: Option<Box<TrieNode>>,
+    /// Subs whose pattern ends with `>` at this level.
+    gt_subs: Vec<Subscription>,
+}
+
+/// Trie-based wildcard subscription storage.
+///
+/// Provides O(depth) matching instead of O(N) linear scan. Each wildcard
+/// subscription is inserted into a trie keyed by its dotted subject tokens.
+/// Matching walks only the branches that could match the publish subject.
+#[derive(Debug, Default)]
+struct WildTrie {
+    root: TrieNode,
+    len: usize,
+    /// (conn_id, sid) → subject pattern. For O(1) remove lookup.
+    sub_index: HashMap<(u64, u64), String>,
+    /// conn_id → list of sids. For connection-level removal.
+    conn_index: HashMap<u64, Vec<u64>>,
+}
+
+impl WildTrie {
+    fn insert(&mut self, sub: Subscription) {
+        let subject = sub.subject.clone();
+        let conn_id = sub.conn_id;
+        let sid = sub.sid;
+
+        let tokens: Vec<&str> = subject.split('.').collect();
+        let mut node = &mut self.root;
+
+        // Check if the last token is `>` — if so, walk to parent and store in gt_subs.
+        let (walk_tokens, is_gt) = if tokens.last() == Some(&">") {
+            (&tokens[..tokens.len() - 1], true)
+        } else {
+            (&tokens[..], false)
+        };
+
+        for token in walk_tokens {
+            if *token == "*" {
+                node = node
+                    .star
+                    .get_or_insert_with(|| Box::new(TrieNode::default()));
+            } else {
+                node = node.children.entry(token.to_string()).or_default();
+            }
+        }
+
+        if is_gt {
+            node.gt_subs.push(sub);
+        } else {
+            node.subs.push(sub);
+        }
+
+        self.len += 1;
+        self.sub_index.insert((conn_id, sid), subject);
+        self.conn_index.entry(conn_id).or_default().push(sid);
+    }
+
+    fn remove(&mut self, conn_id: u64, sid: u64) -> Option<Subscription> {
+        let subject = self.sub_index.remove(&(conn_id, sid))?;
+
+        let mut node = &mut self.root;
+
+        for token in subject.split('.') {
+            if token == ">" {
+                if let Some(pos) = node
+                    .gt_subs
+                    .iter()
+                    .position(|s| s.conn_id == conn_id && s.sid == sid)
+                {
+                    let removed = node.gt_subs.swap_remove(pos);
+                    self.len -= 1;
+                    if let Some(sids) = self.conn_index.get_mut(&conn_id) {
+                        sids.retain(|&s| s != sid);
+                        if sids.is_empty() {
+                            self.conn_index.remove(&conn_id);
+                        }
+                    }
+                    return Some(removed);
+                }
+                return None;
+            }
+            if token == "*" {
+                match node.star {
+                    Some(ref mut star) => node = star,
+                    None => return None,
+                }
+            } else {
+                match node.children.get_mut(token) {
+                    Some(child) => node = child,
+                    None => return None,
+                }
+            }
+        }
+
+        // Terminal node (non->)
+        if let Some(pos) = node
+            .subs
+            .iter()
+            .position(|s| s.conn_id == conn_id && s.sid == sid)
+        {
+            let removed = node.subs.swap_remove(pos);
+            self.len -= 1;
+            if let Some(sids) = self.conn_index.get_mut(&conn_id) {
+                sids.retain(|&s| s != sid);
+                if sids.is_empty() {
+                    self.conn_index.remove(&conn_id);
+                }
+            }
+            Some(removed)
+        } else {
+            None
+        }
+    }
+
+    fn remove_conn(&mut self, conn_id: u64) -> Vec<Subscription> {
+        let sids = match self.conn_index.remove(&conn_id) {
+            Some(sids) => sids,
+            None => return Vec::new(),
+        };
+
+        let mut removed = Vec::with_capacity(sids.len());
+        for sid in sids {
+            if let Some(subject) = self.sub_index.remove(&(conn_id, sid)) {
+                let mut node = &mut self.root;
+                let mut found = false;
+
+                for token in subject.split('.') {
+                    if token == ">" {
+                        if let Some(pos) = node
+                            .gt_subs
+                            .iter()
+                            .position(|s| s.conn_id == conn_id && s.sid == sid)
+                        {
+                            removed.push(node.gt_subs.swap_remove(pos));
+                            self.len -= 1;
+                            found = true;
+                        }
+                        break;
+                    }
+                    if token == "*" {
+                        match node.star {
+                            Some(ref mut star) => node = star,
+                            None => break,
+                        }
+                    } else {
+                        match node.children.get_mut(token) {
+                            Some(child) => node = child,
+                            None => break,
+                        }
+                    }
+                }
+
+                if !found {
+                    if let Some(pos) = node
+                        .subs
+                        .iter()
+                        .position(|s| s.conn_id == conn_id && s.sid == sid)
+                    {
+                        removed.push(node.subs.swap_remove(pos));
+                        self.len -= 1;
+                    }
+                }
+            }
+        }
+
+        removed
+    }
+
+    /// Iterate over all wildcard subscriptions matching a publish subject.
+    fn for_each_match<'a>(&'a self, subject: &str, mut f: impl FnMut(&'a Subscription)) {
+        let tokens: Vec<&str> = subject.split('.').collect();
+        let depth = tokens.len();
+        let mut stack: Vec<(&TrieNode, usize)> = Vec::with_capacity(depth * 2);
+        stack.push((&self.root, 0));
+
+        while let Some((node, idx)) = stack.pop() {
+            // `>` matches one or more remaining tokens
+            if idx < depth {
+                for sub in &node.gt_subs {
+                    f(sub);
+                }
+            }
+
+            if idx == depth {
+                // Terminal match
+                for sub in &node.subs {
+                    f(sub);
+                }
+            } else {
+                let token = tokens[idx];
+                // Literal child match
+                if let Some(child) = node.children.get(token) {
+                    stack.push((child, idx + 1));
+                }
+                // Star wildcard match (any single token)
+                if let Some(ref star) = node.star {
+                    stack.push((star, idx + 1));
+                }
+            }
+        }
+    }
+
+    /// DFS traversal visiting all subscriptions in the trie.
+    fn for_each_sub<'a>(&'a self, mut f: impl FnMut(&'a Subscription)) {
+        let mut stack: Vec<&TrieNode> = vec![&self.root];
+        while let Some(node) = stack.pop() {
+            for sub in &node.subs {
+                f(sub);
+            }
+            for sub in &node.gt_subs {
+                f(sub);
+            }
+            for child in node.children.values() {
+                stack.push(child);
+            }
+            if let Some(ref star) = node.star {
+                stack.push(star);
+            }
+        }
+    }
+
+    /// Find a subscription by conn_id and sid.
+    fn find(&self, conn_id: u64, sid: u64) -> Option<&Subscription> {
+        let subject = self.sub_index.get(&(conn_id, sid))?;
+
+        let mut node = &self.root;
+
+        for token in subject.split('.') {
+            if token == ">" {
+                return node
+                    .gt_subs
+                    .iter()
+                    .find(|s| s.conn_id == conn_id && s.sid == sid);
+            }
+            if token == "*" {
+                match node.star {
+                    Some(ref star) => node = star,
+                    None => return None,
+                }
+            } else {
+                match node.children.get(token) {
+                    Some(child) => node = child,
+                    None => return None,
+                }
+            }
+        }
+
+        node.subs
+            .iter()
+            .find(|s| s.conn_id == conn_id && s.sid == sid)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Subscription list supporting NATS wildcard matching.
 ///
-/// Splits subscriptions into exact (HashMap) and wildcard (Vec) for fast
-/// lookups: exact subjects get O(1) HashMap lookup, only wildcard patterns
-/// require linear scanning.
+/// Splits subscriptions into exact (HashMap) and wildcard (trie) for fast
+/// lookups: exact subjects get O(1) HashMap lookup, wildcard patterns use
+/// O(depth) trie traversal.
 #[derive(Debug, Default)]
 pub struct SubList {
     /// Exact (non-wildcard) subscriptions indexed by subject.
     exact: HashMap<String, Vec<Subscription>>,
-    /// Wildcard subscriptions (patterns with `*` or `>`).
-    wild: Vec<Subscription>,
+    /// Wildcard subscriptions (patterns with `*` or `>`) stored in a trie.
+    wild: WildTrie,
     /// Round-robin counter for queue group delivery.
     queue_counter: AtomicUsize,
 }
@@ -290,20 +559,16 @@ impl SubList {
 
     pub fn insert(&mut self, sub: Subscription) {
         if is_wildcard(&sub.subject) {
-            self.wild.push(sub);
+            self.wild.insert(sub);
         } else {
             self.exact.entry(sub.subject.clone()).or_default().push(sub);
         }
     }
 
     pub fn remove(&mut self, conn_id: u64, sid: u64) -> Option<Subscription> {
-        // Try wildcard list first
-        if let Some(pos) = self
-            .wild
-            .iter()
-            .position(|s| s.conn_id == conn_id && s.sid == sid)
-        {
-            return Some(self.wild.swap_remove(pos));
+        // Try wildcard trie first (O(1) sub_index lookup)
+        if let Some(removed) = self.wild.remove(conn_id, sid) {
+            return Some(removed);
         }
         // Search exact map
         for subs in self.exact.values_mut() {
@@ -319,17 +584,8 @@ impl SubList {
     }
 
     pub fn remove_conn(&mut self, conn_id: u64) -> Vec<Subscription> {
-        let mut removed = Vec::new();
-
-        // Remove from wildcard list
-        let mut i = 0;
-        while i < self.wild.len() {
-            if self.wild[i].conn_id == conn_id {
-                removed.push(self.wild.swap_remove(i));
-            } else {
-                i += 1;
-            }
-        }
+        // Remove from wildcard trie
+        let mut removed = self.wild.remove_conn(conn_id);
 
         // Remove from exact map
         self.exact.retain(|_, subs| {
@@ -353,12 +609,10 @@ impl SubList {
         if let Some(subs) = self.exact.get(subject) {
             result.extend(subs.iter());
         }
-        // Linear scan of wildcard patterns only
-        for sub in &self.wild {
-            if subject_matches(&sub.subject, subject) {
-                result.push(sub);
-            }
-        }
+        // O(depth) trie traversal for wildcard matches
+        self.wild.for_each_match(subject, |sub| {
+            result.push(sub);
+        });
         result
     }
 
@@ -377,11 +631,9 @@ impl SubList {
             }
         }
         // Check wildcard subs
-        for sub in &self.wild {
-            if sub.conn_id == conn_id && sub.sid == sid {
-                sub.max_msgs.store(max, Ordering::Relaxed);
-                return true;
-            }
+        if let Some(sub) = self.wild.find(conn_id, sid) {
+            sub.max_msgs.store(max, Ordering::Relaxed);
+            return true;
         }
         false
     }
@@ -399,10 +651,8 @@ impl SubList {
                 }
             }
         }
-        for sub in &self.wild {
-            if sub.conn_id == conn_id && sub.sid == sid {
-                return find(sub);
-            }
+        if let Some(sub) = self.wild.find(conn_id, sid) {
+            return find(sub);
         }
         false
     }
@@ -421,9 +671,7 @@ impl SubList {
         let mut count = 0;
         let mut expired: Vec<(u64, u64)> = Vec::new();
         // Collect queue group subs lazily — only allocate when needed.
-        // Uses indices to avoid lifetime issues with the closure.
-        // (source, index): source 0 = exact, source 1 = wild
-        let mut queue_groups: Vec<(&str, Vec<(u8, usize)>)> = Vec::new();
+        let mut queue_groups: Vec<(&str, Vec<&Subscription>)> = Vec::new();
 
         // Check max_msgs limit, deliver if allowed, track expired.
         macro_rules! deliver_sub {
@@ -451,15 +699,15 @@ impl SubList {
         // Route a single matching sub: deliver non-queue immediately,
         // collect queue subs by group name.
         macro_rules! route_sub {
-            ($sub:expr, $source:expr, $idx:expr) => {
+            ($sub:expr) => {
                 if let Some(ref q) = $sub.queue {
                     if let Some(group) = queue_groups
                         .iter_mut()
                         .find(|(name, _)| *name == q.as_str())
                     {
-                        group.1.push(($source, $idx));
+                        group.1.push($sub);
                     } else {
-                        queue_groups.push((q.as_str(), vec![($source, $idx)]));
+                        queue_groups.push((q.as_str(), vec![$sub]));
                     }
                 } else {
                     deliver_sub!($sub);
@@ -469,29 +717,21 @@ impl SubList {
 
         // O(1) exact lookup
         if let Some(subs) = self.exact.get(subject) {
-            for (i, sub) in subs.iter().enumerate() {
-                route_sub!(sub, 0u8, i);
+            for sub in subs.iter() {
+                route_sub!(sub);
             }
         }
-        // Linear scan of wildcard patterns only
-        for (i, sub) in self.wild.iter().enumerate() {
-            if subject_matches(&sub.subject, subject) {
-                route_sub!(sub, 1u8, i);
-            }
-        }
+        // O(depth) trie traversal for wildcard matches
+        self.wild.for_each_match(subject, |sub| {
+            route_sub!(sub);
+        });
 
         // Deliver to exactly one member per queue group (round-robin)
         if !queue_groups.is_empty() {
             let rr = self.queue_counter.fetch_add(1, Ordering::Relaxed);
-            let exact_subs = self.exact.get(subject);
             for (_name, members) in &queue_groups {
                 let idx = rr % members.len();
-                let (source, sub_idx) = members[idx];
-                let sub = if source == 0 {
-                    &exact_subs.unwrap()[sub_idx]
-                } else {
-                    &self.wild[sub_idx]
-                };
+                let sub = members[idx];
                 deliver_sub!(sub);
             }
         }
@@ -507,9 +747,9 @@ impl SubList {
     #[allow(dead_code)]
     pub fn unique_subjects(&self) -> HashSet<&str> {
         let mut subjects: HashSet<&str> = self.exact.keys().map(|s| s.as_str()).collect();
-        for sub in &self.wild {
+        self.wild.for_each_sub(|sub| {
             subjects.insert(&sub.subject);
-        }
+        });
         subjects
     }
 
@@ -530,20 +770,22 @@ impl SubList {
                 return true;
             }
         }
-        // Check wildcard subs
-        for sub in &self.wild {
+        // Check wildcard subs via trie
+        let mut found = false;
+        self.wild.for_each_match(subject, |sub| {
+            if found {
+                return;
+            }
             #[cfg(feature = "cluster")]
             if sub.is_route {
-                continue;
+                return;
             }
             if sub.is_gateway {
-                continue;
+                return;
             }
-            if subject_matches(&sub.subject, subject) {
-                return true;
-            }
-        }
-        false
+            found = true;
+        });
+        found
     }
 
     /// Returns unique non-leaf, non-route, non-gateway (subject, queue) pairs for leaf interest
@@ -566,19 +808,19 @@ impl SubList {
                 }
             }
         }
-        for sub in &self.wild {
+        self.wild.for_each_sub(|sub| {
             if !sub.is_leaf {
                 #[cfg(feature = "cluster")]
                 if sub.is_route {
-                    continue;
+                    return;
                 }
                 #[cfg(feature = "gateway")]
                 if sub.is_gateway {
-                    continue;
+                    return;
                 }
                 set.insert((sub.subject.as_str(), sub.queue.as_deref()));
             }
-        }
+        });
         set.into_iter().collect()
     }
 
@@ -600,17 +842,17 @@ impl SubList {
                 set.insert((subj.as_str(), sub.queue.as_deref()));
             }
         }
-        for sub in &self.wild {
+        self.wild.for_each_sub(|sub| {
             #[cfg(feature = "cluster")]
             if sub.is_route {
-                continue;
+                return;
             }
             #[cfg(feature = "gateway")]
             if sub.is_gateway {
-                continue;
+                return;
             }
             set.insert((sub.subject.as_str(), sub.queue.as_deref()));
-        }
+        });
         set.into_iter().collect()
     }
 
@@ -624,9 +866,9 @@ impl SubList {
                 set.insert((subj.as_str(), sub.queue.as_deref()));
             }
         }
-        for sub in &self.wild {
+        self.wild.for_each_sub(|sub| {
             set.insert((sub.subject.as_str(), sub.queue.as_deref()));
-        }
+        });
         set.into_iter().collect()
     }
 }
@@ -1437,6 +1679,181 @@ mod tests {
         let (count, expired) = sl.for_each_match("foo.baz", |_sub| {});
         assert_eq!(count, 1);
         assert_eq!(expired.len(), 1);
+    }
+
+    // --- WildTrie tests ---
+
+    #[test]
+    fn test_trie_insert_and_match_star() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.*"));
+
+        let mut matched = Vec::new();
+        trie.for_each_match("foo.bar", |sub| matched.push(sub.sid));
+        assert_eq!(matched, vec![1]);
+
+        matched.clear();
+        trie.for_each_match("foo.bar.baz", |sub| matched.push(sub.sid));
+        assert!(matched.is_empty(), "* should not match multiple tokens");
+    }
+
+    #[test]
+    fn test_trie_insert_and_match_gt() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.>"));
+
+        let mut matched = Vec::new();
+        trie.for_each_match("foo.bar", |sub| matched.push(sub.sid));
+        assert_eq!(matched, vec![1]);
+
+        matched.clear();
+        trie.for_each_match("foo.bar.baz", |sub| matched.push(sub.sid));
+        assert_eq!(matched, vec![1]);
+
+        matched.clear();
+        trie.for_each_match("foo", |sub| matched.push(sub.sid));
+        assert!(matched.is_empty(), "> requires at least one token");
+    }
+
+    #[test]
+    fn test_trie_gt_only() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, ">"));
+
+        let mut matched = Vec::new();
+        trie.for_each_match("anything", |sub| matched.push(sub.sid));
+        assert_eq!(matched, vec![1]);
+
+        matched.clear();
+        trie.for_each_match("a.b.c", |sub| matched.push(sub.sid));
+        assert_eq!(matched, vec![1]);
+    }
+
+    #[test]
+    fn test_trie_star_gt_combined() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.*.>"));
+
+        let mut matched = Vec::new();
+        trie.for_each_match("foo.bar.baz", |sub| matched.push(sub.sid));
+        assert_eq!(matched, vec![1]);
+
+        matched.clear();
+        trie.for_each_match("foo.bar", |sub| matched.push(sub.sid));
+        assert!(matched.is_empty(), "*.> needs at least 2 tokens after foo");
+    }
+
+    #[test]
+    fn test_trie_multiple_patterns() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.*"));
+        trie.insert(test_sub(2, 1, "foo.>"));
+        trie.insert(test_sub(3, 1, "*.bar"));
+
+        let mut matched = Vec::new();
+        trie.for_each_match("foo.bar", |sub| matched.push(sub.conn_id));
+        matched.sort();
+        assert_eq!(matched, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_trie_remove() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.*"));
+        trie.insert(test_sub(2, 1, "foo.>"));
+
+        let removed = trie.remove(1, 1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().subject, "foo.*");
+        assert_eq!(trie.len, 1);
+
+        let mut matched = Vec::new();
+        trie.for_each_match("foo.bar", |sub| matched.push(sub.conn_id));
+        assert_eq!(matched, vec![2]);
+    }
+
+    #[test]
+    fn test_trie_remove_gt() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.>"));
+
+        let removed = trie.remove(1, 1);
+        assert!(removed.is_some());
+        assert!(trie.is_empty());
+    }
+
+    #[test]
+    fn test_trie_remove_conn() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.*"));
+        trie.insert(test_sub(1, 2, "bar.>"));
+        trie.insert(test_sub(2, 1, "baz.*"));
+
+        let removed = trie.remove_conn(1);
+        assert_eq!(removed.len(), 2);
+        assert_eq!(trie.len, 1);
+
+        let mut matched = Vec::new();
+        trie.for_each_match("baz.qux", |sub| matched.push(sub.conn_id));
+        assert_eq!(matched, vec![2]);
+    }
+
+    #[test]
+    fn test_trie_find() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.*"));
+        trie.insert(test_sub(2, 1, "bar.>"));
+
+        let found = trie.find(1, 1);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().subject, "foo.*");
+
+        let found = trie.find(2, 1);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().subject, "bar.>");
+
+        assert!(trie.find(3, 1).is_none());
+    }
+
+    #[test]
+    fn test_trie_for_each_sub() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "foo.*"));
+        trie.insert(test_sub(2, 1, "bar.>"));
+        trie.insert(test_sub(3, 1, "*.baz"));
+
+        let mut subjects = Vec::new();
+        trie.for_each_sub(|sub| subjects.push(sub.subject.clone()));
+        subjects.sort();
+        assert_eq!(subjects, vec!["*.baz", "bar.>", "foo.*"]);
+    }
+
+    #[test]
+    fn test_trie_multi_level_star() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "*.*.*"));
+
+        let mut matched = Vec::new();
+        trie.for_each_match("a.b.c", |sub| matched.push(sub.sid));
+        assert_eq!(matched, vec![1]);
+
+        matched.clear();
+        trie.for_each_match("a.b", |sub| matched.push(sub.sid));
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_trie_no_false_positives() {
+        let mut trie = WildTrie::default();
+        trie.insert(test_sub(1, 1, "orders.*"));
+
+        let mut matched = Vec::new();
+        trie.for_each_match("events.created", |sub| matched.push(sub.sid));
+        assert!(matched.is_empty());
+
+        matched.clear();
+        trie.for_each_match("orders", |sub| matched.push(sub.sid));
+        assert!(matched.is_empty(), "* requires exactly one more token");
     }
 
     #[cfg(feature = "accounts")]

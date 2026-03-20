@@ -81,6 +81,161 @@ fn bench_publish_local(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark wildcard subscription scaling: measures for_each_match with
+/// increasing numbers of wildcard subscriptions. This exposes the O(N) linear
+/// scan bottleneck in the current Vec-based wildcard storage.
+fn bench_wildcard_scaling(c: &mut Criterion) {
+    use open_wire::sub_list::Subscription;
+
+    let mut group = c.benchmark_group("wildcard_scaling");
+    group.throughput(Throughput::Elements(1));
+
+    // Many wildcard subs across different namespaces.
+    // Only 1 matches "app.orders.created" — the rest are in other namespaces.
+    // This stresses the linear scan: every non-matching wildcard must be checked.
+    for count in [10, 100, 1000, 5000] {
+        let mut sl = SubList::new();
+        // Add `count` wildcard subs that DON'T match our publish subject
+        for i in 0..count {
+            sl.insert(Subscription::new_dummy(i, 1, format!("svc{}.>", i), None));
+        }
+        // Add 1 wildcard sub that DOES match
+        sl.insert(Subscription::new_dummy(
+            count + 1,
+            1,
+            "app.>".to_string(),
+            None,
+        ));
+
+        group.bench_function(format!("{count}_wild_subs"), |b| {
+            b.iter(|| {
+                let mut matched = 0usize;
+                sl.for_each_match("app.orders.created", |_sub| {
+                    matched += 1;
+                });
+                assert_eq!(matched, 1);
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark for_each_match with many wildcard subs that ALL match.
+/// This measures the cost of the matching itself plus delivery fan-out.
+fn bench_wildcard_fanout(c: &mut Criterion) {
+    use open_wire::sub_list::Subscription;
+
+    let mut group = c.benchmark_group("wildcard_fanout");
+    group.throughput(Throughput::Elements(1));
+
+    for count in [10, 100, 1000] {
+        let mut sl = SubList::new();
+        // All wildcards match "app.events.x"
+        for i in 0..count {
+            sl.insert(Subscription::new_dummy(
+                i,
+                1,
+                "app.events.*".to_string(),
+                None,
+            ));
+        }
+        // Also add some exact subs
+        for i in 0..10 {
+            sl.insert(Subscription::new_dummy(
+                count + i,
+                1,
+                "app.events.x".to_string(),
+                None,
+            ));
+        }
+
+        group.bench_function(format!("{count}_matching_wild"), |b| {
+            b.iter(|| {
+                let mut matched = 0usize;
+                sl.for_each_match("app.events.x", |_sub| {
+                    matched += 1;
+                });
+            });
+        });
+    }
+
+    group.finish();
+}
+
+/// Benchmark mixed exact + wildcard with realistic NATS subject hierarchy.
+/// Simulates a microservices deployment: many services with exact subs,
+/// plus monitoring/logging wildcards that catch everything.
+fn bench_mixed_realistic(c: &mut Criterion) {
+    use open_wire::sub_list::Subscription;
+
+    let mut group = c.benchmark_group("mixed_realistic");
+    group.throughput(Throughput::Elements(1));
+
+    let services = ["orders", "users", "payments", "inventory", "shipping"];
+    let actions = ["created", "updated", "deleted", "queried"];
+
+    let mut sl = SubList::new();
+    let mut sid = 0u64;
+
+    // 100 exact subscriptions (service-specific)
+    for svc in &services {
+        for action in &actions {
+            for i in 0..5 {
+                sl.insert(Subscription::new_dummy(
+                    sid,
+                    1,
+                    format!("svc.{svc}.{action}"),
+                    None,
+                ));
+                sid += 1;
+                let _ = i;
+            }
+        }
+    }
+
+    // Wildcard monitoring subs
+    let wild_patterns = [
+        "svc.>",                // catch-all
+        "svc.orders.>",         // order events
+        "svc.*.created",        // all creation events
+        "svc.*.deleted",        // all deletion events
+        "audit.>",              // audit trail (no match)
+        "metrics.>",            // metrics (no match)
+        "logs.>",               // logs (no match)
+        "internal.*.heartbeat", // heartbeats (no match)
+    ];
+    for pat in &wild_patterns {
+        for i in 0..10 {
+            sl.insert(Subscription::new_dummy(sid, 1, pat.to_string(), None));
+            sid += 1;
+            let _ = i;
+        }
+    }
+    // Total: 100 exact + 80 wildcard
+
+    group.bench_function("publish_to_orders", |b| {
+        b.iter(|| {
+            let mut matched = 0usize;
+            sl.for_each_match("svc.orders.created", |_sub| {
+                matched += 1;
+            });
+        });
+    });
+
+    group.bench_function("publish_no_match", |b| {
+        b.iter(|| {
+            let mut matched = 0usize;
+            sl.for_each_match("unknown.topic.here", |_sub| {
+                matched += 1;
+            });
+            assert_eq!(matched, 0);
+        });
+    });
+
+    group.finish();
+}
+
 // ── Protocol parsing benchmarks ─────────────────────────────────────────────
 
 mod proto_bench {
@@ -243,6 +398,9 @@ criterion_group!(
     bench_subject_matches,
     bench_sublist_match,
     bench_publish_local,
+    bench_wildcard_scaling,
+    bench_wildcard_fanout,
+    bench_mixed_realistic,
     proto_bench::bench_parse_pub,
     proto_bench::bench_build_msg,
     proto_bench::bench_parse_lmsg,
