@@ -34,9 +34,11 @@ returns exactly one complete datagram. This makes zero-copy forwarding via
 `sendmsg(MSG_ZEROCOPY)` trivial: peek at a fixed-size binary header for routing,
 forward the entire datagram without interpreting the payload.
 
-Game networking has proven lightweight reliability patterns over UDP (sequence
-numbers + ACK bitfields piggybacked on every packet) that provide "good enough"
-reliability without TCP's overhead.
+The [`rusty_enet`](https://github.com/jabuwu/rusty_enet) crate provides a pure
+Rust port of the ENet reliable UDP library — battle-tested game networking
+(reliable + unreliable channels, fragmentation, congestion control) in ~40 lines
+of integration code. Using it from the start eliminates the need for a separate
+reliability phase and solves MTU fragmentation out of the box.
 
 ## Decision
 
@@ -44,7 +46,8 @@ Implement a **UDP binary transport** as an opt-in feature (`udp-transport`)
 in a **self-contained module directory** (`src/udp/`). The existing TCP text
 cluster transport remains the default and is unaffected. The UDP transport is
 negotiated during route INFO exchange and runs as a parallel data channel
-alongside the TCP control channel.
+alongside the TCP control channel. Reliability is provided by `rusty_enet`
+from day one.
 
 ### Design principles
 
@@ -53,8 +56,8 @@ alongside the TCP control channel.
 2. **Feature-gated**: `#[cfg(feature = "udp-transport")]` — zero cost when disabled
 3. **Hybrid TCP+UDP**: TCP handles control plane (SUB/UNSUB, PING/PONG, handshake);
    UDP handles data plane (message forwarding)
-4. **Phased delivery**: raw UDP first (benchmark ceiling), then enet reliability,
-   then zero-copy fan-out
+4. **enet from day one**: no raw UDP phase — `rusty_enet` provides reliability,
+   fragmentation, and congestion control with minimal integration effort
 
 ## Binary wire protocol
 
@@ -111,32 +114,26 @@ this is an **8-15x reduction** in subject bytes per message.
 
 ### Datagram format
 
+Each enet packet carries one batch. Reliability, sequencing, and fragmentation
+are handled by enet's transport layer — our datagram header only contains
+application-level framing.
+
 ```
-Datagram header (20 bytes, fixed):
+Batch header (4 bytes, fixed):
 
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 ├───────────────────────────────────┼───────────────────────────────┤
-│          magic (0xCA 0xFE)        │    flags (1B) │ msg_count(1B)│
+│          magic (0xCA 0xFE)        │  msg_count(1B)│ tok_defs(1B) │
 ├───────────────────────────────────────────────────────────────────┤
-│                       sequence number (4B)                       │
-├───────────────────────────────────────────────────────────────────┤
-│                         ack_seq (4B)                             │
-├───────────────────────────────────────────────────────────────────┤
-│                        ack_bits (4B)                             │
-├───────────────────────────────────────────────────────────────────┤
-│  token_def_count (1B)  │           reserved (3B)                 │
-├───────────────────────────────────────────────────────────────────┤
-│  token definitions (variable, token_def_count entries)...        │
+│  token definitions (variable, tok_defs entries)...               │
 │  messages (variable, msg_count entries)...                       │
 └───────────────────────────────────────────────────────────────────┘
-
-Flags byte:
-  bit 0: ACK_ONLY      — no messages, just ACK state
-  bit 1: RETRANSMIT    — this packet is a retransmit
-  bit 2: HAS_TOKENS    — token_def_count > 0
-  bits 3-7: reserved
 ```
+
+**4-byte header** — enet handles seq/ack/retransmit, so we don't duplicate that.
+The batch header just frames the application payload: how many token definitions
+and how many messages follow.
 
 #### Token definition entry (variable length)
 
@@ -179,20 +176,45 @@ When token_id == 0:
   subject_len (2B) + subject bytes are present inline after the fixed header.
 ```
 
-### Reliability layer
+### Reliability: rusty_enet
 
-#### Phase 1: No reliability (tracer bullet)
+[`rusty_enet`](https://github.com/jabuwu/rusty_enet) is a pure Rust port of
+[ENet](http://enet.bespin.org/) — the game networking library used in production
+since 2002. It provides reliable and unreliable channels over UDP with congestion
+control, automatic fragmentation/reassembly, and peer management. MIT licensed,
+no C FFI, no async runtime dependency.
 
-Raw `UdpSocket` with sequence numbers for loss measurement but no retransmit.
-Measures the throughput ceiling.
+**Integration is ~40 lines:**
 
-#### Phase 2: enet integration
+```rust
+// Create host (server or client side)
+let socket = UdpSocket::bind("0.0.0.0:9222")?;
+let mut host = enet::Host::new(socket, enet::HostSettings {
+    peer_limit: 32,
+    channel_limit: 2,
+    compressor: Some(Box::new(enet::RangeCoder::new())),
+    checksum: Some(Box::new(enet::crc32)),
+    ..Default::default()
+});
 
-[ENet](http://enet.bespin.org/) provides reliable and unreliable channels over
-UDP with congestion control, fragmentation, and peer management. Rust bindings
-via `enet-sys` crate (MIT licensed).
+// Connect to peer (after TCP negotiation provides peer's UDP address)
+let peer = host.connect(peer_addr, 2, 0)?;
 
-Channel mapping:
+// Send — one-liner difference between reliable and unreliable
+peer.send(0, &enet::Packet::unreliable_sequenced(data, 0));  // ch 0: messages
+peer.send(1, &enet::Packet::reliable(token_def));              // ch 1: token defs
+
+// Receive — poll in a loop (fits into a dedicated thread)
+while let Some(event) = host.service()? {
+    match event {
+        Event::Receive { peer, channel_id, packet } => { /* packet.data() */ }
+        Event::Connect { peer, .. } => { /* peer connected */ }
+        Event::Disconnect { peer, .. } => { /* peer gone */ }
+    }
+}
+```
+
+**Channel mapping:**
 
 | ENet channel | Reliability | NATS traffic |
 |---|---|---|
@@ -201,11 +223,19 @@ Channel mapping:
 
 Core NATS PUB is at-most-once — transport-level loss is tolerable. JetStream
 adds its own application-level reliability via stream acknowledgments. The
-unreliable channel provides ordering (discards out-of-order packets) which is
-sufficient for most workloads.
+unreliable sequenced channel provides ordering (discards out-of-order packets)
+which is sufficient for most workloads.
 
 Token definitions use the reliable channel to guarantee the receiver builds
 a consistent vocabulary.
+
+**What enet gives us for free** (things we'd otherwise build ourselves):
+- Reliable + unreliable + sequenced delivery modes
+- Automatic fragmentation and reassembly for messages > MTU
+- Congestion control (won't flood the link)
+- Connection keepalives and timeout detection
+- Built-in compression (RangeCoder)
+- Peer management (connect/disconnect events)
 
 ### Batching
 
@@ -229,18 +259,18 @@ With standard MTU (1500) and 128B payloads: ~9 messages per datagram.
 ### Large messages (> MTU)
 
 For messages exceeding one datagram, enet handles fragmentation and reassembly
-transparently. In phase 1 (raw UDP), messages larger than MTU are sent via the
-TCP control channel as a fallback.
+transparently. No MTU fallback to TCP needed — enet splits large packets into
+fragments, sends them individually, and reassembles at the receiver with
+automatic retransmit for lost fragments.
 
 ## Module structure
 
 ```
 src/udp/
-├── mod.rs              — Public API: UdpTransport, UdpTransportConfig
+├── mod.rs              — Public API: UdpTransport, UdpTransportConfig, UdpCmd
 ├── codec.rs            — Binary encode/decode, zero-copy message parsing
 ├── token_table.rs      — Subject tokenization: assign, lookup, evict
-├── transport.rs        — UdpSocket reader/writer threads, batch accumulation
-└── reliability.rs      — Seq/ack tracking (phase 1), enet wrapper (phase 2)
+└── transport.rs        — enet Host wrapper, reader/writer threads, batch accumulation
 ```
 
 All types are `pub(crate)`. The module exposes:
@@ -298,15 +328,18 @@ UdpTransport::new()
 
 Minimal hooks — 5 files modified, all behind `#[cfg(feature = "udp-transport")]`:
 
-### 1. `Cargo.toml` — feature flag
+### 1. `Cargo.toml` — feature flag + dependency
 
 ```toml
 [features]
 udp-transport = ["cluster"]  # depends on cluster feature
+
+[dependencies]
+rusty_enet = { version = "0.4", optional = true }
 ```
 
-No new external dependencies in phase 1 (std::net::UdpSocket only).
-Phase 2 adds `enet-sys` dependency.
+`rusty_enet` is pure Rust (no C FFI), MIT licensed, and compiles with zig
+like the rest of the project.
 
 ### 2. `src/lib.rs` — module declaration
 
@@ -358,48 +391,36 @@ if let Some(udp_tx) = route_udp_tx {
 
 ## Implementation phases
 
-### Phase 1 — Raw UDP binary, no reliability (tracer bullet)
+### Phase 1 — Binary UDP with enet (tracer bullet, end-to-end)
 
-**Goal**: Measure throughput ceiling of binary UDP vs TCP text.
+**Goal**: Working cluster transport over binary UDP with reliability.
+Side-by-side benchmark vs TCP text protocol.
 
 **Scope**:
 - `src/udp/mod.rs` — module root, UdpTransport, UdpCmd
 - `src/udp/codec.rs` — binary encode/decode
 - `src/udp/token_table.rs` — subject tokenization (assign + lookup)
-- `src/udp/transport.rs` — reader/writer threads with std::net::UdpSocket
+- `src/udp/transport.rs` — enet Host wrapper, reader/writer threads, batching
 - Touch points: Cargo.toml, lib.rs, server.rs, route_conn.rs, route_handler.rs
-- Benchmark script: `tests/throughput.sh` — add "Cluster UDP" scenario
+- Benchmark script: `tests/throughput.sh` — add "Cluster UDP" scenarios
 
-**No reliability**: sequence numbers present in header for loss measurement,
-but no retransmit. Messages that arrive are processed; lost datagrams are lost.
-Large messages (> MTU) fall back to TCP.
+**enet from the start** — adds ~40 lines over raw UdpSocket but provides
+reliability, fragmentation, congestion control. No separate reliability phase
+needed. Token definitions use enet's reliable channel; message forwarding uses
+unreliable sequenced channel.
 
-**Deliverable**: Side-by-side benchmark of cluster pub/sub over TCP text vs
-UDP binary. The delta shows the ceiling.
+**Deliverable**: Side-by-side benchmark of cluster pub/sub and fan-out over
+TCP text vs UDP binary+enet. Measures both throughput and latency.
 
-### Phase 2 — enet reliability
-
-**Goal**: Add reliable transport without reimplementing TCP.
-
-**Scope**:
-- `src/udp/reliability.rs` — enet Host wrapper
-- Replace raw UdpSocket with enet peer connection
-- Channel 0 (unreliable sequenced): message forwarding
-- Channel 1 (reliable ordered): token definitions
-- Add `enet-sys` to Cargo.toml dependencies
-
-**Deliverable**: Benchmark UDP+enet vs TCP text. The delta between phase 1 and
-phase 2 shows the cost of reliability.
-
-### Phase 3 — Zero-copy fan-out
+### Phase 2 — Zero-copy fan-out
 
 **Goal**: Eliminate payload copies for multi-peer forwarding.
 
 **Scope**:
 - `sendmsg(MSG_ZEROCOPY)` for payload forwarding
 - `recvmmsg()` / `sendmmsg()` for batch syscall reduction
-- Rewrite only the 20-byte datagram header per destination (seq/ack state);
-  payload bytes shared via kernel page reference counting
+- Rewrite only the datagram header per destination; payload bytes shared
+  via kernel page reference counting
 
 **Deliverable**: Benchmark fan-out scenarios (pub on A, sub on B+C+D).
 
@@ -443,16 +464,16 @@ cargo test --lib --features cluster
 
 | Risk | Mitigation |
 |---|---|
-| UDP packet loss degrades throughput | Phase 2 adds enet reliability; phase 1 measures loss rate to calibrate |
-| MTU limits batch size on non-jumbo networks | Detect MTU via `IP_MTU_DISCOVER`; adapt batch size; large messages fall back to TCP |
-| Token table consistency (lost DEFINE_TOKEN) | Phase 2 uses enet reliable channel for token defs; phase 1 uses inline fallback (token_id=0) |
-| enet-sys build complexity (C dependency) | Vendored C source via enet-sys; fallback: hand-roll Gaffer reliability (~150 lines) |
+| UDP packet loss degrades throughput | enet provides reliability + congestion control from day one |
+| MTU limits batch size on non-jumbo networks | enet handles fragmentation/reassembly transparently |
+| Token table consistency (lost DEFINE_TOKEN) | Token defs sent on enet reliable channel; inline fallback (token_id=0) always works |
+| rusty_enet maturity | Pure Rust transpile of battle-tested C library; well-maintained; MIT licensed |
 | Feature flag explosion | udp-transport implies cluster; no cross-product with other features |
 
 ## References
 
+- [rusty_enet — pure Rust ENet port](https://github.com/jabuwu/rusty_enet)
+- [ENet reliable UDP library (original C)](http://enet.bespin.org/)
 - [Gaffer on Games: Reliable UDP](https://gafferongames.com/post/reliability_ordering_and_congestion_avoidance_over_udp/)
-- [ENet reliable UDP library](http://enet.bespin.org/)
-- [enet-sys Rust crate](https://crates.io/crates/enet-sys)
 - [Linux MSG_ZEROCOPY](https://www.kernel.org/doc/html/latest/networking/msg_zerocopy.html)
 - [sendmmsg/recvmmsg batching](https://man7.org/linux/man-pages/man2/sendmmsg.2.html)
