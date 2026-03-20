@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::handler::{deliver_to_subs_upstream_inner, handle_expired_subs_upstream};
 use crate::server::ServerState;
@@ -332,7 +332,7 @@ impl UdpListener {
                 }
             })?;
 
-        debug!(port, "UDP listener started");
+        info!(port, "UDP listener started");
         Ok(Self { shutdown })
     }
 

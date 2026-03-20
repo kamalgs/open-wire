@@ -3,7 +3,7 @@
 #
 # Modes:
 #   --quick (default) — 5 core scenarios, 1 run, 100K msgs (~1-2 min)
-#   --full            — all 19 scenarios, 3 runs, 500K msgs (~5-10 min)
+#   --full            — all 22 scenarios, 3 runs, 500K msgs (~5-10 min)
 #
 # Scenarios (quick mode runs 1-5 only, without "Direct Hub" baseline):
 #   1. Publish only        — raw ingest rate (fire-and-forget)
@@ -22,9 +22,12 @@
 #  14. Cluster: pub/sub    — pub on A, sub on B (cross-node 1:1)
 #  15. Cluster: fan-out x3 — pub on A, sub on A+B+C (3-node fan-out)
 #  16. Cluster: remote B+C — pub on A, sub on B + sub on C (no local sub)
-#  17. Gateway: pub/sub    — pub on alpha, sub on beta (cross-gateway 1:1)
-#  18. Gateway: fan-out    — pub on alpha, sub on alpha + beta (gateway fan-out)
-#  19. Gateway: req-reply  — request-reply across the gateway
+#  17. UDP vs TCP: pub/sub — pub on A, sub on B (UDP binary transport vs TCP RMSG)
+#  18. UDP vs TCP: fan-out — pub on A, sub on A + sub on B (UDP vs TCP fan-out)
+#  19. UDP vs TCP: burst   — pub on A, sub on B (10x messages, sustained throughput)
+#  20. Gateway: pub/sub    — pub on alpha, sub on beta (cross-gateway 1:1)
+#  21. Gateway: fan-out    — pub on alpha, sub on alpha + beta (gateway fan-out)
+#  22. Gateway: req-reply  — request-reply across the gateway
 #
 # Prerequisites:
 #   - nats-server in PATH  (go install github.com/nats-io/nats-server/v2@main)
@@ -87,6 +90,12 @@ RUST_CLUSTER_A_PORT=8001; RUST_CLUSTER_A_ROUTE=8101
 RUST_CLUSTER_B_PORT=8002; RUST_CLUSTER_B_ROUTE=8102
 RUST_CLUSTER_C_PORT=8003; RUST_CLUSTER_C_ROUTE=8103
 
+# 2-node UDP vs TCP cluster ports (full mode only)
+RUST_UDP_CL_A_PORT=8011; RUST_UDP_CL_A_ROUTE=8111; RUST_UDP_CL_A_UDP=9111
+RUST_UDP_CL_B_PORT=8012; RUST_UDP_CL_B_ROUTE=8112; RUST_UDP_CL_B_UDP=9112
+RUST_TCP_CL_A_PORT=8021; RUST_TCP_CL_A_ROUTE=8121
+RUST_TCP_CL_B_PORT=8022; RUST_TCP_CL_B_ROUTE=8122
+
 # 2-node gateway ports (full mode only)
 GO_GW_A_PORT=9001; GO_GW_A_GW=9101
 GO_GW_B_PORT=9002; GO_GW_B_GW=9102
@@ -125,6 +134,10 @@ if [[ "$MODE" == "full" ]]; then
     $GO_CLUSTER_C_PORT $GO_CLUSTER_C_ROUTE \
     $RUST_CLUSTER_A_PORT $RUST_CLUSTER_A_ROUTE $RUST_CLUSTER_B_PORT $RUST_CLUSTER_B_ROUTE \
     $RUST_CLUSTER_C_PORT $RUST_CLUSTER_C_ROUTE \
+    $RUST_UDP_CL_A_PORT $RUST_UDP_CL_A_ROUTE $RUST_UDP_CL_A_UDP \
+    $RUST_UDP_CL_B_PORT $RUST_UDP_CL_B_ROUTE $RUST_UDP_CL_B_UDP \
+    $RUST_TCP_CL_A_PORT $RUST_TCP_CL_A_ROUTE \
+    $RUST_TCP_CL_B_PORT $RUST_TCP_CL_B_ROUTE \
     $GO_GW_A_PORT $GO_GW_A_GW $GO_GW_B_PORT $GO_GW_B_GW \
     $RUST_GW_A_PORT $RUST_GW_A_GW $RUST_GW_B_PORT $RUST_GW_B_GW"
 fi
@@ -145,7 +158,7 @@ echo ""
 echo "Building Rust leaf server (release)..."
 if [[ "$MODE" == "full" ]]; then
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --release --features cluster,gateway 2>&1 | tail -1
+    --release --features cluster,gateway,udp-transport 2>&1 | tail -1
 else
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
     --release 2>&1 | tail -1
@@ -910,6 +923,193 @@ if [[ "$MODE" == "full" ]]; then
     "$rust_cl_rem_ctx" "$go_cl_rem_ctx"
 
   # ──────────────────────────────────────────────────────────────────────
+  # UDP vs TCP cluster: 2-node Rust clusters side by side
+  # ──────────────────────────────────────────────────────────────────────
+  echo ""
+  echo "Starting 2-node Rust TCP cluster (for UDP comparison baseline)..."
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_tcp_cluster_a.conf" &
+  PIDS+=($!); RUST_TCP_CL_A_PID=$!
+  sleep 0.5
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_tcp_cluster_b.conf" &
+  PIDS+=($!); RUST_TCP_CL_B_PID=$!
+  sleep 2
+
+  echo "Starting 2-node Rust UDP cluster..."
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_udp_cluster_a.conf" &
+  PIDS+=($!); RUST_UDP_CL_A_PID=$!
+  sleep 0.5
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_udp_cluster_b.conf" &
+  PIDS+=($!); RUST_UDP_CL_B_PID=$!
+  sleep 2
+
+  # Verify connectivity
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_TCP_CL_A_PORT" >/dev/null 2>&1 || { echo "FAIL: rust TCP cluster A"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_TCP_CL_B_PORT" >/dev/null 2>&1 || { echo "FAIL: rust TCP cluster B"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_UDP_CL_A_PORT" >/dev/null 2>&1 || { echo "FAIL: rust UDP cluster A"; exit 1; }
+  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_UDP_CL_B_PORT" >/dev/null 2>&1 || { echo "FAIL: rust UDP cluster B"; exit 1; }
+  echo "All TCP/UDP cluster nodes responding."
+  echo ""
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 17: UDP vs TCP pub/sub (pub on A, sub on B)
+  # ──────────────────────────────────────────────────────────────────────
+  echo "================================================================"
+  echo "  17. UDP vs TCP CLUSTER PUB/SUB (pub on A, sub on B)"
+  echo "      ${MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+  run_cross_pubsub_capture "TCP Cluster A→B" \
+    "nats://127.0.0.1:$RUST_TCP_CL_A_PORT" "nats://127.0.0.1:$RUST_TCP_CL_B_PORT" "$RUST_TCP_CL_A_PID"
+  tcp_vs_udp_ps_tcp_rate=$CAPTURED_RATE tcp_vs_udp_ps_tcp_cpu=$CAPTURED_CPU tcp_vs_udp_ps_tcp_rss=$CAPTURED_RSS tcp_vs_udp_ps_tcp_ctx=$CAPTURED_CTX
+
+  run_cross_pubsub_capture "UDP Cluster A→B" \
+    "nats://127.0.0.1:$RUST_UDP_CL_A_PORT" "nats://127.0.0.1:$RUST_UDP_CL_B_PORT" "$RUST_UDP_CL_A_PID"
+  tcp_vs_udp_ps_udp_rate=$CAPTURED_RATE tcp_vs_udp_ps_udp_cpu=$CAPTURED_CPU tcp_vs_udp_ps_udp_rss=$CAPTURED_RSS tcp_vs_udp_ps_udp_ctx=$CAPTURED_CTX
+
+  record_summary "UDP A→B" \
+    "$tcp_vs_udp_ps_udp_rate" "$tcp_vs_udp_ps_tcp_rate" \
+    "$tcp_vs_udp_ps_udp_cpu" "$tcp_vs_udp_ps_tcp_cpu" \
+    "$tcp_vs_udp_ps_udp_rss" "$tcp_vs_udp_ps_tcp_rss" \
+    "$tcp_vs_udp_ps_udp_ctx" "$tcp_vs_udp_ps_tcp_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 18: UDP vs TCP fan-out (pub on A, sub on A + sub on B)
+  # ──────────────────────────────────────────────────────────────────────
+  echo "================================================================"
+  echo "  18. UDP vs TCP CLUSTER FAN-OUT (pub on A, sub on A + B)"
+  echo "      ${MSGS} msgs × ${SIZE}B"
+  echo "================================================================"
+  echo ""
+
+  # TCP cluster fan-out
+  echo "--- TCP Cluster fan-out ---"
+  cpu_before=$(cpu_ticks "$RUST_TCP_CL_A_PID")
+  ctx_before=$(ctx_switches "$RUST_TCP_CL_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.udp.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_TCP_CL_A_PORT" >"/tmp/bench_udp_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.udp.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_TCP_CL_B_PORT" >"/tmp/bench_udp_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.udp.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_TCP_CL_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:" || true
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2; do
+      grep -E "stats:" "/tmp/bench_udp_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
+      rm -f "/tmp/bench_udp_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  tcp_fan_rate=$(( rate_sum / RUNS ))
+  tcp_fan_cpu=$(( ($(cpu_ticks "$RUST_TCP_CL_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  tcp_fan_rss=$(rss_kb "$RUST_TCP_CL_A_PID")
+  tcp_fan_ctx=$(( $(ctx_switches "$RUST_TCP_CL_A_PID") - ctx_before ))
+
+  # UDP cluster fan-out
+  echo "--- UDP Cluster fan-out ---"
+  cpu_before=$(cpu_ticks "$RUST_UDP_CL_A_PID")
+  ctx_before=$(ctx_switches "$RUST_UDP_CL_A_PID")
+  rate_sum=0
+  for i in $(seq 1 "$RUNS"); do
+    nats bench sub "bench.udp.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_UDP_CL_A_PORT" >"/tmp/bench_udp_sub_1.out" 2>&1 &
+    BG_PIDS+=($!)
+    nats bench sub "bench.udp.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_UDP_CL_B_PORT" >"/tmp/bench_udp_sub_2.out" 2>&1 &
+    BG_PIDS+=($!)
+    sleep 0.5
+
+    output=$(nats bench pub "bench.udp.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
+      -s "nats://127.0.0.1:$RUST_UDP_CL_A_PORT" 2>&1)
+    echo "$output" | grep -E "stats:" || true
+    rate=$(echo "$output" | extract_rate)
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+
+    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for s in 1 2; do
+      grep -E "stats:" "/tmp/bench_udp_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
+      rm -f "/tmp/bench_udp_sub_${s}.out"
+    done
+    BG_PIDS=()
+  done
+  echo ""
+  udp_fan_rate=$(( rate_sum / RUNS ))
+  udp_fan_cpu=$(( ($(cpu_ticks "$RUST_UDP_CL_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  udp_fan_rss=$(rss_kb "$RUST_UDP_CL_A_PID")
+  udp_fan_ctx=$(( $(ctx_switches "$RUST_UDP_CL_A_PID") - ctx_before ))
+
+  record_summary "UDP fan x2" \
+    "$udp_fan_rate" "$tcp_fan_rate" \
+    "$udp_fan_cpu" "$tcp_fan_cpu" \
+    "$udp_fan_rss" "$tcp_fan_rss" \
+    "$udp_fan_ctx" "$tcp_fan_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
+  # Scenario 19: UDP vs TCP sustained burst (10x messages)
+  # ──────────────────────────────────────────────────────────────────────
+  BURST_MSGS=$(( MSGS * 10 ))
+  echo "================================================================"
+  echo "  19. UDP vs TCP BURST (pub on A, sub on B — ${BURST_MSGS} msgs)"
+  echo "      ${BURST_MSGS} msgs × ${SIZE}B (10x sustained)"
+  echo "================================================================"
+  echo ""
+  # Single run for burst test (it's already 10x messages)
+  echo "--- TCP Cluster burst ---"
+  cpu_before=$(cpu_ticks "$RUST_TCP_CL_A_PID")
+  ctx_before=$(ctx_switches "$RUST_TCP_CL_A_PID")
+  nats bench sub "bench.udp.burst" --msgs "$BURST_MSGS" --size "$SIZE" --no-progress \
+    -s "nats://127.0.0.1:$RUST_TCP_CL_B_PORT" >"/tmp/bench_udp_burst_sub.out" 2>&1 &
+  BG_PIDS+=($!)
+  sleep 0.5
+  output=$(nats bench pub "bench.udp.burst" --msgs "$BURST_MSGS" --size "$SIZE" --no-progress \
+    -s "nats://127.0.0.1:$RUST_TCP_CL_A_PORT" 2>&1)
+  echo "$output" | grep -E "stats:" || true
+  tcp_burst_rate=$(echo "$output" | extract_rate)
+  for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 60; done
+  grep -E "stats:" /tmp/bench_udp_burst_sub.out 2>/dev/null | sed 's/^/  sub  /' || true
+  rm -f /tmp/bench_udp_burst_sub.out
+  BG_PIDS=()
+  tcp_burst_cpu=$(( ($(cpu_ticks "$RUST_TCP_CL_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  tcp_burst_rss=$(rss_kb "$RUST_TCP_CL_A_PID")
+  tcp_burst_ctx=$(( $(ctx_switches "$RUST_TCP_CL_A_PID") - ctx_before ))
+  echo ""
+
+  echo "--- UDP Cluster burst ---"
+  cpu_before=$(cpu_ticks "$RUST_UDP_CL_A_PID")
+  ctx_before=$(ctx_switches "$RUST_UDP_CL_A_PID")
+  nats bench sub "bench.udp.burst" --msgs "$BURST_MSGS" --size "$SIZE" --no-progress \
+    -s "nats://127.0.0.1:$RUST_UDP_CL_B_PORT" >"/tmp/bench_udp_burst_sub.out" 2>&1 &
+  BG_PIDS+=($!)
+  sleep 0.5
+  output=$(nats bench pub "bench.udp.burst" --msgs "$BURST_MSGS" --size "$SIZE" --no-progress \
+    -s "nats://127.0.0.1:$RUST_UDP_CL_A_PORT" 2>&1)
+  echo "$output" | grep -E "stats:" || true
+  udp_burst_rate=$(echo "$output" | extract_rate)
+  for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 60; done
+  grep -E "stats:" /tmp/bench_udp_burst_sub.out 2>/dev/null | sed 's/^/  sub  /' || true
+  rm -f /tmp/bench_udp_burst_sub.out
+  BG_PIDS=()
+  udp_burst_cpu=$(( ($(cpu_ticks "$RUST_UDP_CL_A_PID") - cpu_before) * 1000 / CLK_TCK ))
+  udp_burst_rss=$(rss_kb "$RUST_UDP_CL_A_PID")
+  udp_burst_ctx=$(( $(ctx_switches "$RUST_UDP_CL_A_PID") - ctx_before ))
+  echo ""
+
+  record_summary "UDP burst" \
+    "${udp_burst_rate:-0}" "${tcp_burst_rate:-0}" \
+    "$udp_burst_cpu" "$tcp_burst_cpu" \
+    "$udp_burst_rss" "$tcp_burst_rss" \
+    "$udp_burst_ctx" "$tcp_burst_ctx"
+
+  # ──────────────────────────────────────────────────────────────────────
   # Gateway mode: start 2 Go gateway nodes + 2 Rust gateway nodes
   # ──────────────────────────────────────────────────────────────────────
   echo ""
@@ -937,10 +1137,10 @@ if [[ "$MODE" == "full" ]]; then
   echo ""
 
   # ──────────────────────────────────────────────────────────────────────
-  # Scenario 17: Gateway pub/sub (pub on alpha, sub on beta)
+  # Scenario 20: Gateway pub/sub (pub on alpha, sub on beta)
   # ──────────────────────────────────────────────────────────────────────
   echo "================================================================"
-  echo "  17. GATEWAY PUB/SUB (pub on alpha, sub on beta — cross-gateway)"
+  echo "  20. GATEWAY PUB/SUB (pub on alpha, sub on beta — cross-gateway)"
   echo "      ${MSGS} msgs × ${SIZE}B"
   echo "================================================================"
   echo ""
@@ -959,10 +1159,10 @@ if [[ "$MODE" == "full" ]]; then
     "$rust_gw_ps_ctx" "$go_gw_ps_ctx"
 
   # ──────────────────────────────────────────────────────────────────────
-  # Scenario 18: Gateway fan-out (pub on alpha, sub on alpha + sub on beta)
+  # Scenario 21: Gateway fan-out (pub on alpha, sub on alpha + sub on beta)
   # ──────────────────────────────────────────────────────────────────────
   echo "================================================================"
-  echo "  18. GATEWAY FAN-OUT (pub on alpha, sub on alpha + beta)"
+  echo "  21. GATEWAY FAN-OUT (pub on alpha, sub on alpha + beta)"
   echo "      ${MSGS} msgs × ${SIZE}B"
   echo "================================================================"
   echo ""
@@ -1040,11 +1240,11 @@ if [[ "$MODE" == "full" ]]; then
     "$rust_gw_fan_ctx" "$go_gw_fan_ctx"
 
   # ──────────────────────────────────────────────────────────────────────
-  # Scenario 19: Gateway request-reply (service mode across the gateway)
+  # Scenario 22: Gateway request-reply (service mode across the gateway)
   # ──────────────────────────────────────────────────────────────────────
   RR_MSGS=10000  # req-reply is sequential round-trip, ~400 msgs/sec across gateway
   echo "================================================================"
-  echo "  19. GATEWAY REQUEST-REPLY (req on alpha, reply on beta)"
+  echo "  22. GATEWAY REQUEST-REPLY (req on alpha, reply on beta)"
   echo "      ${RR_MSGS} msgs × ${SIZE}B"
   echo "================================================================"
   echo ""
