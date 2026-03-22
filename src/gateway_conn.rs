@@ -519,6 +519,8 @@ fn handle_gateway_op(
                 is_gateway: true,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
+                #[cfg(feature = "hub")]
+                leaf_perms: None,
             };
 
             let mut subs = state

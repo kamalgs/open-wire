@@ -233,6 +233,8 @@ pub(crate) struct ClientState {
     epoll_has_out: bool,
     /// When false, suppress delivery of the client's own published messages.
     echo: bool,
+    /// When true, send 503 no-responders status for request-reply with zero subscribers.
+    no_responders: bool,
     /// When this connection was accepted (for auth timeout).
     accepted_at: Instant,
     /// Last time activity was seen on this connection.
@@ -568,6 +570,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -644,6 +647,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -719,6 +723,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -794,6 +799,7 @@ impl Worker {
             upstream_tx: None,
             epoll_has_out: false,
             echo: true,
+            no_responders: false,
             accepted_at: Instant::now(),
             last_activity: Instant::now(),
             pings_outstanding: 0,
@@ -2062,12 +2068,39 @@ impl Worker {
                         let is_leaf = false;
 
                         if is_leaf {
-                            // Inbound leaf node — skip client auth, send PING, go Active.
+                            // Inbound leaf node — validate leaf auth, send PING, go Active.
                             #[cfg(feature = "hub")]
                             {
+                                // Validate leaf auth before taking mutable borrow on conns.
+                                let leaf_perms = self.state.leaf_auth.validate(&connect_info);
+                                let leaf_perms = match leaf_perms {
+                                    Some(p) => p.map(std::sync::Arc::new),
+                                    None => {
+                                        // Auth failed — disconnect.
+                                        warn!(conn_id, "leaf authorization violation");
+                                        counter!(
+                                            "auth_failures_total",
+                                            "worker" => self.worker_label.clone()
+                                        )
+                                        .increment(1);
+                                        if let Some(client) = self.conns.get_mut(&conn_id) {
+                                            client.write_buf.extend_from_slice(
+                                                b"-ERR 'Authorization Violation'\r\n",
+                                            );
+                                        }
+                                        self.try_flush_conn(conn_id);
+                                        self.remove_conn(conn_id);
+                                        return;
+                                    }
+                                };
+
                                 let client = self.conns.get_mut(&conn_id).unwrap();
                                 client.phase = ConnPhase::Active;
                                 client.echo = false; // suppress echo for leaf conns
+                                                     // Store permissions on the connection for filtering
+                                                     // in leaf_handler (LMSG publish check, LS+ subscribe check).
+                                client.permissions =
+                                    leaf_perms.as_ref().map(|p| p.as_ref().clone());
                                 #[cfg(feature = "leaf")]
                                 {
                                     client.upstream_tx =
@@ -2077,10 +2110,14 @@ impl Worker {
 
                                 // Register leaf DirectWriter so interest can be propagated.
                                 let dw = client.direct_writer.clone();
-                                self.state.leaf_writers.write().unwrap().insert(conn_id, dw);
+                                self.state
+                                    .leaf_writers
+                                    .write()
+                                    .unwrap()
+                                    .insert(conn_id, (dw, leaf_perms.clone()));
 
                                 // Send existing subscriptions as LS+ to the new leaf.
-                                send_existing_subs(&self.state, &client.direct_writer);
+                                send_existing_subs(&self.state, &client.direct_writer, &leaf_perms);
 
                                 info!(conn_id, "inbound leaf connected");
                             }
@@ -2112,6 +2149,8 @@ impl Worker {
                             let client = self.conns.get_mut(&conn_id).unwrap();
                             client.phase = ConnPhase::Active;
                             client.echo = connect_info.echo;
+                            client.no_responders =
+                                connect_info.no_responders && connect_info.headers;
                             client.permissions = perms;
                             #[cfg(feature = "accounts")]
                             {
@@ -2190,6 +2229,7 @@ impl Worker {
                                         write_buf: &mut client.write_buf,
                                         direct_writer: &client.direct_writer,
                                         echo: client.echo,
+                                        no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
                                         upstream_tx: &mut client.upstream_tx,
@@ -2267,6 +2307,7 @@ impl Worker {
                                         write_buf: &mut client.write_buf,
                                         direct_writer: &client.direct_writer,
                                         echo: client.echo,
+                                        no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
                                         upstream_tx: &mut client.upstream_tx,
@@ -2344,6 +2385,7 @@ impl Worker {
                                         write_buf: &mut client.write_buf,
                                         direct_writer: &client.direct_writer,
                                         echo: client.echo,
+                                        no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
                                         upstream_tx: &mut client.upstream_tx,
@@ -2454,6 +2496,7 @@ impl Worker {
                                     write_buf: &mut client.write_buf,
                                     direct_writer: &client.direct_writer,
                                     echo: client.echo,
+                                    no_responders: client.no_responders,
                                     sub_count: &mut client.sub_count,
                                     #[cfg(feature = "leaf")]
                                     upstream_tx: &mut client.upstream_tx,

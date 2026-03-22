@@ -70,6 +70,20 @@ impl LeafHandler {
         queue: Option<Bytes>,
     ) -> HandleResult {
         let subject_str = bytes_to_str(&subject);
+
+        // Check subscribe permissions: ignore LS+ if the leaf is not allowed
+        // to subscribe on this subject (controls what the leaf can import).
+        if let Some(ref perms) = conn.permissions {
+            if !perms.subscribe.is_allowed(subject_str) {
+                debug!(
+                    conn_id = conn.conn_id,
+                    subject = %subject_str,
+                    "leaf sub denied by subscribe permissions"
+                );
+                return HandleResult::Ok;
+            }
+        }
+
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
 
         // Generate synthetic SID for this leaf subscription.
@@ -109,6 +123,10 @@ impl LeafHandler {
             is_gateway: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            leaf_perms: conn
+                .permissions
+                .as_ref()
+                .map(|p| std::sync::Arc::new(p.clone())),
         };
 
         {
@@ -256,6 +274,15 @@ impl LeafHandler {
         *wctx.msgs_received_bytes += payload_len;
 
         let subject_str = bytes_to_str(&subject);
+
+        // Check publish permissions: drop LMSG if the leaf is not allowed
+        // to publish on this subject.
+        if let Some(ref perms) = conn.permissions {
+            if !perms.publish.is_allowed(subject_str) {
+                return (HandleResult::Ok, Vec::new());
+            }
+        }
+
         // Echo suppression: always skip delivery back to the originating leaf.
         let (_delivered, expired) = deliver_to_subs(
             wctx,

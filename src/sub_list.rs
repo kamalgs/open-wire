@@ -213,6 +213,11 @@ pub struct Subscription {
     /// Account this subscription belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     pub account_id: crate::server::AccountId,
+    /// Per-leaf subscribe permissions. When set, LMSG delivery to this leaf sub
+    /// is filtered: only messages matching subscribe.allow (and not in deny) are
+    /// delivered. `None` for client/route/gateway subs.
+    #[cfg(feature = "hub")]
+    pub leaf_perms: Option<std::sync::Arc<crate::server::Permissions>>,
 }
 
 impl Clone for Subscription {
@@ -233,6 +238,8 @@ impl Clone for Subscription {
             is_gateway: self.is_gateway,
             #[cfg(feature = "accounts")]
             account_id: self.account_id,
+            #[cfg(feature = "hub")]
+            leaf_perms: self.leaf_perms.clone(),
         }
     }
 }
@@ -258,6 +265,8 @@ impl Subscription {
             is_gateway: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            #[cfg(feature = "hub")]
+            leaf_perms: None,
         }
     }
 }
@@ -737,6 +746,26 @@ impl SubList {
         }
 
         (count, expired)
+    }
+
+    /// Returns true if any subscription matches the given subject.
+    /// Cheap boolean check with early exit -- no delivery, no queue routing.
+    pub fn has_any_subscriber(&self, subject: &str) -> bool {
+        // O(1) exact lookup
+        if let Some(subs) = self.exact.get(subject) {
+            if !subs.is_empty() {
+                return true;
+            }
+        }
+        // O(depth) trie traversal for wildcard matches, early exit on first hit
+        let mut found = false;
+        self.wild.for_each_match(subject, |_sub| {
+            if found {
+                return;
+            }
+            found = true;
+        });
+        found
     }
 
     /// Returns true if the sublist has no subscriptions at all.
@@ -1575,6 +1604,33 @@ mod tests {
         // Verify leaf subs are still in the list for matching
         let matches = sl.match_subject("foo");
         assert_eq!(matches.len(), 2); // client + leaf
+    }
+
+    #[test]
+    fn test_has_any_subscriber_exact() {
+        let mut sl = SubList::new();
+        assert!(!sl.has_any_subscriber("foo"));
+
+        sl.insert(test_sub(1, 1, "foo"));
+        assert!(sl.has_any_subscriber("foo"));
+        assert!(!sl.has_any_subscriber("bar"));
+    }
+
+    #[test]
+    fn test_has_any_subscriber_wildcard() {
+        let mut sl = SubList::new();
+        sl.insert(test_sub(1, 1, "foo.*"));
+        sl.insert(test_sub(1, 2, "bar.>"));
+
+        assert!(sl.has_any_subscriber("foo.baz"));
+        assert!(sl.has_any_subscriber("bar.a.b"));
+        assert!(!sl.has_any_subscriber("qux"));
+    }
+
+    #[test]
+    fn test_has_any_subscriber_empty() {
+        let sl = SubList::new();
+        assert!(!sl.has_any_subscriber("anything"));
     }
 
     #[test]

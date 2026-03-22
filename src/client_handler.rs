@@ -132,6 +132,8 @@ impl ClientHandler {
             is_gateway: false,
             #[cfg(feature = "accounts")]
             account_id: conn.account_id,
+            #[cfg(feature = "hub")]
+            leaf_perms: None,
         };
 
         {
@@ -420,6 +422,62 @@ impl ClientHandler {
         *wctx.msgs_received_bytes += payload_len;
 
         let subject_str = bytes_to_str(&subject);
+
+        // No-responders: if the client opted in (no_responders && headers) and
+        // this PUB has a reply-to subject, check whether any subscriber exists.
+        // If not, send a 503 status HMSG back on the reply subject.
+        // Skip this check when connected to an upstream hub — let the hub handle it.
+        if let Some(ref reply_bytes) = respond {
+            if conn.no_responders {
+                let has_upstream = {
+                    #[cfg(feature = "leaf")]
+                    {
+                        conn.upstream_tx.is_some()
+                    }
+                    #[cfg(not(feature = "leaf"))]
+                    {
+                        false
+                    }
+                };
+                if !has_upstream {
+                    let subs = wctx
+                        .state
+                        .get_subs(
+                            #[cfg(feature = "accounts")]
+                            conn.account_id,
+                        )
+                        .read()
+                        .unwrap();
+                    let has_sub = subs.has_any_subscriber(subject_str);
+                    drop(subs);
+
+                    if !has_sub {
+                        // Build 503 No Responders header and deliver to reply subject.
+                        let mut hdr = crate::types::HeaderMap::new();
+                        hdr.set_status(503, None);
+                        let reply_str = bytes_to_str(reply_bytes);
+                        deliver_to_subs(
+                            wctx,
+                            reply_bytes,
+                            reply_str,
+                            None,
+                            Some(&hdr),
+                            &Bytes::new(),
+                            conn.conn_id,
+                            false, // don't skip echo — deliver to the publishing client
+                            #[cfg(feature = "cluster")]
+                            false,
+                            #[cfg(feature = "gateway")]
+                            false,
+                            #[cfg(feature = "accounts")]
+                            conn.account_id,
+                        );
+                        return (HandleResult::Ok, Vec::new());
+                    }
+                }
+            }
+        }
+
         let (_delivered, expired) = deliver_to_subs(
             wctx,
             &subject,

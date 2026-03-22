@@ -569,6 +569,8 @@ fn handle_route_op(
                 is_gateway: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
+                #[cfg(feature = "hub")]
+                leaf_perms: None,
             };
 
             let mut subs = state

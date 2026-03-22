@@ -76,6 +76,54 @@ pub struct UserConfig {
     pub permissions: Option<Permissions>,
 }
 
+/// Leaf node user entry with credentials and optional permissions.
+#[cfg(feature = "hub")]
+#[derive(Debug, Clone)]
+pub struct LeafUserConfig {
+    /// Username.
+    pub user: String,
+    /// Password.
+    pub pass: String,
+    /// Optional per-user permissions.
+    pub permissions: Option<Permissions>,
+}
+
+/// Leaf node authentication configuration.
+#[cfg(feature = "hub")]
+#[derive(Debug, Clone, Default)]
+pub enum LeafAuth {
+    /// No authentication required (default).
+    #[default]
+    None,
+    /// Multi-user with per-user credentials and optional permissions.
+    Users(Vec<LeafUserConfig>),
+}
+
+#[cfg(feature = "hub")]
+impl LeafAuth {
+    /// Returns `true` if leaf authentication is required.
+    pub fn is_required(&self) -> bool {
+        !matches!(self, LeafAuth::None)
+    }
+
+    /// Validate a leaf node's CONNECT info and return permissions on success.
+    /// Returns `Some(perms)` on success (perms may be `None` if no per-user permissions),
+    /// or `None` on auth failure.
+    pub fn validate(&self, info: &ConnectInfo) -> Option<Option<Permissions>> {
+        match self {
+            LeafAuth::None => Some(None),
+            LeafAuth::Users(users) => {
+                let u = info.user.as_deref()?;
+                let p = info.pass.as_deref()?;
+                users
+                    .iter()
+                    .find(|uc| uc.user == u && uc.pass == p)
+                    .map(|uc| uc.permissions.clone())
+            }
+        }
+    }
+}
+
 /// Downstream client authentication configuration.
 #[derive(Debug, Clone, Default)]
 pub enum ClientAuth {
@@ -245,6 +293,9 @@ pub struct LeafServerConfig {
     /// accepts inbound leaf node connections on this port.
     #[cfg(feature = "hub")]
     pub leafnode_port: Option<u16>,
+    /// Leaf node authentication configuration.
+    #[cfg(feature = "hub")]
+    pub leaf_auth: LeafAuth,
     /// Maximum pending write bytes per connection before disconnecting as a
     /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
     pub max_pending: usize,
@@ -584,6 +635,8 @@ impl Default for LeafServerConfig {
             ws_port: None,
             #[cfg(feature = "hub")]
             leafnode_port: None,
+            #[cfg(feature = "hub")]
+            leaf_auth: LeafAuth::None,
             max_pending: 64 * 1024 * 1024,
             max_payload: 1_048_576,
             max_connections: 65_536,
@@ -968,8 +1021,13 @@ pub(crate) struct ServerState {
     pub leafnode_port: Option<u16>,
     /// Registry of DirectWriters for inbound leaf connections.
     /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
+    /// The optional `Permissions` controls which subjects can be sent to each leaf.
     #[cfg(feature = "hub")]
-    pub leaf_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
+    #[allow(clippy::type_complexity)]
+    pub leaf_writers: std::sync::RwLock<HashMap<u64, (DirectWriter, Option<Arc<Permissions>>)>>,
+    /// Leaf node authentication configuration.
+    #[cfg(feature = "hub")]
+    pub leaf_auth: LeafAuth,
     /// Registry of DirectWriters for inbound route connections.
     /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
     #[cfg(feature = "cluster")]
@@ -1042,6 +1100,7 @@ impl ServerState {
         max_control_line: usize,
         max_subscriptions: usize,
         #[cfg(feature = "hub")] leafnode_port: Option<u16>,
+        #[cfg(feature = "hub")] leaf_auth: LeafAuth,
         #[cfg(feature = "cluster")] cluster_port: Option<u16>,
         #[cfg(feature = "cluster")] cluster_name: Option<String>,
         #[cfg(feature = "cluster")] cluster_seeds: Vec<String>,
@@ -1130,6 +1189,8 @@ impl ServerState {
             leafnode_port,
             #[cfg(feature = "hub")]
             leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "hub")]
+            leaf_auth,
             #[cfg(feature = "cluster")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "cluster")]
@@ -1301,6 +1362,8 @@ impl LeafServer {
                 config.max_subscriptions,
                 #[cfg(feature = "hub")]
                 config.leafnode_port,
+                #[cfg(feature = "hub")]
+                config.leaf_auth.clone(),
                 #[cfg(feature = "cluster")]
                 config.cluster_port,
                 #[cfg(feature = "cluster")]
@@ -2483,6 +2546,101 @@ mod tests {
             assert_eq!(ri.src_pattern, "events.>");
             // team_a (idx 1) has no reverse imports
             assert!(reverse[1].is_empty());
+        }
+    }
+
+    #[cfg(feature = "hub")]
+    mod leaf_auth_tests {
+        use super::*;
+
+        fn make_connect(user: &str, pass: &str) -> ConnectInfo {
+            ConnectInfo {
+                user: Some(user.to_string()),
+                pass: Some(pass.to_string()),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn leaf_auth_none_always_passes() {
+            let auth = LeafAuth::None;
+            let info = ConnectInfo::default();
+            assert!(auth.validate(&info).is_some());
+            assert!(auth.validate(&info).unwrap().is_none());
+        }
+
+        #[test]
+        fn leaf_auth_users_valid() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".to_string(),
+                pass: "secret".to_string(),
+                permissions: Some(Permissions {
+                    publish: Permission {
+                        allow: vec!["foo.>".to_string()],
+                        deny: vec!["foo.secret".to_string()],
+                    },
+                    subscribe: Permission {
+                        allow: vec!["bar.>".to_string()],
+                        deny: Vec::new(),
+                    },
+                }),
+            }]);
+            let info = make_connect("leaf1", "secret");
+            let result = auth.validate(&info);
+            assert!(result.is_some());
+            let perms = result.unwrap();
+            assert!(perms.is_some());
+            let p = perms.unwrap();
+            assert!(p.publish.is_allowed("foo.bar"));
+            assert!(!p.publish.is_allowed("foo.secret"));
+            assert!(p.subscribe.is_allowed("bar.baz"));
+            assert!(!p.subscribe.is_allowed("other.topic"));
+        }
+
+        #[test]
+        fn leaf_auth_users_no_perms() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf2".to_string(),
+                pass: "pass2".to_string(),
+                permissions: None,
+            }]);
+            let info = make_connect("leaf2", "pass2");
+            let result = auth.validate(&info);
+            assert!(result.is_some());
+            assert!(result.unwrap().is_none());
+        }
+
+        #[test]
+        fn leaf_auth_users_wrong_password() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".to_string(),
+                pass: "secret".to_string(),
+                permissions: None,
+            }]);
+            let info = make_connect("leaf1", "wrong");
+            assert!(auth.validate(&info).is_none());
+        }
+
+        #[test]
+        fn leaf_auth_users_unknown_user() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".to_string(),
+                pass: "secret".to_string(),
+                permissions: None,
+            }]);
+            let info = make_connect("unknown", "secret");
+            assert!(auth.validate(&info).is_none());
+        }
+
+        #[test]
+        fn leaf_auth_users_missing_credentials() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".to_string(),
+                pass: "secret".to_string(),
+                permissions: None,
+            }]);
+            let info = ConnectInfo::default(); // no user/pass
+            assert!(auth.validate(&info).is_none());
         }
     }
 }

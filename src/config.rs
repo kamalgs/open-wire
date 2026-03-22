@@ -930,6 +930,21 @@ fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), C
                     config.leafnode_port = Some(p);
                 }
             }
+            #[cfg(feature = "hub")]
+            "authorization" => {
+                if let Some(auth_entries) = lval.as_map() {
+                    for (akey, aval) in auth_entries {
+                        if akey == "users" {
+                            if let Some(arr) = aval.as_array() {
+                                let leaf_users = parse_leaf_users_array(arr)?;
+                                config.leaf_auth = crate::server::LeafAuth::Users(leaf_users);
+                            }
+                        } else {
+                            tracing::debug!("ignoring leafnodes.authorization key: {akey}");
+                        }
+                    }
+                }
+            }
             _ => {
                 tracing::debug!("ignoring leafnodes key: {lkey}");
             }
@@ -1235,6 +1250,49 @@ fn parse_users_array(arr: &[Value]) -> Result<Vec<UserConfig>, ConfigError> {
             continue;
         }
         users.push(UserConfig {
+            user,
+            pass,
+            permissions,
+        });
+    }
+    Ok(users)
+}
+
+/// Parse a `users` array from the leafnodes.authorization block.
+#[cfg(feature = "hub")]
+fn parse_leaf_users_array(
+    arr: &[Value],
+) -> Result<Vec<crate::server::LeafUserConfig>, ConfigError> {
+    let mut users = Vec::with_capacity(arr.len());
+    for item in arr {
+        let entries = match item.as_map() {
+            Some(e) => e,
+            None => continue,
+        };
+        let mut user = String::new();
+        let mut pass = String::new();
+        let mut permissions: Option<Permissions> = None;
+
+        for (key, val) in entries {
+            match key.as_str() {
+                "user" | "username" => user = as_string(val)?,
+                "password" | "pass" => pass = as_string(val)?,
+                "permissions" => {
+                    if let Some(pmap) = val.as_map() {
+                        permissions = Some(parse_permissions(pmap)?);
+                    }
+                }
+                _ => {
+                    tracing::debug!("ignoring leaf user key: {key}");
+                }
+            }
+        }
+
+        if user.is_empty() || pass.is_empty() {
+            tracing::warn!("skipping leaf user entry with missing user/password");
+            continue;
+        }
+        users.push(crate::server::LeafUserConfig {
             user,
             pass,
             permissions,
@@ -1881,5 +1939,63 @@ accounts {
         let config = load_config_str(input).unwrap();
         let dst = &config.accounts[1];
         assert_eq!(dst.imports[0].to, None);
+    }
+
+    #[cfg(feature = "hub")]
+    #[test]
+    fn leafnodes_authorization_users() {
+        let input = r#"
+port = 4222
+leafnodes {
+    listen: "0.0.0.0:7422"
+    authorization {
+        users = [
+            {
+                user: "leaf1", password: "pass1",
+                permissions: {
+                    publish: { allow: ["foo.>"], deny: ["foo.secret"] }
+                    subscribe: { allow: ["bar.>"] }
+                }
+            },
+            {
+                user: "leaf2", password: "pass2"
+            }
+        ]
+    }
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert_eq!(config.leafnode_port, Some(7422));
+        match &config.leaf_auth {
+            crate::server::LeafAuth::Users(users) => {
+                assert_eq!(users.len(), 2);
+                assert_eq!(users[0].user, "leaf1");
+                assert_eq!(users[0].pass, "pass1");
+                let perms = users[0].permissions.as_ref().unwrap();
+                assert_eq!(perms.publish.allow, vec!["foo.>"]);
+                assert_eq!(perms.publish.deny, vec!["foo.secret"]);
+                assert_eq!(perms.subscribe.allow, vec!["bar.>"]);
+                assert!(perms.subscribe.deny.is_empty());
+
+                assert_eq!(users[1].user, "leaf2");
+                assert_eq!(users[1].pass, "pass2");
+                assert!(users[1].permissions.is_none());
+            }
+            _ => panic!("expected LeafAuth::Users"),
+        }
+    }
+
+    #[cfg(feature = "hub")]
+    #[test]
+    fn leafnodes_authorization_empty() {
+        let input = r#"
+port = 4222
+leafnodes {
+    listen: "0.0.0.0:7422"
+}
+"#;
+        let config = load_config_str(input).unwrap();
+        assert_eq!(config.leafnode_port, Some(7422));
+        assert!(matches!(config.leaf_auth, crate::server::LeafAuth::None));
     }
 }

@@ -34,6 +34,8 @@ pub(crate) struct ConnCtx<'a> {
     pub write_buf: &'a mut BytesMut,
     pub direct_writer: &'a DirectWriter,
     pub echo: bool,
+    /// When true, send 503 no-responders status for request-reply with zero subscribers.
+    pub no_responders: bool,
     pub sub_count: &'a mut usize,
     #[cfg(feature = "leaf")]
     pub upstream_tx: &'a mut Option<mpsc::Sender<UpstreamCmd>>,
@@ -141,6 +143,7 @@ pub(crate) enum HandleResult {
 }
 
 /// Inner dispatch for writing a message to a single subscription based on its type.
+/// Returns `false` if the message was filtered out by leaf subscribe permissions.
 #[inline]
 #[allow(unused_variables)]
 fn deliver_to_sub_inner(
@@ -150,7 +153,7 @@ fn deliver_to_sub_inner(
     headers: Option<&HeaderMap>,
     payload: &[u8],
     #[cfg(feature = "accounts")] account_name: &[u8],
-) {
+) -> bool {
     #[cfg(feature = "cluster")]
     if sub.is_route {
         sub.writer.write_rmsg(
@@ -161,10 +164,18 @@ fn deliver_to_sub_inner(
             #[cfg(feature = "accounts")]
             account_name,
         );
-        return;
+        return true;
     }
     #[cfg(feature = "hub")]
     if sub.is_leaf {
+        // Check subscribe permissions: only deliver LMSG to this leaf if the
+        // message subject is allowed by the leaf's subscribe permissions.
+        if let Some(ref p) = sub.leaf_perms {
+            let subject_str = std::str::from_utf8(subject).unwrap_or("");
+            if !p.subscribe.is_allowed(subject_str) {
+                return false;
+            }
+        }
         sub.writer.write_lmsg(subject, reply, headers, payload);
     } else {
         sub.writer
@@ -173,6 +184,7 @@ fn deliver_to_sub_inner(
     #[cfg(not(feature = "hub"))]
     sub.writer
         .write_msg(subject, &sub.sid_bytes, reply, headers, payload);
+    true
 }
 
 /// Deliver a message to all matching subscriptions in the global sub list.
@@ -233,7 +245,7 @@ pub(crate) fn deliver_to_subs(
             return;
         }
         #[cfg(feature = "gateway")]
-        if sub.is_gateway {
+        let did_deliver = if sub.is_gateway {
             // Rewrite reply with _GR_ prefix before forwarding across gateway
             let gw_reply = rewrite_gateway_reply(reply, wctx.state);
             sub.writer.write_rmsg(
@@ -244,6 +256,7 @@ pub(crate) fn deliver_to_subs(
                 #[cfg(feature = "accounts")]
                 acct_name,
             );
+            true
         } else {
             deliver_to_sub_inner(
                 sub,
@@ -253,19 +266,20 @@ pub(crate) fn deliver_to_subs(
                 payload,
                 #[cfg(feature = "accounts")]
                 acct_name,
-            );
-        }
+            )
+        };
         #[cfg(not(feature = "gateway"))]
-        {
-            deliver_to_sub_inner(
-                sub,
-                subject,
-                reply,
-                headers,
-                payload,
-                #[cfg(feature = "accounts")]
-                acct_name,
-            );
+        let did_deliver = deliver_to_sub_inner(
+            sub,
+            subject,
+            reply,
+            headers,
+            payload,
+            #[cfg(feature = "accounts")]
+            acct_name,
+        );
+        if !did_deliver {
+            return;
         }
         delivered += 1;
         *wctx.msgs_delivered += 1;
@@ -394,6 +408,13 @@ pub(crate) fn deliver_to_subs_upstream_inner(
         }
         #[cfg(feature = "hub")]
         if sub.is_leaf {
+            // Check subscribe permissions before delivering LMSG to leaf.
+            if let Some(ref p) = sub.leaf_perms {
+                let subject_str_val = std::str::from_utf8(subject).unwrap_or("");
+                if !p.subscribe.is_allowed(subject_str_val) {
+                    return;
+                }
+            }
             sub.writer.write_lmsg(subject, reply, headers, payload);
         } else {
             sub.writer
@@ -459,14 +480,16 @@ pub(crate) fn deliver_cross_account(
 
         let subs = wctx.state.get_subs(route.dst_account_id).read().unwrap();
         let (_count, expired) = subs.for_each_match(&dst_subject_str, |sub| {
-            deliver_to_sub_inner(
+            if !deliver_to_sub_inner(
                 sub,
                 dst_subject_bytes,
                 reply,
                 headers,
                 payload,
                 dst_acct_name,
-            );
+            ) {
+                return;
+            }
             *wctx.msgs_delivered += 1;
             *wctx.msgs_delivered_bytes += payload_len;
             let fd = sub.writer.event_raw_fd();
@@ -541,6 +564,13 @@ pub(crate) fn deliver_cross_account_upstream(
             }
             #[cfg(feature = "hub")]
             if sub.is_leaf {
+                // Check subscribe permissions before delivering LMSG to leaf.
+                if let Some(ref p) = sub.leaf_perms {
+                    let subj_str = std::str::from_utf8(dst_subject_bytes).unwrap_or("");
+                    if !p.subscribe.is_allowed(subj_str) {
+                        return;
+                    }
+                }
                 sub.writer
                     .write_lmsg(dst_subject_bytes, reply, headers, payload);
             } else {
@@ -641,6 +671,8 @@ pub(crate) fn handle_expired_subs_upstream(
 }
 
 /// Propagate LS+ to all inbound leaf connections (interest advertisement).
+/// Checks per-leaf publish permissions: only send LS+ if the leaf is allowed
+/// to publish on this subject (publish perms control what the leaf can export).
 #[cfg(feature = "hub")]
 pub(crate) fn propagate_leaf_sub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
     let writers = state.leaf_writers.read().unwrap();
@@ -653,13 +685,20 @@ pub(crate) fn propagate_leaf_sub(state: &ServerState, subject: &[u8], queue: Opt
     } else {
         builder.build_leaf_sub(subject)
     };
-    for writer in writers.values() {
+    let subject_str = std::str::from_utf8(subject).unwrap_or("");
+    for (writer, perms) in writers.values() {
+        if let Some(ref p) = perms {
+            if !p.publish.is_allowed(subject_str) {
+                continue;
+            }
+        }
         writer.write_raw(data);
         writer.notify();
     }
 }
 
 /// Propagate LS- to all inbound leaf connections (interest removal).
+/// Checks per-leaf publish permissions for consistency with propagate_leaf_sub.
 #[cfg(feature = "hub")]
 pub(crate) fn propagate_leaf_unsub(state: &ServerState, subject: &[u8], queue: Option<&[u8]>) {
     let writers = state.leaf_writers.read().unwrap();
@@ -672,15 +711,26 @@ pub(crate) fn propagate_leaf_unsub(state: &ServerState, subject: &[u8], queue: O
     } else {
         builder.build_leaf_unsub(subject)
     };
-    for writer in writers.values() {
+    let subject_str = std::str::from_utf8(subject).unwrap_or("");
+    for (writer, perms) in writers.values() {
+        if let Some(ref p) = perms {
+            if !p.publish.is_allowed(subject_str) {
+                continue;
+            }
+        }
         writer.write_raw(data);
         writer.notify();
     }
 }
 
 /// Send LS+ for all existing client subscriptions to a given leaf's DirectWriter.
+/// When `perms` is provided, only sends LS+ for subjects allowed by publish permissions.
 #[cfg(feature = "hub")]
-pub(crate) fn send_existing_subs(state: &ServerState, writer: &DirectWriter) {
+pub(crate) fn send_existing_subs(
+    state: &ServerState,
+    writer: &DirectWriter,
+    perms: &Option<Arc<crate::server::Permissions>>,
+) {
     let mut builder = nats_proto::MsgBuilder::new();
 
     #[cfg(feature = "accounts")]
@@ -688,6 +738,11 @@ pub(crate) fn send_existing_subs(state: &ServerState, writer: &DirectWriter) {
         for account_sub in &state.account_subs {
             let subs = account_sub.read().unwrap();
             for (subject, queue) in subs.client_interests() {
+                if let Some(ref p) = perms {
+                    if !p.publish.is_allowed(subject) {
+                        continue;
+                    }
+                }
                 let data = if let Some(q) = queue {
                     builder.build_leaf_sub_queue(subject.as_bytes(), q.as_bytes())
                 } else {
@@ -701,6 +756,11 @@ pub(crate) fn send_existing_subs(state: &ServerState, writer: &DirectWriter) {
     {
         let subs = state.subs.read().unwrap();
         for (subject, queue) in subs.client_interests() {
+            if let Some(ref p) = perms {
+                if !p.publish.is_allowed(subject) {
+                    continue;
+                }
+            }
             let data = if let Some(q) = queue {
                 builder.build_leaf_sub_queue(subject.as_bytes(), q.as_bytes())
             } else {
