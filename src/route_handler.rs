@@ -341,7 +341,7 @@ impl RouteHandler {
         // Also forward to upstream hub if configured
         #[cfg(feature = "leaf")]
         forward_to_upstream(
-            conn.upstream_tx,
+            conn.upstream_txs,
             wctx.state,
             subject,
             reply,

@@ -910,13 +910,7 @@ fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), C
             #[cfg(feature = "leaf")]
             "remotes" => {
                 if let Some(arr) = lval.as_array() {
-                    if arr.len() > 1 {
-                        tracing::warn!(
-                            "config has {} leafnode remotes; only the first is used",
-                            arr.len()
-                        );
-                    }
-                    if let Some(remote) = arr.first() {
+                    for remote in arr {
                         apply_remote(config, remote)?;
                     }
                 }
@@ -1190,18 +1184,22 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
 
     let mut hub_creds = HubCredentials::default();
     let mut has_creds = false;
+    let mut url = String::new();
+    #[cfg(feature = "interest-collapse")]
+    let mut collapse_templates: Vec<String> = Vec::new();
+    #[cfg(feature = "subject-mapping")]
+    let mut mappings: Vec<crate::interest::SubjectMapping> = Vec::new();
 
     for (rkey, rval) in entries {
         match rkey.as_str() {
             "url" | "urls" => {
-                let url = as_string(rval)?;
+                let u = as_string(rval)?;
                 // Convert leaf:// scheme to nats:// for our upstream module
-                let url = if let Some(rest) = url.strip_prefix("leaf://") {
+                url = if let Some(rest) = u.strip_prefix("leaf://") {
                     format!("nats://{rest}")
                 } else {
-                    url
+                    u
                 };
-                config.hub_url = Some(url);
             }
             "credentials" => {
                 hub_creds.creds_file = Some(as_string(rval)?);
@@ -1210,17 +1208,14 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
             #[cfg(feature = "interest-collapse")]
             "interest_collapse" => {
                 if let Some(arr) = rval.as_array() {
-                    let mut templates = Vec::with_capacity(arr.len());
                     for item in arr {
-                        templates.push(as_string(item)?);
+                        collapse_templates.push(as_string(item)?);
                     }
-                    config.interest_collapse = templates;
                 }
             }
             #[cfg(feature = "subject-mapping")]
             "subject_mappings" => {
                 if let Some(arr) = rval.as_array() {
-                    let mut mappings = Vec::with_capacity(arr.len());
                     for item in arr {
                         if let Some(map_entries) = item.as_map() {
                             let mut from = String::new();
@@ -1237,7 +1232,6 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
                             }
                         }
                     }
-                    config.subject_mappings = mappings;
                 }
             }
             _ => {
@@ -1246,8 +1240,36 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
         }
     }
 
-    if has_creds {
+    if !url.is_empty() {
+        let hub_remote = crate::server::HubRemote {
+            url: url.clone(),
+            credentials: if has_creds {
+                Some(hub_creds.clone())
+            } else {
+                None
+            },
+            #[cfg(feature = "interest-collapse")]
+            interest_collapse: collapse_templates.clone(),
+            #[cfg(feature = "subject-mapping")]
+            subject_mappings: mappings.clone(),
+        };
+        config.hub_remotes.push(hub_remote);
+    }
+
+    // Also set legacy fields for backward compat (first remote wins)
+    if config.hub_url.is_none() && !url.is_empty() {
+        config.hub_url = Some(url);
+    }
+    if has_creds && config.hub_credentials.is_none() {
         config.hub_credentials = Some(hub_creds);
+    }
+    #[cfg(feature = "interest-collapse")]
+    if config.interest_collapse.is_empty() && !collapse_templates.is_empty() {
+        config.interest_collapse = collapse_templates;
+    }
+    #[cfg(feature = "subject-mapping")]
+    if config.subject_mappings.is_empty() && !mappings.is_empty() {
+        config.subject_mappings = mappings;
     }
 
     Ok(())

@@ -228,7 +228,7 @@ pub(crate) struct ClientState {
     conn_id: u64,
     ext: ConnExt,
     #[cfg(feature = "leaf")]
-    upstream_tx: Option<mpsc::Sender<UpstreamCmd>>,
+    upstream_txs: Vec<mpsc::Sender<UpstreamCmd>>,
     /// Whether EPOLLOUT is currently registered for this fd.
     epoll_has_out: bool,
     /// When false, suppress delivery of the client's own published messages.
@@ -567,7 +567,7 @@ impl Worker {
             conn_id: id,
             ext: ConnExt::Client,
             #[cfg(feature = "leaf")]
-            upstream_tx: None,
+            upstream_txs: Vec::new(),
             epoll_has_out: false,
             echo: true,
             no_responders: false,
@@ -644,7 +644,7 @@ impl Worker {
                 leaf_sids: HashMap::new(),
             },
             #[cfg(feature = "leaf")]
-            upstream_tx: None,
+            upstream_txs: Vec::new(),
             epoll_has_out: false,
             echo: true,
             no_responders: false,
@@ -720,7 +720,7 @@ impl Worker {
                 peer_server_id: None,
             },
             #[cfg(feature = "leaf")]
-            upstream_tx: None,
+            upstream_txs: Vec::new(),
             epoll_has_out: false,
             echo: true,
             no_responders: false,
@@ -796,7 +796,7 @@ impl Worker {
                 peer_gateway_name: None,
             },
             #[cfg(feature = "leaf")]
-            upstream_tx: None,
+            upstream_txs: Vec::new(),
             epoll_has_out: false,
             echo: true,
             no_responders: false,
@@ -1883,7 +1883,8 @@ impl Worker {
                             client.echo = false;
                             #[cfg(feature = "leaf")]
                             {
-                                client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                                client.upstream_txs =
+                                    self.state.upstream_txs.read().unwrap().clone();
                             }
                             client.write_buf.extend_from_slice(b"PONG\r\n");
 
@@ -1985,7 +1986,8 @@ impl Worker {
                             client.echo = false;
                             #[cfg(feature = "leaf")]
                             {
-                                client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                                client.upstream_txs =
+                                    self.state.upstream_txs.read().unwrap().clone();
                             }
                             client.write_buf.extend_from_slice(b"PONG\r\n");
 
@@ -2101,8 +2103,8 @@ impl Worker {
                                     leaf_perms.as_ref().map(|p| p.as_ref().clone());
                                 #[cfg(feature = "leaf")]
                                 {
-                                    client.upstream_tx =
-                                        self.state.upstream_tx.read().unwrap().clone();
+                                    client.upstream_txs =
+                                        self.state.upstream_txs.read().unwrap().clone();
                                 }
                                 client.write_buf.extend_from_slice(b"PING\r\n");
 
@@ -2156,7 +2158,8 @@ impl Worker {
                             }
                             #[cfg(feature = "leaf")]
                             {
-                                client.upstream_tx = self.state.upstream_tx.read().unwrap().clone();
+                                client.upstream_txs =
+                                    self.state.upstream_txs.read().unwrap().clone();
                             }
                             info!(conn_id, "client connected");
                         }
@@ -2230,7 +2233,7 @@ impl Worker {
                                         no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
-                                        upstream_tx: &mut client.upstream_tx,
+                                        upstream_txs: &mut client.upstream_txs,
                                         permissions: &client.permissions,
                                         ext: &mut client.ext,
                                         draining,
@@ -2308,7 +2311,7 @@ impl Worker {
                                         no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
-                                        upstream_tx: &mut client.upstream_tx,
+                                        upstream_txs: &mut client.upstream_txs,
                                         permissions: &client.permissions,
                                         ext: &mut client.ext,
                                         draining,
@@ -2386,7 +2389,7 @@ impl Worker {
                                         no_responders: client.no_responders,
                                         sub_count: &mut client.sub_count,
                                         #[cfg(feature = "leaf")]
-                                        upstream_tx: &mut client.upstream_tx,
+                                        upstream_txs: &mut client.upstream_txs,
                                         permissions: &client.permissions,
                                         ext: &mut client.ext,
                                         draining,
@@ -2448,7 +2451,7 @@ impl Worker {
                         #[cfg(feature = "leaf")]
                         {
                             let client = self.conns.get(&conn_id).unwrap();
-                            client.upstream_tx.is_none()
+                            client.upstream_txs.is_empty()
                                 && !self.state.has_subs.load(Ordering::Relaxed)
                                 && !has_gw
                         }
@@ -2497,7 +2500,7 @@ impl Worker {
                                     no_responders: client.no_responders,
                                     sub_count: &mut client.sub_count,
                                     #[cfg(feature = "leaf")]
-                                    upstream_tx: &mut client.upstream_tx,
+                                    upstream_txs: &mut client.upstream_txs,
                                     permissions: &client.permissions,
                                     ext: &mut client.ext,
                                     draining,
@@ -2603,8 +2606,8 @@ fn cleanup_conn(id: u64, state: &ServerState) {
 
     #[cfg(feature = "leaf")]
     if !removed.is_empty() {
-        let mut upstream = state.upstream.write().unwrap();
-        if let Some(ref mut up) = *upstream {
+        let mut upstreams = state.upstreams.write().unwrap();
+        for up in upstreams.iter_mut() {
             for sub in &removed {
                 up.remove_interest(&sub.subject, sub.queue.as_deref());
             }

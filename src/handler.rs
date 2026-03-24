@@ -38,7 +38,7 @@ pub(crate) struct ConnCtx<'a> {
     pub no_responders: bool,
     pub sub_count: &'a mut usize,
     #[cfg(feature = "leaf")]
-    pub upstream_tx: &'a mut Option<mpsc::Sender<UpstreamCmd>>,
+    pub upstream_txs: &'a mut Vec<mpsc::Sender<UpstreamCmd>>,
     pub permissions: &'a Option<Permissions>,
     pub ext: &'a mut ConnExt,
     /// Whether the connection is in Draining phase.
@@ -629,8 +629,8 @@ pub(crate) fn handle_expired_subs(
             }
             #[cfg(feature = "leaf")]
             {
-                let mut upstream = state.upstream.write().unwrap();
-                if let Some(ref mut up) = *upstream {
+                let mut upstreams = state.upstreams.write().unwrap();
+                for up in upstreams.iter_mut() {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }
             }
@@ -673,8 +673,8 @@ pub(crate) fn handle_expired_subs_upstream(
         .unwrap();
     for (conn_id, sid) in expired {
         if let Some(removed) = subs.remove(*conn_id, *sid) {
-            let mut upstream = state.upstream.write().unwrap();
-            if let Some(ref mut up) = *upstream {
+            let mut upstreams = state.upstreams.write().unwrap();
+            for up in upstreams.iter_mut() {
                 up.remove_interest(&removed.subject, removed.queue.as_deref());
             }
         }
@@ -1168,29 +1168,36 @@ pub(crate) fn bytes_to_str(b: &Bytes) -> &str {
     unsafe { std::str::from_utf8_unchecked(b) }
 }
 
-/// Forward a publish to the upstream hub. If the writer thread has gone,
-/// refresh the sender from global state.
+/// Forward a publish to all upstream hubs. If a writer thread has gone,
+/// refresh the senders from global state.
 #[cfg(feature = "leaf")]
 pub(crate) fn forward_to_upstream(
-    upstream_tx: &mut Option<mpsc::Sender<UpstreamCmd>>,
+    upstream_txs: &mut Vec<mpsc::Sender<UpstreamCmd>>,
     state: &ServerState,
     subject: Bytes,
     reply: Option<Bytes>,
     headers: Option<HeaderMap>,
     payload: Bytes,
 ) {
-    if let Some(ref tx) = upstream_tx {
+    if upstream_txs.is_empty() {
+        return;
+    }
+    let mut any_failed = false;
+    for tx in upstream_txs.iter() {
         if tx
             .send(UpstreamCmd::Publish {
-                subject,
-                reply,
-                headers,
-                payload,
+                subject: subject.clone(),
+                reply: reply.clone(),
+                headers: headers.clone(),
+                payload: payload.clone(),
             })
             .is_err()
         {
-            // Writer thread gone — refresh from global state (may have reconnected)
-            *upstream_tx = state.upstream_tx.read().unwrap().clone();
+            any_failed = true;
         }
+    }
+    if any_failed {
+        // At least one writer thread gone — refresh from global state (may have reconnected)
+        *upstream_txs = state.upstream_txs.read().unwrap().clone();
     }
 }

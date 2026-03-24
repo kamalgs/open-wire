@@ -235,6 +235,26 @@ pub struct HubCredentials {
     pub creds_file: Option<String>,
 }
 
+/// Configuration for a single upstream hub remote connection.
+///
+/// Each `HubRemote` describes one upstream hub to connect to via the leaf node
+/// protocol. Multiple remotes allow a leaf node to bridge traffic to more than
+/// one hub simultaneously.
+#[cfg(feature = "leaf")]
+#[derive(Debug, Clone)]
+pub struct HubRemote {
+    /// Hub URL (e.g., `"nats://hub:4222"`).
+    pub url: String,
+    /// Optional credentials for this remote.
+    pub credentials: Option<HubCredentials>,
+    /// Interest collapse templates for this remote.
+    #[cfg(feature = "interest-collapse")]
+    pub interest_collapse: Vec<String>,
+    /// Subject mapping rules for this remote.
+    #[cfg(feature = "subject-mapping")]
+    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
+}
+
 /// Generate a random nonce for NKey challenge-response auth.
 fn generate_nonce() -> String {
     let mut data = [0u8; 11];
@@ -319,6 +339,12 @@ pub struct LeafServerConfig {
     /// Credentials for connecting to the upstream hub.
     #[cfg(feature = "leaf")]
     pub hub_credentials: Option<HubCredentials>,
+    /// Multiple upstream hub remotes. When non-empty, each remote gets its own
+    /// independent connection with its own credentials and interest pipeline.
+    /// If empty and `hub_url` is set, a single remote is synthesized from the
+    /// legacy `hub_url`/`hub_credentials`/`interest_collapse`/`subject_mappings`.
+    #[cfg(feature = "leaf")]
+    pub hub_remotes: Vec<HubRemote>,
     /// Port for Prometheus metrics HTTP endpoint. `None` = disabled.
     pub metrics_port: Option<u16>,
     /// Path to TLS certificate file (PEM). When set with `tls_key`, enables TLS.
@@ -648,6 +674,8 @@ impl Default for LeafServerConfig {
             leaf_auth: LeafAuth::None,
             #[cfg(feature = "leaf")]
             hub_credentials: None,
+            #[cfg(feature = "leaf")]
+            hub_remotes: Vec::new(),
             metrics_port: None,
             tls_cert: None,
             tls_key: None,
@@ -991,11 +1019,11 @@ pub(crate) struct ServerState {
     #[cfg(feature = "accounts")]
     pub reverse_imports: Vec<Vec<ReverseImport>>,
     #[cfg(feature = "leaf")]
-    pub upstream: std::sync::RwLock<Option<Upstream>>,
-    /// Lock-free sender for forwarding publishes to the upstream hub.
-    /// Set once after upstream connects; read without locking on every publish.
+    pub upstreams: std::sync::RwLock<Vec<Upstream>>,
+    /// Lock-free senders for forwarding publishes to upstream hubs.
+    /// One entry per connected hub remote. Read without locking on every publish.
     #[cfg(feature = "leaf")]
-    pub upstream_tx: std::sync::RwLock<Option<mpsc::Sender<UpstreamCmd>>>,
+    pub upstream_txs: std::sync::RwLock<Vec<mpsc::Sender<UpstreamCmd>>>,
     /// Lock-free flag: true when at least one subscription exists.
     /// Updated on subscribe/unsubscribe. Avoids taking subs lock on every publish
     /// just to check emptiness.
@@ -1173,9 +1201,9 @@ impl ServerState {
             #[cfg(feature = "accounts")]
             reverse_imports,
             #[cfg(feature = "leaf")]
-            upstream: std::sync::RwLock::new(None),
+            upstreams: std::sync::RwLock::new(Vec::new()),
             #[cfg(feature = "leaf")]
-            upstream_tx: std::sync::RwLock::new(None),
+            upstream_txs: std::sync::RwLock::new(Vec::new()),
             has_subs: AtomicBool::new(false),
             buf_config,
             next_cid: AtomicU64::new(1),
@@ -1383,17 +1411,26 @@ impl LeafServer {
         }
     }
 
-    /// Connect to the upstream hub if configured, using the leaf node protocol.
+    /// Connect to all configured upstream hubs using the leaf node protocol.
     /// Uses a supervisor pattern: initial failure is non-fatal, the supervisor
     /// will keep retrying with exponential backoff.
+    ///
+    /// If `hub_remotes` is non-empty, each remote gets its own connection.
+    /// Otherwise, if the legacy `hub_url` is set, a single remote is
+    /// synthesized from it.
     #[cfg(feature = "leaf")]
     fn connect_upstream(&self) {
-        if let Some(ref hub_url) = self.config.hub_url {
-            info!(url = %hub_url, "connecting to upstream hub (leaf protocol)");
+        let remotes = self.effective_hub_remotes();
+        if remotes.is_empty() {
+            return;
+        }
+
+        for (idx, remote) in remotes.iter().enumerate() {
+            info!(url = %remote.url, idx, "connecting to upstream hub (leaf protocol)");
             #[cfg(feature = "interest-collapse")]
-            let collapse_templates = self.config.interest_collapse.clone();
+            let collapse_templates = remote.interest_collapse.clone();
             #[cfg(feature = "subject-mapping")]
-            let subject_mappings = self.config.subject_mappings.clone();
+            let subject_mappings = remote.subject_mappings.clone();
             let build_pipeline = move || {
                 crate::interest::InterestPipeline::new(
                     #[cfg(feature = "interest-collapse")]
@@ -1404,31 +1441,55 @@ impl LeafServer {
             };
             // Try initial connect synchronously for fast startup
             match Upstream::connect(
-                hub_url,
-                self.config.hub_credentials.as_ref(),
+                &remote.url,
+                remote.credentials.as_ref(),
                 Arc::clone(&self.state),
+                idx,
                 build_pipeline(),
             ) {
                 Ok(upstream) => {
                     let sender = upstream.sender();
-                    *self.state.upstream.write().unwrap() = Some(upstream);
-                    *self.state.upstream_tx.write().unwrap() = Some(sender);
-                    info!("connected to upstream hub");
+                    self.state.upstreams.write().unwrap().push(upstream);
+                    self.state.upstream_txs.write().unwrap().push(sender);
+                    info!(idx, "connected to upstream hub");
                 }
                 Err(e) => {
                     // Initial connect failed — spawn supervisor to keep retrying
-                    warn!(error = %e, "initial hub connection failed, will retry in background");
+                    warn!(idx, error = %e, "initial hub connection failed, will retry in background");
                     let upstream = Upstream::spawn_supervisor(
-                        hub_url.clone(),
-                        self.config.hub_credentials.clone(),
+                        remote.url.clone(),
+                        remote.credentials.clone(),
                         Arc::clone(&self.state),
+                        idx,
                         build_pipeline,
                     );
                     let sender = upstream.sender();
-                    *self.state.upstream.write().unwrap() = Some(upstream);
-                    *self.state.upstream_tx.write().unwrap() = Some(sender);
+                    self.state.upstreams.write().unwrap().push(upstream);
+                    self.state.upstream_txs.write().unwrap().push(sender);
                 }
             }
+        }
+    }
+
+    /// Compute the effective list of hub remotes.
+    ///
+    /// If `hub_remotes` is non-empty, returns a clone. Otherwise synthesizes a
+    /// single `HubRemote` from the legacy `hub_url` / `hub_credentials` fields.
+    #[cfg(feature = "leaf")]
+    fn effective_hub_remotes(&self) -> Vec<HubRemote> {
+        if !self.config.hub_remotes.is_empty() {
+            return self.config.hub_remotes.clone();
+        }
+        match self.config.hub_url {
+            Some(ref url) => vec![HubRemote {
+                url: url.clone(),
+                credentials: self.config.hub_credentials.clone(),
+                #[cfg(feature = "interest-collapse")]
+                interest_collapse: self.config.interest_collapse.clone(),
+                #[cfg(feature = "subject-mapping")]
+                subject_mappings: self.config.subject_mappings.clone(),
+            }],
+            None => Vec::new(),
         }
     }
 
@@ -1997,12 +2058,11 @@ impl LeafServer {
             }
         }
 
-        // Drop upstream
+        // Drop all upstreams
         #[cfg(feature = "leaf")]
         {
-            *self.state.upstream_tx.write().unwrap() = None;
-            let mut upstream = self.state.upstream.write().unwrap();
-            *upstream = None;
+            self.state.upstream_txs.write().unwrap().clear();
+            self.state.upstreams.write().unwrap().clear();
         }
 
         Ok(())

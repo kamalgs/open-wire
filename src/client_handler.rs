@@ -151,9 +151,9 @@ impl ClientHandler {
 
         #[cfg(feature = "leaf")]
         {
-            let mut upstream = wctx.state.upstream.write().unwrap();
-            if let Some(ref mut up) = *upstream {
-                if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue) {
+            let mut upstreams = wctx.state.upstreams.write().unwrap();
+            for up in upstreams.iter_mut() {
+                if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue.clone()) {
                     warn!(error = %e, "failed to add upstream interest");
                 }
             }
@@ -200,8 +200,8 @@ impl ClientHandler {
                         let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                         #[cfg(feature = "leaf")]
                         {
-                            let mut upstream = wctx.state.upstream.write().unwrap();
-                            if let Some(ref mut up) = *upstream {
+                            let mut upstreams = wctx.state.upstreams.write().unwrap();
+                            for up in upstreams.iter_mut() {
                                 let _ = up.add_interest(ri.src_pattern.clone(), None);
                             }
                         }
@@ -272,8 +272,8 @@ impl ClientHandler {
                     *conn.sub_count = conn.sub_count.saturating_sub(1);
                     #[cfg(feature = "leaf")]
                     {
-                        let mut upstream = wctx.state.upstream.write().unwrap();
-                        if let Some(ref mut up) = *upstream {
+                        let mut upstreams = wctx.state.upstreams.write().unwrap();
+                        for up in upstreams.iter_mut() {
                             up.remove_interest(&removed.subject, removed.queue.as_deref());
                         }
                     }
@@ -337,8 +337,8 @@ impl ClientHandler {
                 *conn.sub_count = conn.sub_count.saturating_sub(1);
                 #[cfg(feature = "leaf")]
                 {
-                    let mut upstream = wctx.state.upstream.write().unwrap();
-                    if let Some(ref mut up) = *upstream {
+                    let mut upstreams = wctx.state.upstreams.write().unwrap();
+                    for up in upstreams.iter_mut() {
                         up.remove_interest(&removed.subject, removed.queue.as_deref());
                     }
                 }
@@ -432,7 +432,7 @@ impl ClientHandler {
                 let has_upstream = {
                     #[cfg(feature = "leaf")]
                     {
-                        conn.upstream_tx.is_some()
+                        !conn.upstream_txs.is_empty()
                     }
                     #[cfg(not(feature = "leaf"))]
                     {
@@ -527,7 +527,7 @@ impl ClientHandler {
 
         #[cfg(feature = "leaf")]
         forward_to_upstream(
-            conn.upstream_tx,
+            conn.upstream_txs,
             wctx.state,
             subject,
             respond,
@@ -557,8 +557,8 @@ fn propagate_reverse_unsub(
                 let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                 #[cfg(feature = "leaf")]
                 {
-                    let mut upstream = wctx.state.upstream.write().unwrap();
-                    if let Some(ref mut up) = *upstream {
+                    let mut upstreams = wctx.state.upstreams.write().unwrap();
+                    for up in upstreams.iter_mut() {
                         up.remove_interest(&ri.src_pattern, None);
                     }
                 }
