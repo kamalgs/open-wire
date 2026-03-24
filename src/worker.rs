@@ -276,6 +276,9 @@ pub(crate) struct Worker {
     msgs_received_bytes: u64,
     msgs_delivered: u64,
     msgs_delivered_bytes: u64,
+    /// Worker index within the worker pool (0-based).
+    #[cfg(feature = "worker-affinity")]
+    worker_index: usize,
 }
 
 impl Worker {
@@ -344,6 +347,8 @@ impl Worker {
                     msgs_received_bytes: 0,
                     msgs_delivered: 0,
                     msgs_delivered_bytes: 0,
+                    #[cfg(feature = "worker-affinity")]
+                    worker_index: index,
                 };
                 worker.run();
             })
@@ -2250,6 +2255,8 @@ impl Worker {
                                         msgs_delivered: &mut self.msgs_delivered,
                                         msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
                                         worker_label: &self.worker_label,
+                                        #[cfg(feature = "worker-affinity")]
+                                        worker_index: self.worker_index,
                                     };
                                     LeafHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
@@ -2328,6 +2335,8 @@ impl Worker {
                                         msgs_delivered: &mut self.msgs_delivered,
                                         msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
                                         worker_label: &self.worker_label,
+                                        #[cfg(feature = "worker-affinity")]
+                                        worker_index: self.worker_index,
                                     };
                                     RouteHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
@@ -2406,6 +2415,8 @@ impl Worker {
                                         msgs_delivered: &mut self.msgs_delivered,
                                         msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
                                         worker_label: &self.worker_label,
+                                        #[cfg(feature = "worker-affinity")]
+                                        worker_index: self.worker_index,
                                     };
                                     GatewayHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                                 };
@@ -2517,6 +2528,8 @@ impl Worker {
                                     msgs_delivered: &mut self.msgs_delivered,
                                     msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
                                     worker_label: &self.worker_label,
+                                    #[cfg(feature = "worker-affinity")]
+                                    worker_index: self.worker_index,
                                 };
                                 ClientHandler::handle_op(&mut conn_ctx, &mut worker_ctx, op)
                             };

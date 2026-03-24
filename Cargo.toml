@@ -16,6 +16,7 @@ leaf = []      # Upstream hub connection support
 hub = []       # Inbound leaf node connection support
 cluster = []   # Full mesh route clustering support
 gateway = []   # Gateway inter-cluster traffic support
+worker-affinity = []  # Subject-based worker affinity tracking
 accounts = []  # Multi-tenant per-account subject isolation
 
 [dependencies]

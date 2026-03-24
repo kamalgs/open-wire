@@ -1,4 +1,9 @@
-#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+#[cfg(any(
+    feature = "hub",
+    feature = "cluster",
+    feature = "gateway",
+    feature = "worker-affinity"
+))]
 use std::collections::HashMap;
 #[cfg(any(feature = "cluster", feature = "gateway"))]
 use std::collections::HashSet;
@@ -994,6 +999,96 @@ pub(crate) struct GatewayInterestState {
 #[cfg(feature = "gateway")]
 pub(crate) const GATEWAY_MAX_NI_BEFORE_SWITCH: u64 = 1000;
 
+/// Tracks per-worker subscriber counts by subject first-level prefix.
+///
+/// Workers record subscriptions on SUB and remove them on UNSUB. The map enables
+/// querying which worker hosts the most subscribers for a given subject prefix,
+/// providing infrastructure for future affinity-aware connection placement.
+#[cfg(feature = "worker-affinity")]
+pub(crate) struct AffinityMap {
+    /// subject first-level prefix -> per-worker subscriber counts.
+    /// Vec index = worker_index, value = subscriber count on that worker.
+    prefix_counts: std::sync::RwLock<HashMap<String, Vec<usize>>>,
+    num_workers: usize,
+}
+
+#[cfg(feature = "worker-affinity")]
+impl AffinityMap {
+    /// Create a new affinity map for the given number of workers.
+    pub fn new(num_workers: usize) -> Self {
+        Self {
+            prefix_counts: std::sync::RwLock::new(HashMap::new()),
+            num_workers,
+        }
+    }
+
+    /// Record a subscription on a worker. Extracts first-level prefix from subject.
+    pub fn record_sub(&self, subject: &str, worker_index: usize) {
+        let prefix = match Self::extract_prefix(subject) {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(mut map) = self.prefix_counts.write() {
+            let counts = map
+                .entry(prefix.to_string())
+                .or_insert_with(|| vec![0; self.num_workers]);
+            if worker_index < counts.len() {
+                counts[worker_index] += 1;
+            }
+        }
+    }
+
+    /// Remove a subscription from a worker.
+    pub fn record_unsub(&self, subject: &str, worker_index: usize) {
+        let prefix = match Self::extract_prefix(subject) {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(mut map) = self.prefix_counts.write() {
+            if let Some(counts) = map.get_mut(prefix) {
+                if worker_index < counts.len() {
+                    counts[worker_index] = counts[worker_index].saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    /// Get the preferred worker for a subject (worker with most subs for that prefix).
+    /// Returns `None` if no data or all counts are zero.
+    pub fn preferred_worker(&self, subject: &str) -> Option<usize> {
+        let prefix = Self::extract_prefix(subject)?;
+        let map = match self.prefix_counts.read() {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        let counts = map.get(prefix)?;
+        let mut best_idx = 0;
+        let mut best_count = 0;
+        for (i, &count) in counts.iter().enumerate() {
+            if count > best_count {
+                best_count = count;
+                best_idx = i;
+            }
+        }
+        if best_count == 0 {
+            None
+        } else {
+            Some(best_idx)
+        }
+    }
+
+    /// Extract the first-level prefix from a subject for affinity.
+    /// Returns `None` for bare wildcards `*` or `>`.
+    fn extract_prefix(subject: &str) -> Option<&str> {
+        let first = subject.split('.').next()?;
+        if first == "*" || first == ">" {
+            None
+        } else {
+            Some(first)
+        }
+    }
+}
+
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
@@ -1112,6 +1207,9 @@ pub(crate) struct ServerState {
     /// that need to be forwarded across optimistic gateways.
     #[cfg(feature = "gateway")]
     pub has_gateway_interest: AtomicBool,
+    /// Subject-prefix affinity map for tracking per-worker subscriber distribution.
+    #[cfg(feature = "worker-affinity")]
+    pub affinity: AffinityMap,
 }
 
 impl ServerState {
@@ -1137,6 +1235,7 @@ impl ServerState {
         #[cfg(feature = "gateway")] gateway_name: Option<String>,
         #[cfg(feature = "gateway")] gateway_remotes: Vec<GatewayRemote>,
         #[cfg(feature = "accounts")] accounts: Vec<AccountConfig>,
+        #[cfg(feature = "worker-affinity")] num_workers: usize,
     ) -> Self {
         #[cfg(feature = "cluster")]
         let cluster_self_host = if info.host.is_empty() || info.host == "0.0.0.0" {
@@ -1270,6 +1369,8 @@ impl ServerState {
             gateway_interest: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "gateway")]
             has_gateway_interest: AtomicBool::new(false),
+            #[cfg(feature = "worker-affinity")]
+            affinity: AffinityMap::new(num_workers),
         }
     }
 
@@ -1407,6 +1508,8 @@ impl LeafServer {
                 config.gateway_remotes.clone(),
                 #[cfg(feature = "accounts")]
                 config.accounts.clone(),
+                #[cfg(feature = "worker-affinity")]
+                config.workers.max(1),
             )),
         }
     }
@@ -2727,5 +2830,76 @@ mod tests {
             };
             assert!(auth.validate(&info2).is_none());
         }
+    }
+
+    // --- AffinityMap ---
+
+    #[cfg(feature = "worker-affinity")]
+    #[test]
+    fn affinity_record_sub() {
+        let map = AffinityMap::new(4);
+        map.record_sub("orders.new", 0);
+        map.record_sub("orders.update", 0);
+        map.record_sub("orders.cancel", 2);
+        assert_eq!(map.preferred_worker("orders.fill"), Some(0));
+    }
+
+    #[cfg(feature = "worker-affinity")]
+    #[test]
+    fn affinity_record_unsub() {
+        let map = AffinityMap::new(3);
+        map.record_sub("trades.exec", 1);
+        map.record_sub("trades.exec", 1);
+        map.record_sub("trades.settle", 2);
+        assert_eq!(map.preferred_worker("trades.new"), Some(1));
+
+        map.record_unsub("trades.exec", 1);
+        map.record_unsub("trades.exec", 1);
+        // Worker 2 now has the most for prefix "trades"
+        assert_eq!(map.preferred_worker("trades.new"), Some(2));
+    }
+
+    #[cfg(feature = "worker-affinity")]
+    #[test]
+    fn affinity_wildcard_prefix() {
+        let map = AffinityMap::new(2);
+        map.record_sub("orders.*", 1);
+        assert_eq!(map.preferred_worker("orders.new"), Some(1));
+
+        // Bare wildcards are ignored
+        map.record_sub("*", 0);
+        map.record_sub(">", 0);
+        assert_eq!(map.preferred_worker("*"), None);
+        assert_eq!(map.preferred_worker(">"), None);
+    }
+
+    #[cfg(feature = "worker-affinity")]
+    #[test]
+    fn affinity_no_data() {
+        let map = AffinityMap::new(4);
+        assert_eq!(map.preferred_worker("unknown.subject"), None);
+    }
+
+    #[cfg(feature = "worker-affinity")]
+    #[test]
+    fn affinity_unsub_saturates_at_zero() {
+        let map = AffinityMap::new(2);
+        map.record_sub("foo.bar", 0);
+        map.record_unsub("foo.bar", 0);
+        map.record_unsub("foo.bar", 0); // double unsub should not underflow
+        assert_eq!(map.preferred_worker("foo.x"), None);
+    }
+
+    #[cfg(feature = "worker-affinity")]
+    #[test]
+    fn affinity_extract_prefix() {
+        assert_eq!(
+            AffinityMap::extract_prefix("orders.new.item"),
+            Some("orders")
+        );
+        assert_eq!(AffinityMap::extract_prefix("orders"), Some("orders"));
+        assert_eq!(AffinityMap::extract_prefix("*"), None);
+        assert_eq!(AffinityMap::extract_prefix(">"), None);
+        assert_eq!(AffinityMap::extract_prefix("*.foo"), None);
     }
 }

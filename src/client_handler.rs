@@ -149,6 +149,11 @@ impl ClientHandler {
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
 
+        #[cfg(feature = "worker-affinity")]
+        wctx.state
+            .affinity
+            .record_sub(subject_str, wctx.worker_index);
+
         #[cfg(feature = "leaf")]
         {
             let mut upstreams = wctx.state.upstreams.write().unwrap();
@@ -270,6 +275,10 @@ impl ClientHandler {
                         .has_subs
                         .store(!subs.is_empty(), Ordering::Relaxed);
                     *conn.sub_count = conn.sub_count.saturating_sub(1);
+                    #[cfg(feature = "worker-affinity")]
+                    wctx.state
+                        .affinity
+                        .record_unsub(&removed.subject, wctx.worker_index);
                     #[cfg(feature = "leaf")]
                     {
                         let mut upstreams = wctx.state.upstreams.write().unwrap();
@@ -335,6 +344,10 @@ impl ClientHandler {
 
             if let Some(ref removed) = removed {
                 *conn.sub_count = conn.sub_count.saturating_sub(1);
+                #[cfg(feature = "worker-affinity")]
+                wctx.state
+                    .affinity
+                    .record_unsub(&removed.subject, wctx.worker_index);
                 #[cfg(feature = "leaf")]
                 {
                     let mut upstreams = wctx.state.upstreams.write().unwrap();

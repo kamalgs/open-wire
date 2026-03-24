@@ -130,6 +130,9 @@ pub(crate) struct WorkerCtx<'a> {
     pub msgs_delivered: &'a mut u64,
     pub msgs_delivered_bytes: &'a mut u64,
     pub worker_label: &'a str,
+    /// Worker index within the worker pool (0-based).
+    #[cfg(feature = "worker-affinity")]
+    pub worker_index: usize,
 }
 
 /// Result of handling a single protocol operation.
