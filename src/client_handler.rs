@@ -132,6 +132,8 @@ impl ClientHandler {
             is_gateway: false,
             #[cfg(feature = "accounts")]
             account_id: conn.account_id,
+            #[cfg(feature = "hub")]
+            leaf_perms: None,
         };
 
         {

@@ -168,6 +168,8 @@ impl RouteHandler {
             is_gateway: false,
             #[cfg(feature = "accounts")]
             account_id,
+            #[cfg(feature = "hub")]
+            leaf_perms: None,
         };
 
         {

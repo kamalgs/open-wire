@@ -172,6 +172,55 @@ impl ClientAuth {
     }
 }
 
+/// A leaf node user entry with credentials and optional permissions.
+#[cfg(feature = "hub")]
+#[derive(Debug, Clone)]
+pub struct LeafUserConfig {
+    /// Username.
+    pub user: String,
+    /// Password.
+    pub pass: String,
+    /// Optional per-user permissions.
+    pub permissions: Option<Permissions>,
+}
+
+/// Inbound leaf node authentication configuration.
+#[cfg(feature = "hub")]
+#[derive(Debug, Clone, Default)]
+pub enum LeafAuth {
+    /// No authentication required (default).
+    #[default]
+    None,
+    /// Multi-user with per-user credentials and optional permissions.
+    Users(Vec<LeafUserConfig>),
+}
+
+#[cfg(feature = "hub")]
+impl LeafAuth {
+    /// Returns `true` if authentication is required.
+    pub fn is_required(&self) -> bool {
+        !matches!(self, LeafAuth::None)
+    }
+
+    /// Validate a leaf node's CONNECT info against the configured auth.
+    ///
+    /// Returns `Some(permissions)` on success (`None` inside means no per-user
+    /// permissions), or `None` on auth failure.
+    pub fn validate(&self, info: &ConnectInfo) -> Option<Option<Permissions>> {
+        match self {
+            LeafAuth::None => Some(None),
+            LeafAuth::Users(users) => {
+                let u = info.user.as_deref()?;
+                let p = info.pass.as_deref()?;
+                users
+                    .iter()
+                    .find(|uc| uc.user == u && uc.pass == p)
+                    .map(|uc| uc.permissions.clone())
+            }
+        }
+    }
+}
+
 /// Credentials for connecting to an upstream hub server.
 #[cfg(feature = "leaf")]
 #[derive(Debug, Clone, Default)]
@@ -264,6 +313,9 @@ pub struct LeafServerConfig {
     pub max_pings_outstanding: u32,
     /// Client authentication configuration.
     pub client_auth: ClientAuth,
+    /// Inbound leaf node authentication configuration.
+    #[cfg(feature = "hub")]
+    pub leaf_auth: LeafAuth,
     /// Credentials for connecting to the upstream hub.
     #[cfg(feature = "leaf")]
     pub hub_credentials: Option<HubCredentials>,
@@ -592,6 +644,8 @@ impl Default for LeafServerConfig {
             ping_interval: std::time::Duration::from_secs(120),
             max_pings_outstanding: 2,
             client_auth: ClientAuth::None,
+            #[cfg(feature = "hub")]
+            leaf_auth: LeafAuth::None,
             #[cfg(feature = "leaf")]
             hub_credentials: None,
             metrics_port: None,
@@ -968,8 +1022,13 @@ pub(crate) struct ServerState {
     pub leafnode_port: Option<u16>,
     /// Registry of DirectWriters for inbound leaf connections.
     /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
+    /// Each entry stores the writer and the leaf's optional publish permissions.
     #[cfg(feature = "hub")]
-    pub leaf_writers: std::sync::RwLock<HashMap<u64, DirectWriter>>,
+    #[allow(clippy::type_complexity)]
+    pub leaf_writers: std::sync::RwLock<HashMap<u64, (DirectWriter, Option<Arc<Permissions>>)>>,
+    /// Inbound leaf node authentication configuration.
+    #[cfg(feature = "hub")]
+    pub leaf_auth: LeafAuth,
     /// Registry of DirectWriters for inbound route connections.
     /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
     #[cfg(feature = "cluster")]
@@ -1042,6 +1101,7 @@ impl ServerState {
         max_control_line: usize,
         max_subscriptions: usize,
         #[cfg(feature = "hub")] leafnode_port: Option<u16>,
+        #[cfg(feature = "hub")] leaf_auth: LeafAuth,
         #[cfg(feature = "cluster")] cluster_port: Option<u16>,
         #[cfg(feature = "cluster")] cluster_name: Option<String>,
         #[cfg(feature = "cluster")] cluster_seeds: Vec<String>,
@@ -1130,6 +1190,8 @@ impl ServerState {
             leafnode_port,
             #[cfg(feature = "hub")]
             leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            #[cfg(feature = "hub")]
+            leaf_auth,
             #[cfg(feature = "cluster")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "cluster")]
@@ -1301,6 +1363,8 @@ impl LeafServer {
                 config.max_subscriptions,
                 #[cfg(feature = "hub")]
                 config.leafnode_port,
+                #[cfg(feature = "hub")]
+                config.leaf_auth.clone(),
                 #[cfg(feature = "cluster")]
                 config.cluster_port,
                 #[cfg(feature = "cluster")]
@@ -2483,6 +2547,125 @@ mod tests {
             assert_eq!(ri.src_pattern, "events.>");
             // team_a (idx 1) has no reverse imports
             assert!(reverse[1].is_empty());
+        }
+    }
+
+    // --- LeafAuth tests ---
+    #[cfg(feature = "hub")]
+    mod leaf_auth_tests {
+        use super::*;
+
+        #[test]
+        fn leaf_auth_none_always_passes() {
+            let auth = LeafAuth::None;
+            assert!(!auth.is_required());
+            let info = ConnectInfo::default();
+            let result = auth.validate(&info);
+            assert!(result.is_some());
+            assert!(result.unwrap().is_none()); // no permissions
+        }
+
+        #[test]
+        fn leaf_auth_users_valid() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".into(),
+                pass: "secret".into(),
+                permissions: None,
+            }]);
+            assert!(auth.is_required());
+            let info = ConnectInfo {
+                user: Some("leaf1".into()),
+                pass: Some("secret".into()),
+                ..Default::default()
+            };
+            let result = auth.validate(&info);
+            assert!(result.is_some());
+            assert!(result.unwrap().is_none()); // no per-user perms
+        }
+
+        #[test]
+        fn leaf_auth_users_invalid_pass() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".into(),
+                pass: "secret".into(),
+                permissions: None,
+            }]);
+            let info = ConnectInfo {
+                user: Some("leaf1".into()),
+                pass: Some("wrong".into()),
+                ..Default::default()
+            };
+            assert!(auth.validate(&info).is_none());
+        }
+
+        #[test]
+        fn leaf_auth_users_missing_user() {
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".into(),
+                pass: "secret".into(),
+                permissions: None,
+            }]);
+            let info = ConnectInfo::default();
+            assert!(auth.validate(&info).is_none());
+        }
+
+        #[test]
+        fn leaf_auth_users_with_permissions() {
+            let perms = Permissions {
+                publish: Permission {
+                    allow: vec!["events.>".to_string()],
+                    deny: vec!["events.secret".to_string()],
+                },
+                subscribe: Permission {
+                    allow: vec!["data.>".to_string()],
+                    deny: Vec::new(),
+                },
+            };
+            let auth = LeafAuth::Users(vec![LeafUserConfig {
+                user: "leaf1".into(),
+                pass: "secret".into(),
+                permissions: Some(perms.clone()),
+            }]);
+            let info = ConnectInfo {
+                user: Some("leaf1".into()),
+                pass: Some("secret".into()),
+                ..Default::default()
+            };
+            let result = auth.validate(&info);
+            assert!(result.is_some());
+            let p = result.unwrap().unwrap();
+            assert!(p.publish.is_allowed("events.foo"));
+            assert!(!p.publish.is_allowed("events.secret"));
+            assert!(p.subscribe.is_allowed("data.bar"));
+            assert!(!p.subscribe.is_allowed("other.bar"));
+        }
+
+        #[test]
+        fn leaf_auth_users_multiple() {
+            let auth = LeafAuth::Users(vec![
+                LeafUserConfig {
+                    user: "leaf1".into(),
+                    pass: "p1".into(),
+                    permissions: None,
+                },
+                LeafUserConfig {
+                    user: "leaf2".into(),
+                    pass: "p2".into(),
+                    permissions: None,
+                },
+            ]);
+            let info1 = ConnectInfo {
+                user: Some("leaf2".into()),
+                pass: Some("p2".into()),
+                ..Default::default()
+            };
+            assert!(auth.validate(&info1).is_some());
+            let info2 = ConnectInfo {
+                user: Some("leaf3".into()),
+                pass: Some("p3".into()),
+                ..Default::default()
+            };
+            assert!(auth.validate(&info2).is_none());
         }
     }
 }

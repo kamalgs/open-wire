@@ -213,6 +213,10 @@ pub struct Subscription {
     /// Account this subscription belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     pub account_id: crate::server::AccountId,
+    /// Per-leaf publish permissions. Used during delivery to filter messages
+    /// that the leaf is not allowed to receive (subscribe permission check).
+    #[cfg(feature = "hub")]
+    pub leaf_perms: Option<std::sync::Arc<crate::server::Permissions>>,
 }
 
 impl Clone for Subscription {
@@ -233,6 +237,8 @@ impl Clone for Subscription {
             is_gateway: self.is_gateway,
             #[cfg(feature = "accounts")]
             account_id: self.account_id,
+            #[cfg(feature = "hub")]
+            leaf_perms: self.leaf_perms.clone(),
         }
     }
 }
@@ -258,6 +264,8 @@ impl Subscription {
             is_gateway: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            #[cfg(feature = "hub")]
+            leaf_perms: None,
         }
     }
 }

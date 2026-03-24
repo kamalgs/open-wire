@@ -134,6 +134,8 @@ impl GatewayHandler {
             is_gateway: true,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            #[cfg(feature = "hub")]
+            leaf_perms: None,
         };
 
         {
