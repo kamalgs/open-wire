@@ -91,16 +91,15 @@ impl Upstream {
     ///
     /// Performs the INFO/CONNECT/PING/PONG handshake, then spawns background
     /// threads that read from the hub and write commands batched together.
+    /// The caller is responsible for storing the sender in server state.
     pub(crate) fn connect(
         hub_url: &str,
         config_creds: Option<&HubCredentials>,
         state: Arc<ServerState>,
+        _idx: usize,
         pipeline: InterestPipeline,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (cmd_tx, stream_shutdown) = connect_and_run(hub_url, config_creds, &state, &pipeline)?;
-
-        // Store the sender in server state for workers
-        *state.upstream_tx.write().unwrap() = Some(cmd_tx.clone());
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -115,10 +114,12 @@ impl Upstream {
 
     /// Spawn a supervisor that connects to the hub with automatic reconnection.
     /// Initial connection failure is non-fatal — the supervisor keeps retrying.
+    /// `idx` is this upstream's slot index in the global `upstream_txs` Vec.
     pub(crate) fn spawn_supervisor<F>(
         hub_url: String,
         config_creds: Option<HubCredentials>,
         state: Arc<ServerState>,
+        idx: usize,
         build_pipeline: F,
     ) -> Self
     where
@@ -131,7 +132,7 @@ impl Upstream {
         let supervisor_state = Arc::clone(&state);
         let supervisor_tx = cmd_tx.clone();
         std::thread::Builder::new()
-            .name("upstream-supervisor".into())
+            .name(format!("upstream-supervisor-{idx}"))
             .spawn(move || {
                 run_supervisor(
                     hub_url,
@@ -140,6 +141,7 @@ impl Upstream {
                     supervisor_shutdown,
                     supervisor_tx,
                     cmd_rx,
+                    idx,
                     &build_pipeline,
                 );
             })
@@ -367,6 +369,7 @@ fn connect_and_run(
 /// Supervisor loop: connects to hub, re-connects on failure with backoff.
 /// Forwards subscribe/unsubscribe/publish commands from `supervisor_rx` to the
 /// active connection's cmd_tx when connected, drops them when disconnected.
+#[allow(clippy::too_many_arguments)]
 fn run_supervisor(
     hub_url: String,
     config_creds: Option<HubCredentials>,
@@ -374,6 +377,7 @@ fn run_supervisor(
     shutdown: Arc<AtomicBool>,
     _supervisor_tx: mpsc::Sender<UpstreamCmd>,
     _supervisor_rx: mpsc::Receiver<UpstreamCmd>,
+    idx: usize,
     build_pipeline: &dyn Fn() -> InterestPipeline,
 ) {
     let mut backoff = Backoff::new(Duration::from_millis(250), Duration::from_secs(30));
@@ -390,8 +394,13 @@ fn run_supervisor(
                 backoff.reset();
                 info!("connected to upstream hub");
 
-                // Update the global upstream_tx so workers send to this connection.
-                *state.upstream_tx.write().unwrap() = Some(cmd_tx.clone());
+                // Update this slot in the global upstream_txs so workers send to this connection.
+                {
+                    let mut txs = state.upstream_txs.write().unwrap();
+                    if idx < txs.len() {
+                        txs[idx] = cmd_tx.clone();
+                    }
+                }
 
                 // Wait until the connection drops. We detect this by trying to
                 // send periodic pings. The reader thread will shut down the writer
@@ -409,8 +418,7 @@ fn run_supervisor(
                     }
                 }
 
-                warn!("upstream hub connection lost, will reconnect");
-                *state.upstream_tx.write().unwrap() = None;
+                warn!(idx, "upstream hub connection lost, will reconnect");
             }
             Err(e) => {
                 warn!(error = %e, "failed to connect to upstream hub");

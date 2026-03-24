@@ -147,9 +147,9 @@ impl LeafHandler {
 
         #[cfg(feature = "leaf")]
         {
-            let mut upstream = wctx.state.upstream.write().unwrap();
-            if let Some(ref mut up) = *upstream {
-                if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue) {
+            let mut upstreams = wctx.state.upstreams.write().unwrap();
+            for up in upstreams.iter_mut() {
+                if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue.clone()) {
                     warn!(error = %e, "failed to add upstream interest for leaf sub");
                 }
             }
@@ -227,8 +227,8 @@ impl LeafHandler {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
             #[cfg(feature = "leaf")]
             {
-                let mut upstream = wctx.state.upstream.write().unwrap();
-                if let Some(ref mut up) = *upstream {
+                let mut upstreams = wctx.state.upstreams.write().unwrap();
+                for up in upstreams.iter_mut() {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }
             }
@@ -336,7 +336,7 @@ impl LeafHandler {
 
         #[cfg(feature = "leaf")]
         forward_to_upstream(
-            conn.upstream_tx,
+            conn.upstream_txs,
             wctx.state,
             subject,
             reply,
