@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::collections::HashMap;
 
 #[cfg(feature = "subject-mapping")]
-use crate::sub_list::subject_matches;
+use crate::infra::sub_list::subject_matches;
 
 /// A subject mapping rule: rewrite subjects matching `from` pattern to `to` pattern.
 ///
@@ -275,7 +275,7 @@ impl InterestPipeline {
 /// → key `app.node1.sessions.>`
 #[cfg(feature = "interest-collapse")]
 fn collapse_key(subject: &str, templates: &[String]) -> Option<String> {
-    use crate::sub_list::subject_matches;
+    use crate::infra::sub_list::subject_matches;
 
     for template in templates {
         if !subject_matches(template, subject) {

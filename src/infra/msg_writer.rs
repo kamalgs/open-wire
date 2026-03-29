@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::BytesMut;
 
-use crate::nats_proto::MsgBuilder;
-use crate::types::HeaderMap;
+use crate::infra::nats_proto::MsgBuilder;
+use crate::infra::types::HeaderMap;
 
 /// Create a Linux eventfd for notification.
 pub(crate) fn create_eventfd() -> OwnedFd {

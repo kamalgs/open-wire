@@ -21,8 +21,8 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 
 #[cfg(any(feature = "leaf", feature = "hub"))]
-use crate::types::ServerInfo;
-use crate::types::{ConnectInfo, HeaderMap};
+use crate::infra::types::ServerInfo;
+use crate::infra::types::{ConnectInfo, HeaderMap};
 
 // ────────────────────────────────────────────────────────────────────────────
 // Itoa: format integers as decimal ASCII bytes.

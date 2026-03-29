@@ -22,15 +22,15 @@ use std::time::Instant;
 use metrics::counter;
 use tracing::{error, info, warn};
 
-use crate::types::{ConnectInfo, ServerInfo};
+use crate::infra::types::{ConnectInfo, ServerInfo};
 
-use crate::buf::BufConfig;
+use crate::infra::buf::BufConfig;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-use crate::sub_list::MsgWriter;
-use crate::sub_list::SubscriptionManager;
+use crate::infra::sub_list::MsgWriter;
+use crate::infra::sub_list::SubscriptionManager;
+use crate::infra::worker::{Worker, WorkerHandle};
 #[cfg(feature = "leaf")]
-use crate::upstream::{Upstream, UpstreamCmd};
-use crate::worker::{Worker, WorkerHandle};
+use crate::leaf::{Upstream, UpstreamCmd};
 
 /// An open-wire NATS-compatible message relay server.
 ///
@@ -135,7 +135,7 @@ pub struct LeafServerConfig {
     /// before sending upstream. Supports prefix mappings (`local.>` → `prod.>`) and
     /// exact mappings.
     #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
-    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
+    pub subject_mappings: Vec<crate::leaf::SubjectMapping>,
     /// Port for cluster route connections. When set, the server listens for
     /// inbound route connections and participates in full mesh clustering.
     #[cfg(feature = "cluster")]
@@ -303,7 +303,7 @@ pub struct HubRemote {
     pub interest_collapse: Vec<String>,
     /// Subject mapping rules for this remote.
     #[cfg(feature = "subject-mapping")]
-    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
+    pub subject_mappings: Vec<crate::leaf::SubjectMapping>,
 }
 
 /// Per-subject permission rule with allow/deny lists.
@@ -322,7 +322,7 @@ impl Permission {
         if self
             .deny
             .iter()
-            .any(|p| crate::sub_list::subject_matches(p, subject))
+            .any(|p| crate::infra::sub_list::subject_matches(p, subject))
         {
             return false;
         }
@@ -331,7 +331,7 @@ impl Permission {
         }
         self.allow
             .iter()
-            .any(|p| crate::sub_list::subject_matches(p, subject))
+            .any(|p| crate::infra::sub_list::subject_matches(p, subject))
     }
 }
 
@@ -627,8 +627,8 @@ pub(crate) fn resolve_cross_account_routes(
             }
             let src_acct = &accounts[src_acct_idx];
             let matching_export = src_acct.exports.iter().find(|e| {
-                crate::sub_list::subject_matches(&e.subject, &import.subject)
-                    || crate::sub_list::subject_matches(&import.subject, &e.subject)
+                crate::infra::sub_list::subject_matches(&e.subject, &import.subject)
+                    || crate::infra::sub_list::subject_matches(&import.subject, &e.subject)
             });
             let export_pattern = match matching_export {
                 Some(e) => e.subject.clone(),
@@ -1346,7 +1346,7 @@ impl ServerState {
                 }
                 // Add all configured seeds
                 for seed in &cluster_seeds {
-                    known_urls.insert(crate::route_conn::normalize_route_url(seed));
+                    known_urls.insert(crate::cluster::normalize_route_url(seed));
                 }
                 Mutex::new(RoutePeerRegistry {
                     connected: HashMap::new(),
@@ -1537,7 +1537,7 @@ impl LeafServer {
             #[cfg(feature = "subject-mapping")]
             let subject_mappings = remote.subject_mappings.clone();
             let build_pipeline = move || {
-                crate::interest::InterestPipeline::new(
+                crate::leaf::InterestPipeline::new(
                     #[cfg(feature = "interest-collapse")]
                     collapse_templates.clone(),
                     #[cfg(feature = "subject-mapping")]
@@ -1713,7 +1713,7 @@ impl LeafServer {
         #[cfg(feature = "cluster")]
         let _route_mgr = if !self.state.cluster_seeds.is_empty() {
             info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
-            Some(crate::route_conn::RouteConnManager::spawn(Arc::clone(
+            Some(crate::cluster::RouteConnManager::spawn(Arc::clone(
                 &self.state,
             )))
         } else {
@@ -1776,7 +1776,7 @@ impl LeafServer {
         #[cfg(feature = "gateway")]
         let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
             info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
-            Some(crate::gateway_conn::GatewayConnManager::spawn(Arc::clone(
+            Some(crate::gateway::GatewayConnManager::spawn(Arc::clone(
                 &self.state,
             )))
         } else {
@@ -1928,7 +1928,7 @@ impl LeafServer {
         #[cfg(feature = "cluster")]
         let _route_mgr = if !self.state.cluster_seeds.is_empty() {
             info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
-            Some(crate::route_conn::RouteConnManager::spawn(Arc::clone(
+            Some(crate::cluster::RouteConnManager::spawn(Arc::clone(
                 &self.state,
             )))
         } else {
@@ -1996,7 +1996,7 @@ impl LeafServer {
         #[cfg(feature = "gateway")]
         let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
             info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
-            Some(crate::gateway_conn::GatewayConnManager::spawn(Arc::clone(
+            Some(crate::gateway::GatewayConnManager::spawn(Arc::clone(
                 &self.state,
             )))
         } else {
@@ -2176,7 +2176,7 @@ impl LeafServer {
     /// Reload configuration from file. Updates hot-reloadable values.
     fn reload_config(&self, path: &str) {
         info!(path, "reloading configuration");
-        match crate::config::load_config(std::path::Path::new(path)) {
+        match crate::infra::config::load_config(std::path::Path::new(path)) {
             Ok(new_config) => {
                 // Hot-reload numeric limits
                 self.state

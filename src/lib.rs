@@ -4,44 +4,36 @@
 //! Routes messages between local clients, optionally bridges traffic to an
 //! upstream NATS hub, and can form full-mesh clusters with peer nodes.
 
-pub(crate) mod buf;
-pub mod config;
-#[cfg(feature = "leaf")]
-pub(crate) mod interest;
-#[cfg(feature = "leaf")]
-pub(crate) mod leaf_conn;
-pub(crate) mod msg_writer;
-pub mod nats_proto;
-pub mod server;
-pub mod sub_list;
-pub mod types;
-#[cfg(feature = "leaf")]
-pub(crate) mod upstream;
-pub(crate) mod websocket;
-pub(crate) mod worker;
+// Internal module visibility is controlled at the item level within each module.
+// Modules are `pub` to allow re-exports from lib.rs; internal items use `pub(crate)`.
+pub mod infra;
 
-pub(crate) mod client_handler;
-#[cfg(feature = "gateway")]
-pub(crate) mod gateway_conn;
-#[cfg(feature = "gateway")]
-pub(crate) mod gateway_handler;
 pub(crate) mod handler;
-#[cfg(feature = "hub")]
-pub(crate) mod leaf_handler;
-pub(crate) mod propagation;
-#[cfg(feature = "cluster")]
-pub(crate) mod route_conn;
-#[cfg(feature = "cluster")]
-pub(crate) mod route_handler;
 
-#[cfg(all(feature = "leaf", feature = "subject-mapping"))]
-pub use interest::SubjectMapping;
+#[cfg(feature = "cluster")]
+pub(crate) mod cluster;
 #[cfg(feature = "gateway")]
-pub use server::GatewayRemote;
+pub(crate) mod gateway;
+#[cfg(any(feature = "leaf", feature = "hub"))]
+pub mod leaf;
+
+// Public re-exports for external consumers (main.rs, tests, benchmarks).
+pub use infra::config;
+pub use infra::nats_proto;
+pub use infra::server;
+pub use infra::sub_list;
+pub use infra::types;
+
+#[cfg(feature = "gateway")]
+pub use infra::server::GatewayRemote;
 #[cfg(feature = "leaf")]
-pub use server::HubCredentials;
+pub use infra::server::HubCredentials;
 #[cfg(feature = "leaf")]
-pub use server::HubRemote;
+pub use infra::server::HubRemote;
 #[cfg(feature = "accounts")]
-pub use server::{AccountConfig, AccountId, AccountRegistry};
-pub use server::{ClientAuth, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig};
+pub use infra::server::{AccountConfig, AccountId, AccountRegistry};
+pub use infra::server::{
+    ClientAuth, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig,
+};
+#[cfg(all(feature = "leaf", feature = "subject-mapping"))]
+pub use leaf::SubjectMapping;

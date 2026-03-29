@@ -14,27 +14,38 @@ Built with raw epoll, zero-copy parsing, and no async runtime.
 ```
 src/
 ├── main.rs              # CLI binary (--port, --hub, --ws-port, --workers, --cluster-*)
-├── lib.rs               # Public API: LeafServer, LeafServerConfig
-├── config.rs            # Go nats-server .conf file parser
-├── server.rs            # Accept loop, worker spawning, shutdown
-├── worker.rs            # Per-thread epoll event loop, connection state machine
-├── nats_proto.rs        # Zero-copy protocol parser + MsgBuilder
-├── sub_list.rs          # SubscriptionManager (exact + wildcard subscription matching)
-├── msg_writer.rs        # MsgWriter: shared buffer + eventfd cross-worker delivery
-├── handler.rs           # Shared handler types, ConnExt, deliver_to_subs
-├── propagation.rs       # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
-├── client_handler.rs    # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
-├── leaf_handler.rs      # Inbound leaf protocol dispatch (LS+/LS-/LMSG) [hub]
-├── leaf_conn.rs         # LeafConn, LeafReader, LeafWriter, HubStream [leaf]
-├── upstream.rs          # Hub connection via leaf node protocol [leaf]
-├── interest.rs          # InterestPipeline: subject mapping + interest collapse [leaf]
-├── route_handler.rs     # Route protocol dispatch (RS+/RS-/RMSG) [cluster]
-├── route_conn.rs        # Outbound route connection manager [cluster]
-├── gateway_handler.rs   # Gateway protocol dispatch (RS+/RS-/RMSG) [gateway]
-├── gateway_conn.rs      # Outbound gateway connection manager [gateway]
-├── buf.rs               # AdaptiveBuf, BufConfig, ServerConn (test-only)
-├── websocket.rs         # HTTP upgrade handshake, WS frame codec
-└── types.rs             # ServerInfo, ConnectInfo, HeaderMap
+├── lib.rs               # Module declarations + public re-exports
+├── infra/               # Shared infrastructure
+│   ├── mod.rs           # Facade re-exports
+│   ├── server.rs        # LeafServer, ServerState, accept loop
+│   ├── worker.rs        # N-worker epoll reactor
+│   ├── config.rs        # Go nats-server .conf file parser
+│   ├── nats_proto.rs    # Zero-copy protocol parser + MsgBuilder
+│   ├── sub_list.rs      # SubscriptionManager (exact + wildcard matching)
+│   ├── msg_writer.rs    # MsgWriter: cross-worker delivery via eventfd
+│   ├── buf.rs           # AdaptiveBuf, BufConfig, Backoff
+│   ├── types.rs         # ServerInfo, ConnectInfo, HeaderMap
+│   └── websocket.rs     # HTTP upgrade handshake, WS frame codec
+├── handler/             # Handler framework + client protocol + propagation
+│   ├── mod.rs           # Facade re-exports
+│   ├── conn.rs          # ConnectionHandler trait, ConnCtx, ConnExt
+│   ├── delivery.rs      # Msg, deliver_to_subs, publish
+│   ├── client.rs        # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
+│   └── propagation.rs   # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
+├── cluster/             # Full-mesh clustering [feature = "cluster"]
+│   ├── mod.rs           # Facade re-exports
+│   ├── conn.rs          # Outbound route connection manager
+│   └── handler.rs       # Route protocol dispatch (RS+/RS-/RMSG)
+├── gateway/             # Gateway inter-cluster traffic [feature = "gateway"]
+│   ├── mod.rs           # Facade re-exports
+│   ├── conn.rs          # Outbound gateway connection manager
+│   └── handler.rs       # Gateway protocol dispatch (RS+/RS-/RMSG)
+└── leaf/                # Leaf node + hub connection [features "leaf"/"hub"]
+    ├── mod.rs           # Facade re-exports (per-submodule feature gates)
+    ├── conn.rs          # LeafConn, LeafReader, LeafWriter, HubStream
+    ├── handler.rs       # Inbound leaf protocol dispatch (LS+/LS-/LMSG)
+    ├── upstream.rs      # Hub connection via leaf node protocol
+    └── interest.rs      # InterestPipeline: subject mapping + interest collapse
 examples/
 └── chat/            # Sample chat app (HTML + README)
 tests/
@@ -166,22 +177,23 @@ Always run `cargo +nightly fmt` before committing.
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `LeafServer` | `lib.rs` | Public API entry point |
-| `LeafServerConfig` | `lib.rs` | Server configuration |
-| `load_config` | `config.rs` | Go nats-server `.conf` file parser |
-| `Worker` | `worker.rs` | Per-thread epoll event loop |
-| `NatsProto` / `MsgBuilder` | `nats_proto.rs` | Protocol parser + message builder |
-| `SubscriptionManager` | `sub_list.rs` | Subscription storage + wildcard matching |
-| `MsgWriter` | `msg_writer.rs` | Shared buffer + eventfd cross-worker delivery |
-| `ServerConn` | `buf.rs` | Connection I/O wrapper (test-only) |
-| `LeafConn` | `leaf_conn.rs` | Leaf connection I/O wrapper |
-| `AdaptiveBuf` | `buf.rs` | Dynamic read buffer |
-| `Upstream` | `upstream.rs` | Hub connection management |
-| `InterestPipeline` | `interest.rs` | Subject mapping + interest collapse |
-| `RouteHandler` | `route_handler.rs` | Route protocol dispatch (`cluster`) |
-| `RouteConnManager` | `route_conn.rs` | Outbound route connections (`cluster`) |
-| `GatewayHandler` | `gateway_handler.rs` | Gateway protocol dispatch (`gateway`) |
-| `GatewayConnManager` | `gateway_conn.rs` | Outbound gateway connections (`gateway`) |
+| `LeafServer` | `infra/server.rs` | Public API entry point |
+| `LeafServerConfig` | `infra/server.rs` | Server configuration |
+| `load_config` | `infra/config.rs` | Go nats-server `.conf` file parser |
+| `Worker` | `infra/worker.rs` | Per-thread epoll event loop |
+| `NatsProto` / `MsgBuilder` | `infra/nats_proto.rs` | Protocol parser + message builder |
+| `SubscriptionManager` | `infra/sub_list.rs` | Subscription storage + wildcard matching |
+| `MsgWriter` | `infra/msg_writer.rs` | Shared buffer + eventfd cross-worker delivery |
+| `ServerConn` | `infra/buf.rs` | Connection I/O wrapper (test-only) |
+| `Backoff` | `infra/buf.rs` | Exponential backoff with jitter |
+| `AdaptiveBuf` | `infra/buf.rs` | Dynamic read buffer |
+| `LeafConn` | `leaf/conn.rs` | Leaf connection I/O wrapper |
+| `Upstream` | `leaf/upstream.rs` | Hub connection management |
+| `InterestPipeline` | `leaf/interest.rs` | Subject mapping + interest collapse |
+| `RouteHandler` | `cluster/handler.rs` | Route protocol dispatch (`cluster`) |
+| `RouteConnManager` | `cluster/conn.rs` | Outbound route connections (`cluster`) |
+| `GatewayHandler` | `gateway/handler.rs` | Gateway protocol dispatch (`gateway`) |
+| `GatewayConnManager` | `gateway/conn.rs` | Outbound gateway connections (`gateway`) |
 
 ## Feature Flags
 

@@ -8,11 +8,11 @@ use std::io;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::server::Permissions;
-use crate::sub_list::MsgWriter;
+use crate::infra::server::Permissions;
+use crate::infra::sub_list::MsgWriter;
 
 #[cfg(feature = "leaf")]
-use crate::upstream::UpstreamCmd;
+use crate::leaf::UpstreamCmd;
 #[cfg(feature = "leaf")]
 use std::sync::mpsc;
 
@@ -59,7 +59,7 @@ pub(crate) struct ConnCtx<'a> {
     pub draining: bool,
     /// Account this connection belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
-    pub account_id: crate::server::AccountId,
+    pub account_id: crate::infra::server::AccountId,
 }
 
 /// Per-connection extension state, replacing the flat `ConnectionKind` enum

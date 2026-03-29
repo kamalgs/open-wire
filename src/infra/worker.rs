@@ -18,29 +18,29 @@ use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "cluster")]
-use crate::buf::RouteOp;
-use crate::buf::{AdaptiveBuf, ClientOp};
-use crate::client_handler::ClientHandler;
+use crate::cluster::RouteHandler;
 #[cfg(feature = "gateway")]
-use crate::gateway_handler::GatewayHandler;
+use crate::gateway::GatewayHandler;
+use crate::handler::client::ClientHandler;
+#[cfg(any(feature = "cluster", feature = "gateway"))]
+use crate::handler::propagation::send_existing_route_subs;
+#[cfg(feature = "hub")]
+use crate::handler::propagation::send_existing_subs;
 use crate::handler::{
     handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult,
     MessageDeliveryHub,
 };
-#[cfg(feature = "hub")]
-use crate::leaf_handler::LeafHandler;
-use crate::nats_proto;
-#[cfg(any(feature = "cluster", feature = "gateway"))]
-use crate::propagation::send_existing_route_subs;
-#[cfg(feature = "hub")]
-use crate::propagation::send_existing_subs;
 #[cfg(feature = "cluster")]
-use crate::route_handler::RouteHandler;
-use crate::server::ServerState;
-use crate::sub_list::{create_eventfd, MsgWriter};
+use crate::infra::buf::RouteOp;
+use crate::infra::buf::{AdaptiveBuf, ClientOp};
+use crate::infra::nats_proto;
+use crate::infra::server::ServerState;
+use crate::infra::sub_list::{create_eventfd, MsgWriter};
+use crate::infra::websocket::{self, DecodeStatus, WsCodec};
+#[cfg(feature = "hub")]
+use crate::leaf::LeafHandler;
 #[cfg(feature = "leaf")]
-use crate::upstream::UpstreamCmd;
-use crate::websocket::{self, DecodeStatus, WsCodec};
+use crate::leaf::UpstreamCmd;
 
 use rustls::ServerConnection;
 
@@ -275,10 +275,10 @@ pub(crate) struct ClientState {
     /// Number of active subscriptions for this connection.
     pub(crate) sub_count: usize,
     /// Per-user permissions (set after CONNECT for Users auth).
-    permissions: Option<crate::server::Permissions>,
+    permissions: Option<crate::infra::server::Permissions>,
     /// Account this connection belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
-    account_id: crate::server::AccountId,
+    account_id: crate::infra::server::AccountId,
 }
 
 impl ClientState {
@@ -716,7 +716,7 @@ impl Worker {
 
     #[cfg(feature = "cluster")]
     fn add_route_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        let info = crate::route_conn::build_route_info(&self.state);
+        let info = crate::cluster::build_route_info(&self.state);
         self.register_conn(
             id,
             stream,
@@ -732,7 +732,7 @@ impl Worker {
 
     #[cfg(feature = "gateway")]
     fn add_gateway_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        let info = crate::gateway_conn::get_gateway_info(&self.state);
+        let info = crate::gateway::get_gateway_info(&self.state);
         self.register_conn(
             id,
             stream,
@@ -1811,10 +1811,7 @@ impl Worker {
                 Some(RouteOp::Info(peer_info)) => {
                     // Process gossip connect_urls from peer's INFO.
                     if !peer_info.connect_urls.is_empty() {
-                        crate::route_conn::process_gossip_urls(
-                            &self.state,
-                            &peer_info.connect_urls,
-                        );
+                        crate::cluster::process_gossip_urls(&self.state, &peer_info.connect_urls);
                     }
                     return true; // continue
                 }
@@ -1868,7 +1865,7 @@ impl Worker {
                     send_existing_route_subs(&self.state, &client.direct_writer);
 
                     // Broadcast updated INFO to all routes (gossip re-broadcast).
-                    crate::route_conn::broadcast_route_info(&self.state);
+                    crate::cluster::broadcast_route_info(&self.state);
 
                     info!(conn_id, "inbound route connected");
                 }
@@ -1974,7 +1971,7 @@ impl Worker {
                     send_existing_route_subs(&self.state, &client.direct_writer);
 
                     // Broadcast updated INFO to all gateways (gossip).
-                    crate::gateway_conn::broadcast_gateway_info(&self.state);
+                    crate::gateway::broadcast_gateway_info(&self.state);
 
                     info!(
                         conn_id,

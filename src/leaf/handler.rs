@@ -10,14 +10,14 @@ use tracing::debug;
 #[cfg(feature = "leaf")]
 use tracing::warn;
 
-use crate::buf::LeafOp;
+use crate::handler::propagation::propagate_route_gateway_interest;
 use crate::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
-use crate::nats_proto;
-use crate::propagation::propagate_route_gateway_interest;
-use crate::sub_list::Subscription;
+use crate::infra::buf::LeafOp;
+use crate::infra::nats_proto;
+use crate::infra::sub_list::Subscription;
 
 /// Handles leaf node protocol operations (LS+, LS-, LMSG, PING, PONG).
 pub(crate) struct LeafHandler;
@@ -251,7 +251,7 @@ impl LeafHandler {
         wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         reply: Option<Bytes>,
-        headers: Option<crate::types::HeaderMap>,
+        headers: Option<crate::infra::types::HeaderMap>,
         payload: Bytes,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         let payload_len = payload.len() as u64;

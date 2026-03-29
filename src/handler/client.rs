@@ -8,13 +8,13 @@ use bytes::Bytes;
 use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
+use crate::handler::propagation::propagate_all_interest;
 use crate::handler::{
     bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
-use crate::nats_proto::{self, ClientOp};
-use crate::propagation::propagate_all_interest;
-use crate::sub_list::Subscription;
+use crate::infra::nats_proto::{self, ClientOp};
+use crate::infra::sub_list::Subscription;
 
 /// Handles client protocol operations (PUB, SUB, UNSUB, PING, PONG).
 pub(crate) struct ClientHandler;
@@ -179,7 +179,7 @@ impl ClientHandler {
         {
             if let Some(reverses) = wctx.state.reverse_imports.get(conn.account_id as usize) {
                 for ri in reverses {
-                    if crate::sub_list::subject_matches(&ri.local_pattern, subject_str) {
+                    if crate::infra::sub_list::subject_matches(&ri.local_pattern, subject_str) {
                         let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                         #[cfg(feature = "leaf")]
                         {
@@ -284,7 +284,7 @@ impl ClientHandler {
         subject: Bytes,
         payload: Bytes,
         respond: Option<Bytes>,
-        headers: Option<crate::types::HeaderMap>,
+        headers: Option<crate::infra::types::HeaderMap>,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         // Check publish permissions
         if let Some(ref perms) = conn.permissions {
@@ -347,7 +347,7 @@ impl ClientHandler {
 
                     if !has_sub {
                         // Build 503 No Responders header and deliver to reply subject.
-                        let mut hdr = crate::types::HeaderMap::new();
+                        let mut hdr = crate::infra::types::HeaderMap::new();
                         hdr.set_status(503, None);
                         let reply_str = bytes_to_str(reply_bytes);
                         let empty = Bytes::new();
@@ -436,12 +436,12 @@ fn cleanup_removed_sub(
 #[cfg(feature = "accounts")]
 fn propagate_reverse_unsub(
     wctx: &mut MessageDeliveryHub<'_>,
-    account_id: crate::server::AccountId,
+    account_id: crate::infra::server::AccountId,
     subject: &str,
 ) {
     if let Some(reverses) = wctx.state.reverse_imports.get(account_id as usize) {
         for ri in reverses {
-            if crate::sub_list::subject_matches(&ri.local_pattern, subject) {
+            if crate::infra::sub_list::subject_matches(&ri.local_pattern, subject) {
                 let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                 #[cfg(feature = "leaf")]
                 {

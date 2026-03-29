@@ -8,15 +8,15 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
-use crate::buf::RouteOp;
+#[cfg(feature = "gateway")]
+use crate::handler::propagation::propagate_gateway_interest;
 use crate::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
-use crate::nats_proto;
-#[cfg(feature = "gateway")]
-use crate::propagation::propagate_gateway_interest;
-use crate::sub_list::Subscription;
+use crate::infra::buf::RouteOp;
+use crate::infra::nats_proto;
+use crate::infra::sub_list::Subscription;
 
 /// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct RouteHandler;
@@ -112,7 +112,7 @@ impl ConnectionHandler for RouteHandler {
                     let mut peers = wctx.state.route_peers.lock().unwrap();
                     let tx = wctx.state.route_connect_tx.lock().unwrap();
                     for url in &info.connect_urls {
-                        let normalized = crate::route_conn::normalize_route_url(url);
+                        let normalized = crate::cluster::normalize_route_url(url);
                         if peers.known_urls.insert(normalized.clone()) {
                             if let Some(ref sender) = *tx {
                                 let _ = sender.send(normalized);
@@ -136,7 +136,7 @@ impl RouteHandler {
         wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         queue: Option<Bytes>,
-        #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+        #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
     ) -> HandleResult {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
@@ -215,7 +215,7 @@ impl RouteHandler {
         conn: &mut ConnCtx<'_>,
         wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
-        #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+        #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
     ) -> HandleResult {
         // RS- doesn't include queue in the wire format, so look up by subject only.
         // We try to find the SID for this subject with any queue value.
@@ -286,9 +286,9 @@ impl RouteHandler {
         wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         reply: Option<Bytes>,
-        headers: Option<crate::types::HeaderMap>,
+        headers: Option<crate::infra::types::HeaderMap>,
         payload: Bytes,
-        #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+        #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         let payload_len = payload.len() as u64;
         *wctx.msgs_received += 1;

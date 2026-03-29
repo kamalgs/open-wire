@@ -4,11 +4,11 @@
 //! leaf, route, and gateway peers. Also handles gateway reply rewriting.
 
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-use crate::nats_proto;
+use crate::infra::nats_proto;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-use crate::server::ServerState;
+use crate::infra::server::ServerState;
 #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
-use crate::sub_list::MsgWriter;
+use crate::infra::sub_list::MsgWriter;
 
 #[cfg(feature = "gateway")]
 use std::cell::RefCell;
@@ -59,7 +59,7 @@ pub(crate) fn propagate_leaf_interest(
 pub(crate) fn send_existing_subs(
     state: &ServerState,
     writer: &MsgWriter,
-    leaf_perms: &Option<std::sync::Arc<crate::server::Permissions>>,
+    leaf_perms: &Option<std::sync::Arc<crate::infra::server::Permissions>>,
 ) {
     let mut builder = nats_proto::MsgBuilder::new();
 
@@ -164,7 +164,7 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
     {
         for (idx, account_sub) in state.account_subs.iter().enumerate() {
             let acct = state
-                .account_name(idx as crate::server::AccountId)
+                .account_name(idx as crate::infra::server::AccountId)
                 .as_bytes();
             let subs = account_sub.read().unwrap();
             for (subject, queue) in subs.local_interests() {
@@ -217,7 +217,7 @@ pub(crate) fn propagate_gateway_interest(
     is_sub: bool,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
-    use crate::server::GatewayInterestMode;
+    use crate::infra::server::GatewayInterestMode;
 
     let writers = state.gateway_writers.read().unwrap();
     if writers.is_empty() {
@@ -379,22 +379,24 @@ pub(crate) fn unwrap_gateway_reply_bytes(reply: &bytes::Bytes) -> bytes::Bytes {
 #[cfg(test)]
 mod tests {
     #[cfg(any(feature = "hub", feature = "gateway"))]
-    pub(crate) fn test_server_state() -> crate::server::ServerState {
+    pub(crate) fn test_server_state() -> crate::infra::server::ServerState {
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 
-        crate::server::ServerState {
+        crate::infra::server::ServerState {
             info: Default::default(),
             auth: Default::default(),
             ping_interval_ms: AtomicU64::new(0),
             auth_timeout_ms: AtomicU64::new(0),
             max_pings_outstanding: AtomicU32::new(0),
             #[cfg(not(feature = "accounts"))]
-            subs: std::sync::RwLock::new(crate::sub_list::SubList::new()),
+            subs: std::sync::RwLock::new(crate::infra::sub_list::SubList::new()),
             #[cfg(feature = "accounts")]
-            account_subs: vec![std::sync::RwLock::new(crate::sub_list::SubList::new())],
+            account_subs: vec![std::sync::RwLock::new(
+                crate::infra::sub_list::SubList::new(),
+            )],
             #[cfg(feature = "accounts")]
-            account_registry: crate::server::AccountRegistry::new(&[]),
+            account_registry: crate::infra::server::AccountRegistry::new(&[]),
             #[cfg(feature = "accounts")]
             account_configs: Vec::new(),
             #[cfg(feature = "accounts")]
@@ -430,7 +432,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_seeds: Vec::new(),
             #[cfg(feature = "cluster")]
-            route_peers: std::sync::Mutex::new(crate::server::RoutePeerRegistry {
+            route_peers: std::sync::Mutex::new(crate::infra::server::RoutePeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
@@ -445,7 +447,7 @@ mod tests {
             #[cfg(feature = "gateway")]
             gateway_remotes: Vec::new(),
             #[cfg(feature = "gateway")]
-            gateway_peers: std::sync::Mutex::new(crate::server::GatewayPeerRegistry {
+            gateway_peers: std::sync::Mutex::new(crate::infra::server::GatewayPeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
@@ -460,7 +462,7 @@ mod tests {
             #[cfg(feature = "gateway")]
             has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]
-            affinity: crate::server::AffinityMap::new(1),
+            affinity: crate::infra::server::AffinityMap::new(1),
         }
     }
 
@@ -469,8 +471,8 @@ mod tests {
     fn test_propagate_leaf_filters_by_publish_permission() {
         use std::sync::Arc;
 
-        use crate::server::{Permission, Permissions};
-        use crate::sub_list::MsgWriter;
+        use crate::infra::server::{Permission, Permissions};
+        use crate::infra::sub_list::MsgWriter;
 
         let state = test_server_state();
         let writer = MsgWriter::new_dummy();
@@ -507,7 +509,7 @@ mod tests {
     #[test]
     #[cfg(feature = "hub")]
     fn test_propagate_leaf_sends_to_all_leaves() {
-        use crate::sub_list::MsgWriter;
+        use crate::infra::sub_list::MsgWriter;
 
         let state = test_server_state();
         let w1 = MsgWriter::new_dummy();
@@ -530,8 +532,8 @@ mod tests {
     fn test_send_existing_subs_filters_permissions() {
         use std::sync::Arc;
 
-        use crate::server::{Permission, Permissions};
-        use crate::sub_list::{MsgWriter, Subscription};
+        use crate::infra::server::{Permission, Permissions};
+        use crate::infra::sub_list::{MsgWriter, Subscription};
 
         let state = test_server_state();
 

@@ -21,11 +21,11 @@ use metrics::gauge;
 use tracing::debug;
 
 use super::ConnCtx;
-use crate::server::ServerState;
-use crate::sub_list::MsgWriter;
-use crate::types::HeaderMap;
+use crate::infra::server::ServerState;
+use crate::infra::sub_list::MsgWriter;
+use crate::infra::types::HeaderMap;
 #[cfg(feature = "leaf")]
-use crate::upstream::UpstreamCmd;
+use crate::leaf::UpstreamCmd;
 
 /// Worker-level context for delivery and notification.
 pub(crate) struct MessageDeliveryHub<'a> {
@@ -164,7 +164,7 @@ impl MessageDeliveryHub<'_> {
         msg: &Msg<'_>,
         skip_conn_id: u64,
         scope: &DeliveryScope,
-        #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+        #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
     ) -> (usize, Vec<(u64, u64)>) {
         let (delivered, expired) = deliver_to_subs(
             self,
@@ -208,7 +208,7 @@ impl MessageDeliveryHub<'_> {
 #[inline]
 #[allow(unused_variables)]
 pub(crate) fn deliver_to_sub_inner(
-    sub: &crate::sub_list::Subscription,
+    sub: &crate::infra::sub_list::Subscription,
     msg: &Msg<'_>,
     #[cfg(feature = "accounts")] account_name: &[u8],
 ) -> bool {
@@ -256,7 +256,7 @@ pub(crate) fn deliver_to_sub_inner(
 #[inline]
 #[allow(unused_variables)]
 fn deliver_to_subs_core<F>(
-    subs: &crate::sub_list::SubscriptionManager,
+    subs: &crate::infra::sub_list::SubscriptionManager,
     msg: &Msg<'_>,
     skip_conn_id: u64,
     scope: &DeliveryScope,
@@ -265,7 +265,7 @@ fn deliver_to_subs_core<F>(
     mut on_deliver: F,
 ) -> (usize, Vec<(u64, u64)>)
 where
-    F: FnMut(&crate::sub_list::Subscription),
+    F: FnMut(&crate::infra::sub_list::Subscription),
 {
     let mut delivered: usize = 0;
     let (_match_count, expired) = subs.for_each_match(msg.subject_str, |sub| {
@@ -286,7 +286,7 @@ where
         // Dispatch: gateway subs get reply-rewritten RMSG, others go through deliver_to_sub_inner.
         #[cfg(feature = "gateway")]
         if sub.is_gateway {
-            let gw_reply = crate::propagation::rewrite_gateway_reply(msg.reply, state);
+            let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, state);
             sub.writer.write_rmsg(
                 msg.subject,
                 gw_reply.as_deref(),
@@ -333,7 +333,7 @@ pub(crate) fn deliver_to_subs(
     msg: &Msg<'_>,
     skip_conn_id: u64,
     scope: &DeliveryScope,
-    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+    #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
     let payload_len = msg.payload.len() as u64;
 
@@ -383,7 +383,7 @@ pub(crate) fn deliver_to_subs_upstream(
     state: &ServerState,
     msg: &Msg<'_>,
     dirty_writers: &mut Vec<MsgWriter>,
-    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+    #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
     deliver_to_subs_upstream_inner(
         state,
@@ -405,7 +405,7 @@ pub(crate) fn deliver_to_subs_upstream_inner(
     msg: &Msg<'_>,
     dirty_writers: &mut Vec<MsgWriter>,
     scope: &DeliveryScope,
-    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+    #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
 ) -> (usize, Vec<(u64, u64)>) {
     #[cfg(feature = "accounts")]
     #[allow(unused)]
@@ -503,9 +503,9 @@ impl ConnCtx<'_> {
 pub(crate) fn handle_expired_subs(
     expired: &[(u64, u64)],
     state: &ServerState,
-    conns: &mut HashMap<u64, crate::worker::ClientState>,
+    conns: &mut HashMap<u64, crate::infra::worker::ClientState>,
     worker_label: &str,
-    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+    #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
 ) {
     if expired.is_empty() {
         return;
@@ -554,7 +554,7 @@ pub(crate) fn handle_expired_subs(
 pub(crate) fn handle_expired_subs_upstream(
     expired: &[(u64, u64)],
     state: &ServerState,
-    #[cfg(feature = "accounts")] account_id: crate::server::AccountId,
+    #[cfg(feature = "accounts")] account_id: crate::infra::server::AccountId,
 ) {
     if expired.is_empty() {
         return;
@@ -592,7 +592,7 @@ pub(crate) fn forward_to_optimistic_gateways(
     msg: &Msg<'_>,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
-    use crate::server::GatewayInterestMode;
+    use crate::infra::server::GatewayInterestMode;
 
     let gi = wctx.state.gateway_interest.read().unwrap();
     if gi.is_empty() {
@@ -611,7 +611,7 @@ pub(crate) fn forward_to_optimistic_gateways(
         }
 
         // Rewrite reply with _GR_ prefix before forwarding across gateway.
-        let gw_reply = crate::propagation::rewrite_gateway_reply(msg.reply, wctx.state);
+        let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, wctx.state);
         gis.writer.write_rmsg(
             msg.subject,
             gw_reply.as_deref(),
@@ -642,7 +642,7 @@ pub(crate) fn forward_to_optimistic_gateways(
 pub(crate) fn deliver_cross_account(
     wctx: &mut MessageDeliveryHub<'_>,
     msg: &Msg<'_>,
-    src_account_id: crate::server::AccountId,
+    src_account_id: crate::infra::server::AccountId,
 ) -> Vec<(u64, u64)> {
     let routes = match wctx.state.cross_account_routes.get(src_account_id as usize) {
         Some(r) if !r.is_empty() => r,
@@ -653,15 +653,18 @@ pub(crate) fn deliver_cross_account(
     let mut all_expired = Vec::new();
 
     for route in routes {
-        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
+        if !crate::infra::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
             continue;
         }
 
         let (dst_subject_str, dst_subject_bytes);
         match &route.remap {
             Some(r) => {
-                dst_subject_str =
-                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, msg.subject_str);
+                dst_subject_str = crate::infra::sub_list::remap_subject(
+                    &r.from_pattern,
+                    &r.to_pattern,
+                    msg.subject_str,
+                );
                 dst_subject_bytes = dst_subject_str.as_bytes();
             }
             None => {
@@ -705,7 +708,7 @@ pub(crate) fn deliver_cross_account_upstream(
     state: &ServerState,
     msg: &Msg<'_>,
     dirty_writers: &mut Vec<MsgWriter>,
-    src_account_id: crate::server::AccountId,
+    src_account_id: crate::infra::server::AccountId,
 ) -> Vec<(u64, u64)> {
     let routes = match state.cross_account_routes.get(src_account_id as usize) {
         Some(r) if !r.is_empty() => r,
@@ -715,15 +718,18 @@ pub(crate) fn deliver_cross_account_upstream(
     let mut all_expired = Vec::new();
 
     for route in routes {
-        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
+        if !crate::infra::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
             continue;
         }
 
         let (dst_subject_str, dst_subject_bytes_owned);
         match &route.remap {
             Some(r) => {
-                dst_subject_str =
-                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, msg.subject_str);
+                dst_subject_str = crate::infra::sub_list::remap_subject(
+                    &r.from_pattern,
+                    &r.to_pattern,
+                    msg.subject_str,
+                );
                 dst_subject_bytes_owned = Some(dst_subject_str.as_bytes().to_vec());
             }
             None => {
@@ -763,14 +769,14 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
     use std::sync::Arc;
 
-    use crate::sub_list::{DirectWriter, SubList, Subscription};
+    use crate::infra::sub_list::{DirectWriter, SubList, Subscription};
 
     use super::*;
 
-    fn test_server_state() -> crate::server::ServerState {
+    fn test_server_state() -> crate::infra::server::ServerState {
         use std::collections::HashMap;
 
-        crate::server::ServerState {
+        crate::infra::server::ServerState {
             info: Default::default(),
             auth: Default::default(),
             ping_interval_ms: AtomicU64::new(0),
@@ -781,7 +787,7 @@ mod tests {
             #[cfg(feature = "accounts")]
             account_subs: vec![std::sync::RwLock::new(SubList::new())],
             #[cfg(feature = "accounts")]
-            account_registry: crate::server::AccountRegistry::new(&[]),
+            account_registry: crate::infra::server::AccountRegistry::new(&[]),
             #[cfg(feature = "accounts")]
             account_configs: Vec::new(),
             #[cfg(feature = "accounts")]
@@ -817,7 +823,7 @@ mod tests {
             #[cfg(feature = "cluster")]
             cluster_seeds: Vec::new(),
             #[cfg(feature = "cluster")]
-            route_peers: std::sync::Mutex::new(crate::server::RoutePeerRegistry {
+            route_peers: std::sync::Mutex::new(crate::infra::server::RoutePeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
@@ -832,7 +838,7 @@ mod tests {
             #[cfg(feature = "gateway")]
             gateway_remotes: Vec::new(),
             #[cfg(feature = "gateway")]
-            gateway_peers: std::sync::Mutex::new(crate::server::GatewayPeerRegistry {
+            gateway_peers: std::sync::Mutex::new(crate::infra::server::GatewayPeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
@@ -847,7 +853,7 @@ mod tests {
             #[cfg(feature = "gateway")]
             has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]
-            affinity: crate::server::AffinityMap::new(1),
+            affinity: crate::infra::server::AffinityMap::new(1),
         }
     }
 
@@ -1113,7 +1119,7 @@ mod tests {
     #[test]
     #[cfg(feature = "hub")]
     fn test_deliver_leaf_sub_filtered_by_permissions() {
-        use crate::server::{Permission, Permissions};
+        use crate::infra::server::{Permission, Permissions};
 
         let writer = DirectWriter::new_dummy();
         let mut sub = sub_with_writer(1, 1, "secret.data", None, &writer);

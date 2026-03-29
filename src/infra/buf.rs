@@ -11,22 +11,23 @@ use std::io::{BufWriter, Write};
 use std::net::TcpStream;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::RawFd;
+use std::time::Duration;
 
 use bytes::{BufMut, BytesMut};
 
 #[cfg(test)]
-use crate::nats_proto::{self, MsgBuilder};
+use crate::infra::nats_proto::{self, MsgBuilder};
 #[cfg(test)]
-use crate::types::HeaderMap;
+use crate::infra::types::HeaderMap;
 #[cfg(test)]
-use crate::types::ServerInfo;
+use crate::infra::types::ServerInfo;
 
 // Re-export parsed op types so the rest of the crate uses nats_proto's types.
-pub(crate) use crate::nats_proto::ClientOp;
+pub(crate) use crate::infra::nats_proto::ClientOp;
 #[cfg(any(feature = "leaf", feature = "hub"))]
-pub(crate) use crate::nats_proto::LeafOp;
+pub(crate) use crate::infra::nats_proto::LeafOp;
 #[cfg(feature = "cluster")]
-pub(crate) use crate::nats_proto::RouteOp;
+pub(crate) use crate::infra::nats_proto::RouteOp;
 
 // --- Adaptive read buffer (Go-style dynamic sizing) ---
 
@@ -331,6 +332,41 @@ impl ServerConn {
     }
 }
 
+/// Exponential backoff with jitter for reconnection attempts.
+pub(crate) struct Backoff {
+    current: Duration,
+    initial: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    /// Create a new backoff starting at `initial`, capping at `max`.
+    pub(crate) fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            current: initial,
+            initial,
+            max,
+        }
+    }
+
+    /// Return the next backoff duration (with ±25% jitter) and advance.
+    pub(crate) fn next_delay(&mut self) -> Duration {
+        let base = self.current;
+        // Double for next time, capped
+        self.current = (self.current * 2).min(self.max);
+        // Apply ±25% jitter
+        let jitter_range = base.as_millis() as f64 * 0.25;
+        let jitter = (rand::random::<f64>() - 0.5) * 2.0 * jitter_range;
+        let ms = (base.as_millis() as f64 + jitter).max(1.0) as u64;
+        Duration::from_millis(ms)
+    }
+
+    /// Reset backoff to the initial value (called on successful connect).
+    pub(crate) fn reset(&mut self) {
+        self.current = self.initial;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,9 +435,9 @@ mod tests {
     // Leaf protocol parsing tests live in nats_proto.rs.
 
     #[cfg(feature = "leaf")]
-    fn make_leaf_pair() -> (crate::leaf_conn::LeafConn, TcpStream) {
+    fn make_leaf_pair() -> (crate::leaf::LeafConn, TcpStream) {
         let (server, client) = tcp_pair();
-        let conn = crate::leaf_conn::LeafConn::new(server, BufConfig::default());
+        let conn = crate::leaf::LeafConn::new(server, BufConfig::default());
         (conn, client)
     }
 
@@ -472,7 +508,7 @@ mod tests {
     #[test]
     #[cfg(feature = "leaf")]
     fn test_leaf_connect_with_creds() {
-        use crate::leaf_conn::UpstreamConnectCreds;
+        use crate::leaf::UpstreamConnectCreds;
         let (mut conn, mut hub) = make_leaf_pair();
         let creds = UpstreamConnectCreds {
             user: Some("admin".into()),
@@ -512,7 +548,7 @@ mod tests {
         hub.flush().unwrap();
 
         let op = reader.read_leaf_op().unwrap().unwrap();
-        assert!(matches!(op, crate::nats_proto::LeafOp::Ping));
+        assert!(matches!(op, crate::infra::nats_proto::LeafOp::Ping));
     }
 
     // --- AdaptiveBuf tests ---

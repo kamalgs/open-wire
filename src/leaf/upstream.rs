@@ -12,13 +12,13 @@ use tracing::{debug, error, info, warn};
 #[cfg(feature = "accounts")]
 use crate::handler::deliver_cross_account_upstream;
 use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream, Msg};
-use crate::interest::InterestPipeline;
-use crate::types::HeaderMap;
+use crate::infra::types::HeaderMap;
+use crate::leaf::InterestPipeline;
 
-use crate::buf::LeafOp;
-use crate::leaf_conn::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
-use crate::server::{HubCredentials, ServerState};
-use crate::sub_list::MsgWriter;
+use crate::infra::buf::LeafOp;
+use crate::infra::server::{HubCredentials, ServerState};
+use crate::infra::sub_list::MsgWriter;
+use crate::leaf::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
 
 /// Commands sent from the Upstream handle to the background writer thread.
 #[derive(Debug)]
@@ -36,40 +36,7 @@ pub(crate) enum UpstreamCmd {
     Shutdown,
 }
 
-/// Exponential backoff with jitter for reconnection attempts.
-pub(crate) struct Backoff {
-    current: Duration,
-    initial: Duration,
-    max: Duration,
-}
-
-impl Backoff {
-    /// Create a new backoff starting at `initial`, capping at `max`.
-    pub(crate) fn new(initial: Duration, max: Duration) -> Self {
-        Self {
-            current: initial,
-            initial,
-            max,
-        }
-    }
-
-    /// Return the next backoff duration (with ±25% jitter) and advance.
-    pub(crate) fn next_delay(&mut self) -> Duration {
-        let base = self.current;
-        // Double for next time, capped
-        self.current = (self.current * 2).min(self.max);
-        // Apply ±25% jitter
-        let jitter_range = base.as_millis() as f64 * 0.25;
-        let jitter = (rand::random::<f64>() - 0.5) * 2.0 * jitter_range;
-        let ms = (base.as_millis() as f64 + jitter).max(1.0) as u64;
-        Duration::from_millis(ms)
-    }
-
-    /// Reset backoff to the initial value (called on successful connect).
-    pub(crate) fn reset(&mut self) {
-        self.current = self.initial;
-    }
-}
+use crate::infra::buf::Backoff;
 
 /// Manages connection to an upstream NATS hub server using the leaf node protocol.
 /// Sends LS+/LS- for subscription interest and LMSG for messages.
@@ -244,7 +211,7 @@ fn connect_and_run(
     let stream_shutdown = tcp.try_clone()?;
 
     let mut leaf = if parsed.use_tls {
-        let tls_config = crate::server::build_tls_client_config();
+        let tls_config = crate::infra::server::build_tls_client_config();
         let server_name = rustls_pki_types::ServerName::try_from(parsed.host.clone())
             .map_err(|e| format!("invalid TLS server name '{}': {e}", parsed.host))?;
         let tls_conn = rustls::ClientConnection::new(tls_config, server_name)
@@ -1012,7 +979,7 @@ mod tests {
 
     // --- add_interest / remove_interest with pipeline ---
 
-    use crate::interest::InterestPipeline;
+    use crate::leaf::InterestPipeline;
 
     /// Helper: create an Upstream with a pipeline but no real connection.
     fn test_upstream(

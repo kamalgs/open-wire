@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
-pub(crate) use crate::msg_writer::{create_eventfd, MsgWriter};
+pub(crate) use crate::infra::msg_writer::{create_eventfd, MsgWriter};
 
 /// Backward-compatible alias for `MsgWriter`.
 pub(crate) type DirectWriter = MsgWriter;
@@ -36,11 +36,11 @@ pub struct Subscription {
     pub is_gateway: bool,
     /// Account this subscription belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
-    pub account_id: crate::server::AccountId,
+    pub account_id: crate::infra::server::AccountId,
     /// Per-leaf publish permissions. Used during delivery to filter messages
     /// that the leaf is not allowed to receive (subscribe permission check).
     #[cfg(feature = "hub")]
-    pub leaf_perms: Option<std::sync::Arc<crate::server::Permissions>>,
+    pub leaf_perms: Option<std::sync::Arc<crate::infra::server::Permissions>>,
 }
 
 impl Clone for Subscription {
