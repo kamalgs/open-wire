@@ -173,7 +173,7 @@ stateDiagram-v2
     state Active {
         [*] --> Processing
         Processing --> Processing : parse_op → handle_op
-        Processing --> Flushing : HandleResult::Flush
+        Processing --> Flushing : HandleResult Flush
         Flushing --> Processing : write_buf flushed
     }
 
@@ -181,7 +181,7 @@ stateDiagram-v2
     Draining --> [*] : write_buf empty, close fd
 
     WaitConnect --> [*] : invalid CONNECT / timeout
-    Active --> [*] : protocol error (HandleResult::Disconnect)
+    Active --> [*] : protocol error (HandleResult Disconnect)
     Active --> [*] : I/O error / EOF
 
     note right of SendInfo
@@ -197,7 +197,7 @@ stateDiagram-v2
 
     note right of Active
         worker.rs — process_active()
-        Calls H::parse_op() + H::handle_op()
+        Calls H.parse_op() + H.handle_op()
         via ConnectionHandler trait
         handler/conn.rs:25
     end note
@@ -391,10 +391,10 @@ stateDiagram-v2
             state ProcessActive {
                 [*] --> ReadLoop
                 ReadLoop --> ParseOp : data available
-                ParseOp --> HandleOp : H::parse_op()
-                HandleOp --> ReadLoop : HandleResult::Ok
-                HandleOp --> FlushAndRead : HandleResult::Flush
-                HandleOp --> Disconnect : HandleResult::Disconnect
+                ParseOp --> HandleOp : H.parse_op()
+                HandleOp --> ReadLoop : HandleResult Ok
+                HandleOp --> FlushAndRead : HandleResult Flush
+                HandleOp --> Disconnect : HandleResult Disconnect
                 ReadLoop --> [*] : WouldBlock
             }
         }
