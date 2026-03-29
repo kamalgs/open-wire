@@ -49,239 +49,202 @@ fn install_signal_handler(sig: libc::c_int, handler: extern "C" fn(libc::c_int))
     }
 }
 
+/// Set up graceful shutdown and hot-reload via signals.
+fn setup_signals() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    let shutdown = Arc::new(AtomicBool::new(false));
+    SHUTDOWN_PTR.store(Arc::as_ptr(&shutdown) as *mut AtomicBool, Ordering::Release);
+
+    let reload = Arc::new(AtomicBool::new(false));
+    RELOAD_PTR.store(Arc::as_ptr(&reload) as *mut AtomicBool, Ordering::Release);
+
+    install_signal_handler(libc::SIGTERM, handle_shutdown);
+    install_signal_handler(libc::SIGINT, handle_shutdown);
+    install_signal_handler(libc::SIGHUP, handle_reload);
+
+    (shutdown, reload)
+}
+
+const USAGE: &str = "\
+Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
+[--hub URL] [--name NAME] \
+[--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N] \
+[--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
+[--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
+[--hub-token TOKEN] [--hub-creds PATH] \
+[--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH] \
+[--tls-ca-cert PATH] [--tls-verify] \
+[--max-payload BYTES] [--max-connections N] \
+[--max-control-line BYTES] [--max-subscriptions N] \
+[--pid-file PATH] [--log-file PATH] [--monitoring-port PORT] \
+[--auth-timeout SECS]";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Defer tracing init until after config is parsed (may need log_file).
-    // First pass: look for --config / -c to load config file as base
-    let args: Vec<String> = std::env::args().collect();
-    let mut config = {
-        let mut cfg_path: Option<String> = None;
-        let mut i = 1;
-        while i < args.len() {
-            if matches!(args[i].as_str(), "--config" | "-c") {
-                i += 1;
-                if i < args.len() {
-                    cfg_path = Some(args[i].clone());
-                }
-            }
-            i += 1;
-        }
-        if let Some(path) = cfg_path {
-            config::load_config(std::path::Path::new(&path))
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
-        } else {
-            LeafServerConfig::default()
-        }
+    let mut args = pico_args::Arguments::from_env();
+
+    // Load config file as base (if provided)
+    let cfg_path: Option<String> = args.opt_value_from_str(["-c", "--config"])?;
+    let mut config = if let Some(ref path) = cfg_path {
+        config::load_config(std::path::Path::new(path))
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+    } else {
+        LeafServerConfig::default()
     };
 
-    // Accumulate auth-related CLI values before building config
-    let mut auth_token: Option<String> = None;
-    let mut auth_user: Option<String> = None;
-    let mut auth_pass: Option<String> = None;
+    // Override config with CLI flags
+    if let Some(v) = args.opt_value_from_str(["-p", "--port"])? {
+        config.port = v;
+    }
+    if let Some(v) = args.opt_value_from_str(["-h", "--host"])? {
+        config.host = v;
+    }
+    if let Some(v) = args.opt_value_from_str(["-w", "--workers"])? {
+        config.workers = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--name")? {
+        config.server_name = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--ws-port")? {
+        config.ws_port = Some(v);
+    }
+    if let Some(v) = args.opt_value_from_str("--read-buf-max")? {
+        config.max_read_buf_capacity = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--write-buf-size")? {
+        config.write_buf_capacity = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--metrics-port")? {
+        config.metrics_port = Some(v);
+    }
+    if let Some(v) = args.opt_value_from_str("--max-payload")? {
+        config.max_payload = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--max-connections")? {
+        config.max_connections = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--max-control-line")? {
+        config.max_control_line = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--max-subscriptions")? {
+        config.max_subscriptions = v;
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--tls-cert")? {
+        config.tls_cert = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--tls-key")? {
+        config.tls_key = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--tls-ca-cert")? {
+        config.tls_ca_cert = Some(std::path::PathBuf::from(v));
+    }
+    if args.contains("--tls-verify") {
+        config.tls_verify = true;
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--pid-file")? {
+        config.pid_file = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--log-file")? {
+        config.log_file = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str(["--monitoring-port", "--http-port"])? {
+        config.monitoring_port = Some(v);
+    }
+    if let Some(secs) = args.opt_value_from_str::<_, u64>("--auth-timeout")? {
+        config.auth_timeout = std::time::Duration::from_secs(secs);
+    }
+
+    // Auth flags
+    let auth_token: Option<String> = args.opt_value_from_str("--token")?;
+    let auth_user: Option<String> = args.opt_value_from_str("--user")?;
+    let auth_pass: Option<String> = args.opt_value_from_str("--pass")?;
     let mut auth_nkeys: Vec<String> = Vec::new();
+    while let Some(v) = args.opt_value_from_str::<_, String>("--nkey")? {
+        auth_nkeys.push(v);
+    }
+
+    // Hub credential flags
     #[cfg(feature = "leaf")]
     let mut hub_creds = HubCredentials::default();
     #[cfg(feature = "leaf")]
     let mut has_hub_creds = false;
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" | "-c" => {
-                i += 1; // already handled above, skip value
+    #[cfg(feature = "leaf")]
+    if let Some(v) = args.opt_value_from_str("--hub")? {
+        config.hub_url = Some(v);
+    }
+    #[cfg(feature = "leaf")]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--hub-user")? {
+        hub_creds.user = Some(v);
+        has_hub_creds = true;
+    }
+    #[cfg(feature = "leaf")]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--hub-pass")? {
+        hub_creds.pass = Some(v);
+        has_hub_creds = true;
+    }
+    #[cfg(feature = "leaf")]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--hub-token")? {
+        hub_creds.token = Some(v);
+        has_hub_creds = true;
+    }
+    #[cfg(feature = "leaf")]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--hub-creds")? {
+        hub_creds.creds_file = Some(v);
+        has_hub_creds = true;
+    }
+
+    // Cluster flags
+    #[cfg(feature = "cluster")]
+    if let Some(v) = args.opt_value_from_str("--cluster-port")? {
+        config.cluster_port = Some(v);
+    }
+    #[cfg(feature = "cluster")]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--cluster-seeds")? {
+        config
+            .cluster_seeds
+            .extend(v.split(',').map(|s| s.trim().to_string()));
+    }
+    #[cfg(feature = "cluster")]
+    if let Some(v) = args.opt_value_from_str("--cluster-name")? {
+        config.cluster_name = Some(v);
+    }
+
+    // Gateway flags
+    #[cfg(feature = "gateway")]
+    if let Some(v) = args.opt_value_from_str("--gateway-port")? {
+        config.gateway_port = Some(v);
+    }
+    #[cfg(feature = "gateway")]
+    if let Some(v) = args.opt_value_from_str("--gateway-name")? {
+        config.gateway_name = Some(v);
+    }
+    #[cfg(feature = "gateway")]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--gateway-remotes")? {
+        // Format: "cluster-b=host1:7222,host2:7222;cluster-c=host3:7222"
+        for cluster_spec in v.split(';') {
+            let cluster_spec = cluster_spec.trim();
+            if cluster_spec.is_empty() {
+                continue;
             }
-            "--port" | "-p" => {
-                i += 1;
-                config.port = args[i].parse().expect("invalid port");
-            }
-            "--host" | "-h" => {
-                i += 1;
-                config.host = args[i].clone();
-            }
-            #[cfg(feature = "leaf")]
-            "--hub" => {
-                i += 1;
-                config.hub_url = Some(args[i].clone());
-            }
-            "--name" => {
-                i += 1;
-                config.server_name = args[i].clone();
-            }
-            "--read-buf-max" => {
-                i += 1;
-                config.max_read_buf_capacity = args[i].parse().expect("invalid read-buf-max");
-            }
-            "--write-buf-size" => {
-                i += 1;
-                config.write_buf_capacity = args[i].parse().expect("invalid write-buf-size");
-            }
-            "--workers" | "-w" => {
-                i += 1;
-                config.workers = args[i].parse().expect("invalid workers count");
-            }
-            "--ws-port" => {
-                i += 1;
-                config.ws_port = Some(args[i].parse().expect("invalid ws-port"));
-            }
-            "--token" => {
-                i += 1;
-                auth_token = Some(args[i].clone());
-            }
-            "--user" => {
-                i += 1;
-                auth_user = Some(args[i].clone());
-            }
-            "--pass" => {
-                i += 1;
-                auth_pass = Some(args[i].clone());
-            }
-            "--nkey" => {
-                i += 1;
-                auth_nkeys.push(args[i].clone());
-            }
-            #[cfg(feature = "leaf")]
-            "--hub-user" => {
-                i += 1;
-                hub_creds.user = Some(args[i].clone());
-                has_hub_creds = true;
-            }
-            #[cfg(feature = "leaf")]
-            "--hub-pass" => {
-                i += 1;
-                hub_creds.pass = Some(args[i].clone());
-                has_hub_creds = true;
-            }
-            #[cfg(feature = "leaf")]
-            "--hub-token" => {
-                i += 1;
-                hub_creds.token = Some(args[i].clone());
-                has_hub_creds = true;
-            }
-            #[cfg(feature = "leaf")]
-            "--hub-creds" => {
-                i += 1;
-                hub_creds.creds_file = Some(args[i].clone());
-                has_hub_creds = true;
-            }
-            "--metrics-port" => {
-                i += 1;
-                config.metrics_port = Some(args[i].parse().expect("invalid metrics-port"));
-            }
-            "--tls-cert" => {
-                i += 1;
-                config.tls_cert = Some(std::path::PathBuf::from(&args[i]));
-            }
-            "--tls-key" => {
-                i += 1;
-                config.tls_key = Some(std::path::PathBuf::from(&args[i]));
-            }
-            "--tls-ca-cert" => {
-                i += 1;
-                config.tls_ca_cert = Some(std::path::PathBuf::from(&args[i]));
-            }
-            "--tls-verify" => {
-                config.tls_verify = true;
-            }
-            "--max-payload" => {
-                i += 1;
-                config.max_payload = args[i].parse().expect("invalid max-payload");
-            }
-            "--max-connections" => {
-                i += 1;
-                config.max_connections = args[i].parse().expect("invalid max-connections");
-            }
-            "--max-control-line" => {
-                i += 1;
-                config.max_control_line = args[i].parse().expect("invalid max-control-line");
-            }
-            "--max-subscriptions" => {
-                i += 1;
-                config.max_subscriptions = args[i].parse().expect("invalid max-subscriptions");
-            }
-            "--pid-file" => {
-                i += 1;
-                config.pid_file = Some(std::path::PathBuf::from(&args[i]));
-            }
-            "--log-file" => {
-                i += 1;
-                config.log_file = Some(std::path::PathBuf::from(&args[i]));
-            }
-            "--monitoring-port" | "--http-port" => {
-                i += 1;
-                config.monitoring_port = Some(args[i].parse().expect("invalid monitoring-port"));
-            }
-            "--auth-timeout" => {
-                i += 1;
-                let secs: u64 = args[i].parse().expect("invalid auth-timeout");
-                config.auth_timeout = std::time::Duration::from_secs(secs);
-            }
-            #[cfg(feature = "cluster")]
-            "--cluster-port" => {
-                i += 1;
-                config.cluster_port = Some(args[i].parse().expect("invalid cluster-port"));
-            }
-            #[cfg(feature = "cluster")]
-            "--cluster-seeds" => {
-                i += 1;
+            if let Some((name, urls_str)) = cluster_spec.split_once('=') {
+                let urls: Vec<String> = urls_str.split(',').map(|s| s.trim().to_string()).collect();
                 config
-                    .cluster_seeds
-                    .extend(args[i].split(',').map(|s| s.trim().to_string()));
-            }
-            #[cfg(feature = "cluster")]
-            "--cluster-name" => {
-                i += 1;
-                config.cluster_name = Some(args[i].clone());
-            }
-            #[cfg(feature = "gateway")]
-            "--gateway-port" => {
-                i += 1;
-                config.gateway_port = Some(args[i].parse().expect("invalid gateway-port"));
-            }
-            #[cfg(feature = "gateway")]
-            "--gateway-name" => {
-                i += 1;
-                config.gateway_name = Some(args[i].clone());
-            }
-            #[cfg(feature = "gateway")]
-            "--gateway-remotes" => {
-                // Format: "cluster-b=host1:7222,host2:7222;cluster-c=host3:7222"
-                i += 1;
-                for cluster_spec in args[i].split(';') {
-                    let cluster_spec = cluster_spec.trim();
-                    if cluster_spec.is_empty() {
-                        continue;
-                    }
-                    if let Some((name, urls_str)) = cluster_spec.split_once('=') {
-                        let urls: Vec<String> =
-                            urls_str.split(',').map(|s| s.trim().to_string()).collect();
-                        config
-                            .gateway_remotes
-                            .push(open_wire::server::GatewayRemote {
-                                name: name.trim().to_string(),
-                                urls,
-                            });
-                    }
-                }
-            }
-            _ => {
-                eprintln!("Unknown argument: {}", args[i]);
-                eprintln!(
-                    "Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
-                     [--hub URL] [--name NAME] \
-                     [--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N] \
-                     [--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
-                     [--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
-                     [--hub-token TOKEN] [--hub-creds PATH] \
-                     [--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH] \
-                     [--tls-ca-cert PATH] [--tls-verify] \
-                     [--max-payload BYTES] [--max-connections N] \
-                     [--max-control-line BYTES] [--max-subscriptions N] \
-                     [--pid-file PATH] [--log-file PATH] [--monitoring-port PORT] \
-                     [--auth-timeout SECS]"
-                );
-                std::process::exit(1);
+                    .gateway_remotes
+                    .push(open_wire::server::GatewayRemote {
+                        name: name.trim().to_string(),
+                        urls,
+                    });
             }
         }
-        i += 1;
+    }
+
+    // Reject unknown arguments
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        for arg in &remaining {
+            eprintln!("Unknown argument: {}", arg.to_string_lossy());
+        }
+        eprintln!("{USAGE}");
+        std::process::exit(1);
     }
 
     // Build client auth from CLI flags
@@ -339,36 +302,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Monitoring port: {monitoring_port}");
     }
 
-    // Set up graceful shutdown via signals
-    let shutdown = Arc::new(AtomicBool::new(false));
-    SHUTDOWN_PTR.store(Arc::as_ptr(&shutdown) as *mut AtomicBool, Ordering::Release);
-
-    let reload = Arc::new(AtomicBool::new(false));
-    RELOAD_PTR.store(Arc::as_ptr(&reload) as *mut AtomicBool, Ordering::Release);
-
-    install_signal_handler(libc::SIGTERM, handle_shutdown);
-    install_signal_handler(libc::SIGINT, handle_shutdown);
-    install_signal_handler(libc::SIGHUP, handle_reload);
-
-    // Determine config path for hot-reload
-    let config_path: Option<String> = {
-        let mut cp = None;
-        let mut j = 1;
-        while j < args.len() {
-            if matches!(args[j].as_str(), "--config" | "-c") {
-                j += 1;
-                if j < args.len() {
-                    cp = Some(args[j].clone());
-                }
-            }
-            j += 1;
-        }
-        cp
-    };
+    let (shutdown, reload) = setup_signals();
 
     let pid_file = config.pid_file.clone();
     let server = LeafServer::new(config);
-    let result = server.run_until_shutdown(shutdown, reload, config_path.as_deref());
+    let result = server.run_until_shutdown(shutdown, reload, cfg_path.as_deref());
 
     // Clear the global pointers (the Arcs are about to drop).
     SHUTDOWN_PTR.store(ptr::null_mut(), Ordering::Release);

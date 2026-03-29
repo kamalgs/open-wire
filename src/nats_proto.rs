@@ -25,79 +25,57 @@ use crate::types::ServerInfo;
 use crate::types::{ConnectInfo, HeaderMap};
 
 // ────────────────────────────────────────────────────────────────────────────
-// Itoa: pre-computed decimal byte strings for small integers.
+// Itoa: format integers as decimal ASCII bytes.
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Format a `usize` as decimal ASCII bytes into `buf`.
-/// Returns the slice of `buf` that was written.
-#[inline]
-fn usize_to_buf(n: usize, buf: &mut [u8; 20]) -> &[u8] {
-    if n == 0 {
-        buf[0] = b'0';
-        return &buf[..1];
-    }
-    let mut i = 20;
-    let mut v = n;
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    &buf[i..]
+macro_rules! int_to_buf {
+    ($name:ident, $ty:ty) => {
+        #[inline]
+        fn $name(n: $ty, buf: &mut [u8; 20]) -> &[u8] {
+            if n == 0 {
+                buf[0] = b'0';
+                return &buf[..1];
+            }
+            let mut i = 20;
+            let mut v = n;
+            while v > 0 {
+                i -= 1;
+                buf[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+            }
+            &buf[i..]
+        }
+    };
 }
 
-/// Format a `u64` as decimal ASCII bytes into `dst`, returning the slice written.
-#[inline]
-fn u64_to_buf(n: u64, buf: &mut [u8; 20]) -> &[u8] {
-    if n == 0 {
-        buf[0] = b'0';
-        return &buf[..1];
-    }
-    let mut i = 20;
-    let mut v = n;
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    &buf[i..]
-}
+int_to_buf!(usize_to_buf, usize);
+int_to_buf!(u64_to_buf, u64);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Parse helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Parse a decimal integer from raw bytes. Returns `Err` on empty or non-digit.
-#[inline]
-fn parse_size(d: &[u8]) -> io::Result<usize> {
-    if d.is_empty() || d.len() > 9 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad size"));
-    }
-    let mut n: usize = 0;
-    for &b in d {
-        if !b.is_ascii_digit() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad size"));
+macro_rules! parse_int {
+    ($name:ident, $ty:ty, $max_digits:expr, $label:expr) => {
+        #[inline]
+        fn $name(d: &[u8]) -> io::Result<$ty> {
+            if d.is_empty() || d.len() > $max_digits {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, $label));
+            }
+            let mut n: $ty = 0;
+            for &b in d {
+                if !b.is_ascii_digit() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, $label));
+                }
+                n = n * 10 + (b - b'0') as $ty;
+            }
+            Ok(n)
         }
-        n = n * 10 + (b - b'0') as usize;
-    }
-    Ok(n)
+    };
 }
 
-/// Parse a u64 from raw bytes.
-#[inline]
-fn parse_u64(d: &[u8]) -> io::Result<u64> {
-    if d.is_empty() || d.len() > 19 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad u64"));
-    }
-    let mut n: u64 = 0;
-    for &b in d {
-        if !b.is_ascii_digit() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad u64"));
-        }
-        n = n * 10 + (b - b'0') as u64;
-    }
-    Ok(n)
-}
+parse_int!(parse_size, usize, 9, "bad size");
+parse_int!(parse_u64, u64, 19, "bad u64");
 
 /// Find the next `\n` in `buf`. Returns the index of `\n`.
 #[inline]
@@ -173,6 +151,79 @@ pub enum ClientOp {
         sid: u64,
         max: Option<u64>,
     },
+}
+
+/// A parsed hub→leaf operation.
+#[cfg(any(feature = "leaf", feature = "hub"))]
+#[derive(Debug)]
+pub enum LeafOp {
+    Info(Box<ServerInfo>),
+    Ping,
+    Pong,
+    Ok,
+    Err(String),
+    LeafSub {
+        subject: Bytes,
+        queue: Option<Bytes>,
+    },
+    LeafUnsub {
+        subject: Bytes,
+        queue: Option<Bytes>,
+    },
+    LeafMsg {
+        subject: Bytes,
+        reply: Option<Bytes>,
+        headers: Option<HeaderMap>,
+        payload: Bytes,
+    },
+}
+
+/// A parsed route protocol operation (RS+, RS-, RMSG, INFO, CONNECT, PING, PONG).
+#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[derive(Debug)]
+pub enum RouteOp {
+    Info(Box<ServerInfo>),
+    Connect(Box<ConnectInfo>),
+    Ping,
+    Pong,
+    /// RS+ account subject [queue [weight]]
+    RouteSub {
+        #[cfg(feature = "accounts")]
+        account: Bytes,
+        subject: Bytes,
+        queue: Option<Bytes>,
+    },
+    /// RS- account subject
+    RouteUnsub {
+        #[cfg(feature = "accounts")]
+        account: Bytes,
+        subject: Bytes,
+    },
+    /// RMSG account subject [reply] [hdr_size] total_size\r\n<payload>\r\n
+    RouteMsg {
+        #[cfg(feature = "accounts")]
+        account: Bytes,
+        subject: Bytes,
+        reply: Option<Bytes>,
+        headers: Option<HeaderMap>,
+        payload: Bytes,
+    },
+}
+
+/// Gateway operations reuse the route wire format (RS+/RS-/RMSG).
+#[cfg(feature = "gateway")]
+pub type GatewayOp = RouteOp;
+
+/// Scratch buffer for building outgoing protocol lines. Reuse across calls
+/// to avoid allocation.
+pub struct MsgBuilder {
+    buf: Vec<u8>,
+}
+
+impl Default for MsgBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Try to parse the next client operation from `buf`.
@@ -540,31 +591,6 @@ fn proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
 // Leaf-side parsed operations
 // ────────────────────────────────────────────────────────────────────────────
 
-/// A parsed hub→leaf operation.
-#[cfg(any(feature = "leaf", feature = "hub"))]
-#[derive(Debug)]
-pub enum LeafOp {
-    Info(Box<ServerInfo>),
-    Ping,
-    Pong,
-    Ok,
-    Err(String),
-    LeafSub {
-        subject: Bytes,
-        queue: Option<Bytes>,
-    },
-    LeafUnsub {
-        subject: Bytes,
-        queue: Option<Bytes>,
-    },
-    LeafMsg {
-        subject: Bytes,
-        reply: Option<Bytes>,
-        headers: Option<HeaderMap>,
-        payload: Bytes,
-    },
-}
-
 /// Try to parse the next hub→leaf operation from `buf`.
 #[cfg(any(feature = "leaf", feature = "hub"))]
 pub fn try_parse_leaf_op(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
@@ -827,46 +853,6 @@ fn leaf_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
     }
     Err(io::Error::new(io::ErrorKind::InvalidInput, msg))
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Route-side parsed operations (cluster mode)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// A parsed route protocol operation (RS+, RS-, RMSG, INFO, CONNECT, PING, PONG).
-#[cfg(any(feature = "cluster", feature = "gateway"))]
-#[derive(Debug)]
-pub enum RouteOp {
-    Info(Box<ServerInfo>),
-    Connect(Box<ConnectInfo>),
-    Ping,
-    Pong,
-    /// RS+ account subject [queue [weight]]
-    RouteSub {
-        #[cfg(feature = "accounts")]
-        account: Bytes,
-        subject: Bytes,
-        queue: Option<Bytes>,
-    },
-    /// RS- account subject
-    RouteUnsub {
-        #[cfg(feature = "accounts")]
-        account: Bytes,
-        subject: Bytes,
-    },
-    /// RMSG account subject [reply] [hdr_size] total_size\r\n<payload>\r\n
-    RouteMsg {
-        #[cfg(feature = "accounts")]
-        account: Bytes,
-        subject: Bytes,
-        reply: Option<Bytes>,
-        headers: Option<HeaderMap>,
-        payload: Bytes,
-    },
-}
-
-/// Gateway operations reuse the route wire format (RS+/RS-/RMSG).
-#[cfg(feature = "gateway")]
-pub type GatewayOp = RouteOp;
 
 /// Try to parse the next gateway protocol operation from `buf`.
 /// Gateways use the same wire format as routes.
@@ -1188,18 +1174,6 @@ pub(crate) fn parse_headers(data: &[u8]) -> io::Result<HeaderMap> {
 // ────────────────────────────────────────────────────────────────────────────
 // Message builder — direct byte assembly, no write!() formatting
 // ────────────────────────────────────────────────────────────────────────────
-
-/// Scratch buffer for building outgoing protocol lines. Reuse across calls
-/// to avoid allocation.
-pub struct MsgBuilder {
-    buf: Vec<u8>,
-}
-
-impl Default for MsgBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 impl MsgBuilder {
     pub fn new() -> Self {

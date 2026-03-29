@@ -173,6 +173,37 @@ impl WorkerHandle {
     }
 }
 
+// --- Worker ---
+
+pub(crate) struct Worker {
+    epoll_fd: OwnedFd,
+    event_fd: Arc<OwnedFd>,
+    conns: HashMap<u64, ClientState>,
+    fd_to_conn: HashMap<RawFd, u64>,
+    rx: mpsc::Receiver<WorkerCmd>,
+    state: Arc<ServerState>,
+    info_line: Vec<u8>,
+    /// INFO line for inbound leaf connections (port set to leafnode_port).
+    #[cfg(feature = "hub")]
+    leaf_info_line: Vec<u8>,
+    shutdown: bool,
+    /// Accumulated eventfd notifications. Flushed after processing a read batch.
+    /// Deduplicates across multiple PUBs in the same read buffer.
+    pending_notify: [RawFd; 16],
+    pending_notify_count: usize,
+    /// Worker index label for metrics.
+    worker_label: String,
+    /// Thread-local metric accumulators — plain u64, no atomics.
+    /// Flushed to the global `metrics` recorder once per epoll batch.
+    msgs_received: u64,
+    msgs_received_bytes: u64,
+    msgs_delivered: u64,
+    msgs_delivered_bytes: u64,
+    /// Worker index within the worker pool (0-based).
+    #[cfg(feature = "worker-affinity")]
+    worker_index: usize,
+}
+
 // --- Connection state machine ---
 
 #[derive(Clone, Copy)]
@@ -269,37 +300,6 @@ impl ClientState {
             account_id: self.account_id,
         }
     }
-}
-
-// --- Worker ---
-
-pub(crate) struct Worker {
-    epoll_fd: OwnedFd,
-    event_fd: Arc<OwnedFd>,
-    conns: HashMap<u64, ClientState>,
-    fd_to_conn: HashMap<RawFd, u64>,
-    rx: mpsc::Receiver<WorkerCmd>,
-    state: Arc<ServerState>,
-    info_line: Vec<u8>,
-    /// INFO line for inbound leaf connections (port set to leafnode_port).
-    #[cfg(feature = "hub")]
-    leaf_info_line: Vec<u8>,
-    shutdown: bool,
-    /// Accumulated eventfd notifications. Flushed after processing a read batch.
-    /// Deduplicates across multiple PUBs in the same read buffer.
-    pending_notify: [RawFd; 16],
-    pending_notify_count: usize,
-    /// Worker index label for metrics.
-    worker_label: String,
-    /// Thread-local metric accumulators — plain u64, no atomics.
-    /// Flushed to the global `metrics` recorder once per epoll batch.
-    msgs_received: u64,
-    msgs_received_bytes: u64,
-    msgs_delivered: u64,
-    msgs_delivered_bytes: u64,
-    /// Worker index within the worker pool (0-based).
-    #[cfg(feature = "worker-affinity")]
-    worker_index: usize,
 }
 
 impl Worker {

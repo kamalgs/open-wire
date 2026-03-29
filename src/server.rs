@@ -32,6 +32,280 @@ use crate::sub_list::SubscriptionManager;
 use crate::upstream::{Upstream, UpstreamCmd};
 use crate::worker::{Worker, WorkerHandle};
 
+/// An open-wire NATS-compatible message relay server.
+///
+/// Accepts local client connections, routes messages between them,
+/// and optionally forwards traffic to an upstream NATS hub.
+pub struct LeafServer {
+    config: LeafServerConfig,
+    state: Arc<ServerState>,
+}
+
+/// Configuration for the leaf node server.
+#[derive(Debug, Clone)]
+pub struct LeafServerConfig {
+    /// Address to listen on (e.g., "0.0.0.0").
+    pub host: String,
+    /// Port to listen on.
+    pub port: u16,
+    /// Optional upstream hub URL (e.g., "nats://hub:4222").
+    #[cfg(feature = "leaf")]
+    pub hub_url: Option<String>,
+    /// Server name.
+    pub server_name: String,
+    /// Max per-client read buffer capacity in bytes (default: 64 KB).
+    /// The buffer starts small (512B) and grows adaptively up to this limit.
+    pub max_read_buf_capacity: usize,
+    /// Per-client write buffer capacity in bytes (default: 64 KB).
+    pub write_buf_capacity: usize,
+    /// Number of worker threads (default: available parallelism or 4).
+    pub workers: usize,
+    /// Optional WebSocket port. When set, a second listener accepts WebSocket
+    /// connections on this port (NATS protocol over WebSocket binary frames).
+    pub ws_port: Option<u16>,
+    /// Optional leafnode listen port. When set, open-wire acts as a hub and
+    /// accepts inbound leaf node connections on this port.
+    #[cfg(feature = "hub")]
+    pub leafnode_port: Option<u16>,
+    /// Maximum pending write bytes per connection before disconnecting as a
+    /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
+    pub max_pending: usize,
+    /// Maximum message payload size in bytes (default: 1 MB, matching Go nats-server).
+    /// Advertised in INFO and enforced on PUB/HPUB.
+    pub max_payload: usize,
+    /// Maximum simultaneous client connections (default: 65536). 0 = unlimited.
+    pub max_connections: usize,
+    /// Maximum control line length in bytes (default: 4096, matching Go nats-server).
+    pub max_control_line: usize,
+    /// Maximum subscriptions per client connection (default: 0 = unlimited).
+    pub max_subscriptions: usize,
+    /// Interval between server-initiated PING keepalives (default: 2 minutes).
+    /// Set to `Duration::ZERO` to disable keepalive.
+    pub ping_interval: std::time::Duration,
+    /// Maximum outstanding PINGs before closing a connection (default: 2).
+    pub max_pings_outstanding: u32,
+    /// Client authentication configuration.
+    pub client_auth: ClientAuth,
+    /// Inbound leaf node authentication configuration.
+    #[cfg(feature = "hub")]
+    pub leaf_auth: LeafAuth,
+    /// Credentials for connecting to the upstream hub.
+    #[cfg(feature = "leaf")]
+    pub hub_credentials: Option<HubCredentials>,
+    /// Multiple upstream hub remotes. When non-empty, each remote gets its own
+    /// independent connection with its own credentials and interest pipeline.
+    /// If empty and `hub_url` is set, a single remote is synthesized from the
+    /// legacy `hub_url`/`hub_credentials`/`interest_collapse`/`subject_mappings`.
+    #[cfg(feature = "leaf")]
+    pub hub_remotes: Vec<HubRemote>,
+    /// Port for Prometheus metrics HTTP endpoint. `None` = disabled.
+    pub metrics_port: Option<u16>,
+    /// Path to TLS certificate file (PEM). When set with `tls_key`, enables TLS.
+    pub tls_cert: Option<PathBuf>,
+    /// Path to TLS private key file (PEM).
+    pub tls_key: Option<PathBuf>,
+    /// Path to CA certificate file (PEM) for client certificate verification (mTLS).
+    pub tls_ca_cert: Option<PathBuf>,
+    /// When `true` (and `tls_ca_cert` is set), require and verify client certificates.
+    pub tls_verify: bool,
+    /// Path to write the server PID file. Removed on shutdown.
+    pub pid_file: Option<PathBuf>,
+    /// Path to the log file. When set, tracing output is directed here.
+    pub log_file: Option<PathBuf>,
+    /// Timeout for clients to send CONNECT after connection (default: 2s).
+    /// Set to `Duration::ZERO` to disable. Only enforced when auth is required.
+    pub auth_timeout: std::time::Duration,
+    /// Duration of lame duck mode before shutdown (default: 30s).
+    pub lame_duck_duration: std::time::Duration,
+    /// Grace period before lame duck starts closing connections (default: 10s).
+    pub lame_duck_grace_period: std::time::Duration,
+    /// Port for the monitoring HTTP server (/varz, /healthz). `None` = disabled.
+    pub monitoring_port: Option<u16>,
+    /// Interest collapse templates for upstream leaf subscriptions.
+    ///
+    /// Each template is a NATS subject pattern (e.g., `"app.*.sessions.>"`).
+    /// When a client subscribes to a subject matching a template, the leaf sends
+    /// a single collapsed wildcard `LS+` to the hub instead of per-subject `LS+`.
+    /// This reduces upstream interest propagation from O(N) to O(1) per template.
+    #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
+    pub interest_collapse: Vec<String>,
+    /// Subject mapping rules for upstream leaf subscriptions.
+    ///
+    /// Each mapping rewrites subjects matching the `from` pattern to the `to` pattern
+    /// before sending upstream. Supports prefix mappings (`local.>` → `prod.>`) and
+    /// exact mappings.
+    #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
+    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
+    /// Port for cluster route connections. When set, the server listens for
+    /// inbound route connections and participates in full mesh clustering.
+    #[cfg(feature = "cluster")]
+    pub cluster_port: Option<u16>,
+    /// Seed route URLs for outbound connections (e.g., `["nats-route://host2:4248"]`).
+    #[cfg(feature = "cluster")]
+    pub cluster_seeds: Vec<String>,
+    /// Cluster name. All nodes in a cluster must use the same name.
+    #[cfg(feature = "cluster")]
+    pub cluster_name: Option<String>,
+    /// Port for gateway connections. When set, the server listens for
+    /// inbound gateway connections from other clusters.
+    #[cfg(feature = "gateway")]
+    pub gateway_port: Option<u16>,
+    /// This cluster's gateway name (required for gateway mode).
+    #[cfg(feature = "gateway")]
+    pub gateway_name: Option<String>,
+    /// Remote clusters to connect to via gateways.
+    #[cfg(feature = "gateway")]
+    pub gateway_remotes: Vec<GatewayRemote>,
+    /// Account configurations for multi-tenant isolation.
+    #[cfg(feature = "accounts")]
+    pub accounts: Vec<AccountConfig>,
+}
+
+impl Default for LeafServerConfig {
+    fn default() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: 4222,
+            #[cfg(feature = "leaf")]
+            hub_url: None,
+            server_name: "open-wire".to_string(),
+            max_read_buf_capacity: 65536,
+            write_buf_capacity: 65536,
+            workers,
+            ws_port: None,
+            #[cfg(feature = "hub")]
+            leafnode_port: None,
+            max_pending: 64 * 1024 * 1024,
+            max_payload: 1_048_576,
+            max_connections: 65_536,
+            max_control_line: 4_096,
+            max_subscriptions: 0,
+            ping_interval: std::time::Duration::from_secs(120),
+            max_pings_outstanding: 2,
+            client_auth: ClientAuth::None,
+            #[cfg(feature = "hub")]
+            leaf_auth: LeafAuth::None,
+            #[cfg(feature = "leaf")]
+            hub_credentials: None,
+            #[cfg(feature = "leaf")]
+            hub_remotes: Vec::new(),
+            metrics_port: None,
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            tls_verify: false,
+            pid_file: None,
+            log_file: None,
+            auth_timeout: std::time::Duration::from_secs(2),
+            lame_duck_duration: std::time::Duration::from_secs(30),
+            lame_duck_grace_period: std::time::Duration::from_secs(10),
+            monitoring_port: None,
+            #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
+            interest_collapse: Vec::new(),
+            #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
+            subject_mappings: Vec::new(),
+            #[cfg(feature = "cluster")]
+            cluster_port: None,
+            #[cfg(feature = "cluster")]
+            cluster_seeds: Vec::new(),
+            #[cfg(feature = "cluster")]
+            cluster_name: None,
+            #[cfg(feature = "gateway")]
+            gateway_port: None,
+            #[cfg(feature = "gateway")]
+            gateway_name: None,
+            #[cfg(feature = "gateway")]
+            gateway_remotes: Vec::new(),
+            #[cfg(feature = "accounts")]
+            accounts: Vec::new(),
+        }
+    }
+}
+
+/// A remote cluster for gateway connections.
+#[derive(Debug, Clone)]
+pub struct GatewayRemote {
+    /// Remote cluster name.
+    pub name: String,
+    /// Seed URLs for that cluster.
+    pub urls: Vec<String>,
+}
+
+/// Numeric account identifier. 0 = `$G` (global/default account).
+#[cfg(feature = "accounts")]
+pub type AccountId = u16;
+
+/// Configuration for a single named account.
+#[cfg(feature = "accounts")]
+#[derive(Debug, Clone)]
+pub struct AccountConfig {
+    /// Account name (e.g., "team_a").
+    pub name: String,
+    /// Usernames assigned to this account.
+    pub users: Vec<String>,
+    /// Subjects this account exports (makes available to other accounts).
+    pub exports: Vec<ExportRule>,
+    /// Subjects this account imports from other accounts.
+    pub imports: Vec<ImportRule>,
+}
+
+/// A subject export rule: makes subjects available for cross-account import.
+#[cfg(feature = "accounts")]
+#[derive(Debug, Clone)]
+pub struct ExportRule {
+    /// Subject pattern to export (e.g., "events.>"). Supports NATS wildcards.
+    pub subject: String,
+}
+
+/// A subject import rule: subscribes to subjects exported by another account.
+#[cfg(feature = "accounts")]
+#[derive(Debug, Clone)]
+pub struct ImportRule {
+    /// Source subject pattern to import (must match an export in the source account).
+    pub subject: String,
+    /// Name of the source account to import from.
+    pub account: String,
+    /// Optional local subject remapping (e.g., "team_a.events.>").
+    pub to: Option<String>,
+}
+
+/// Credentials for connecting to an upstream hub server.
+#[cfg(feature = "leaf")]
+#[derive(Debug, Clone, Default)]
+pub struct HubCredentials {
+    /// Username for user/password auth.
+    pub user: Option<String>,
+    /// Password for user/password auth.
+    pub pass: Option<String>,
+    /// Token for token auth.
+    pub token: Option<String>,
+    /// Path to a `.creds` file (JWT + NKey seed) for NKey/JWT auth.
+    pub creds_file: Option<String>,
+}
+
+/// Configuration for a single upstream hub remote connection.
+///
+/// Each `HubRemote` describes one upstream hub to connect to via the leaf node
+/// protocol. Multiple remotes allow a leaf node to bridge traffic to more than
+/// one hub simultaneously.
+#[cfg(feature = "leaf")]
+#[derive(Debug, Clone)]
+pub struct HubRemote {
+    /// Hub URL (e.g., `"nats://hub:4222"`).
+    pub url: String,
+    /// Optional credentials for this remote.
+    pub credentials: Option<HubCredentials>,
+    /// Interest collapse templates for this remote.
+    #[cfg(feature = "interest-collapse")]
+    pub interest_collapse: Vec<String>,
+    /// Subject mapping rules for this remote.
+    #[cfg(feature = "subject-mapping")]
+    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
+}
+
 /// Per-subject permission rule with allow/deny lists.
 #[derive(Debug, Clone, Default)]
 pub struct Permission {
@@ -226,240 +500,6 @@ impl LeafAuth {
     }
 }
 
-/// Credentials for connecting to an upstream hub server.
-#[cfg(feature = "leaf")]
-#[derive(Debug, Clone, Default)]
-pub struct HubCredentials {
-    /// Username for user/password auth.
-    pub user: Option<String>,
-    /// Password for user/password auth.
-    pub pass: Option<String>,
-    /// Token for token auth.
-    pub token: Option<String>,
-    /// Path to a `.creds` file (JWT + NKey seed) for NKey/JWT auth.
-    pub creds_file: Option<String>,
-}
-
-/// Configuration for a single upstream hub remote connection.
-///
-/// Each `HubRemote` describes one upstream hub to connect to via the leaf node
-/// protocol. Multiple remotes allow a leaf node to bridge traffic to more than
-/// one hub simultaneously.
-#[cfg(feature = "leaf")]
-#[derive(Debug, Clone)]
-pub struct HubRemote {
-    /// Hub URL (e.g., `"nats://hub:4222"`).
-    pub url: String,
-    /// Optional credentials for this remote.
-    pub credentials: Option<HubCredentials>,
-    /// Interest collapse templates for this remote.
-    #[cfg(feature = "interest-collapse")]
-    pub interest_collapse: Vec<String>,
-    /// Subject mapping rules for this remote.
-    #[cfg(feature = "subject-mapping")]
-    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
-}
-
-/// Generate a random nonce for NKey challenge-response auth.
-fn generate_nonce() -> String {
-    let mut data = [0u8; 11];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut data);
-    data_encoding::BASE64URL_NOPAD.encode(&data)
-}
-
-/// Compute a 6-character base36 hash from a string using FNV-1a.
-#[cfg(feature = "gateway")]
-fn fnv_hash_base36(s: &str) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0100_0000_01b3;
-    let mut h = FNV_OFFSET;
-    for b in s.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    // Convert to base36, take first 6 chars
-    let mut buf = String::with_capacity(6);
-    let mut val = h;
-    for _ in 0..6 {
-        let digit = (val % 36) as u8;
-        let c = if digit < 10 {
-            b'0' + digit
-        } else {
-            b'a' + digit - 10
-        };
-        buf.push(c as char);
-        val /= 36;
-    }
-    buf
-}
-
-/// Configuration for the leaf node server.
-#[derive(Debug, Clone)]
-pub struct LeafServerConfig {
-    /// Address to listen on (e.g., "0.0.0.0").
-    pub host: String,
-    /// Port to listen on.
-    pub port: u16,
-    /// Optional upstream hub URL (e.g., "nats://hub:4222").
-    #[cfg(feature = "leaf")]
-    pub hub_url: Option<String>,
-    /// Server name.
-    pub server_name: String,
-    /// Max per-client read buffer capacity in bytes (default: 64 KB).
-    /// The buffer starts small (512B) and grows adaptively up to this limit.
-    pub max_read_buf_capacity: usize,
-    /// Per-client write buffer capacity in bytes (default: 64 KB).
-    pub write_buf_capacity: usize,
-    /// Number of worker threads (default: available parallelism or 4).
-    pub workers: usize,
-    /// Optional WebSocket port. When set, a second listener accepts WebSocket
-    /// connections on this port (NATS protocol over WebSocket binary frames).
-    pub ws_port: Option<u16>,
-    /// Optional leafnode listen port. When set, open-wire acts as a hub and
-    /// accepts inbound leaf node connections on this port.
-    #[cfg(feature = "hub")]
-    pub leafnode_port: Option<u16>,
-    /// Maximum pending write bytes per connection before disconnecting as a
-    /// slow consumer (default: 64 MB, matching Go nats-server). 0 = unlimited.
-    pub max_pending: usize,
-    /// Maximum message payload size in bytes (default: 1 MB, matching Go nats-server).
-    /// Advertised in INFO and enforced on PUB/HPUB.
-    pub max_payload: usize,
-    /// Maximum simultaneous client connections (default: 65536). 0 = unlimited.
-    pub max_connections: usize,
-    /// Maximum control line length in bytes (default: 4096, matching Go nats-server).
-    pub max_control_line: usize,
-    /// Maximum subscriptions per client connection (default: 0 = unlimited).
-    pub max_subscriptions: usize,
-    /// Interval between server-initiated PING keepalives (default: 2 minutes).
-    /// Set to `Duration::ZERO` to disable keepalive.
-    pub ping_interval: std::time::Duration,
-    /// Maximum outstanding PINGs before closing a connection (default: 2).
-    pub max_pings_outstanding: u32,
-    /// Client authentication configuration.
-    pub client_auth: ClientAuth,
-    /// Inbound leaf node authentication configuration.
-    #[cfg(feature = "hub")]
-    pub leaf_auth: LeafAuth,
-    /// Credentials for connecting to the upstream hub.
-    #[cfg(feature = "leaf")]
-    pub hub_credentials: Option<HubCredentials>,
-    /// Multiple upstream hub remotes. When non-empty, each remote gets its own
-    /// independent connection with its own credentials and interest pipeline.
-    /// If empty and `hub_url` is set, a single remote is synthesized from the
-    /// legacy `hub_url`/`hub_credentials`/`interest_collapse`/`subject_mappings`.
-    #[cfg(feature = "leaf")]
-    pub hub_remotes: Vec<HubRemote>,
-    /// Port for Prometheus metrics HTTP endpoint. `None` = disabled.
-    pub metrics_port: Option<u16>,
-    /// Path to TLS certificate file (PEM). When set with `tls_key`, enables TLS.
-    pub tls_cert: Option<PathBuf>,
-    /// Path to TLS private key file (PEM).
-    pub tls_key: Option<PathBuf>,
-    /// Path to CA certificate file (PEM) for client certificate verification (mTLS).
-    pub tls_ca_cert: Option<PathBuf>,
-    /// When `true` (and `tls_ca_cert` is set), require and verify client certificates.
-    pub tls_verify: bool,
-    /// Path to write the server PID file. Removed on shutdown.
-    pub pid_file: Option<PathBuf>,
-    /// Path to the log file. When set, tracing output is directed here.
-    pub log_file: Option<PathBuf>,
-    /// Timeout for clients to send CONNECT after connection (default: 2s).
-    /// Set to `Duration::ZERO` to disable. Only enforced when auth is required.
-    pub auth_timeout: std::time::Duration,
-    /// Duration of lame duck mode before shutdown (default: 30s).
-    pub lame_duck_duration: std::time::Duration,
-    /// Grace period before lame duck starts closing connections (default: 10s).
-    pub lame_duck_grace_period: std::time::Duration,
-    /// Port for the monitoring HTTP server (/varz, /healthz). `None` = disabled.
-    pub monitoring_port: Option<u16>,
-    /// Interest collapse templates for upstream leaf subscriptions.
-    ///
-    /// Each template is a NATS subject pattern (e.g., `"app.*.sessions.>"`).
-    /// When a client subscribes to a subject matching a template, the leaf sends
-    /// a single collapsed wildcard `LS+` to the hub instead of per-subject `LS+`.
-    /// This reduces upstream interest propagation from O(N) to O(1) per template.
-    #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
-    pub interest_collapse: Vec<String>,
-    /// Subject mapping rules for upstream leaf subscriptions.
-    ///
-    /// Each mapping rewrites subjects matching the `from` pattern to the `to` pattern
-    /// before sending upstream. Supports prefix mappings (`local.>` → `prod.>`) and
-    /// exact mappings.
-    #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
-    pub subject_mappings: Vec<crate::interest::SubjectMapping>,
-    /// Port for cluster route connections. When set, the server listens for
-    /// inbound route connections and participates in full mesh clustering.
-    #[cfg(feature = "cluster")]
-    pub cluster_port: Option<u16>,
-    /// Seed route URLs for outbound connections (e.g., `["nats-route://host2:4248"]`).
-    #[cfg(feature = "cluster")]
-    pub cluster_seeds: Vec<String>,
-    /// Cluster name. All nodes in a cluster must use the same name.
-    #[cfg(feature = "cluster")]
-    pub cluster_name: Option<String>,
-    /// Port for gateway connections. When set, the server listens for
-    /// inbound gateway connections from other clusters.
-    #[cfg(feature = "gateway")]
-    pub gateway_port: Option<u16>,
-    /// This cluster's gateway name (required for gateway mode).
-    #[cfg(feature = "gateway")]
-    pub gateway_name: Option<String>,
-    /// Remote clusters to connect to via gateways.
-    #[cfg(feature = "gateway")]
-    pub gateway_remotes: Vec<GatewayRemote>,
-    /// Account configurations for multi-tenant isolation.
-    #[cfg(feature = "accounts")]
-    pub accounts: Vec<AccountConfig>,
-}
-
-/// A remote cluster for gateway connections.
-#[derive(Debug, Clone)]
-pub struct GatewayRemote {
-    /// Remote cluster name.
-    pub name: String,
-    /// Seed URLs for that cluster.
-    pub urls: Vec<String>,
-}
-
-/// Numeric account identifier. 0 = `$G` (global/default account).
-#[cfg(feature = "accounts")]
-pub type AccountId = u16;
-
-/// Configuration for a single named account.
-#[cfg(feature = "accounts")]
-#[derive(Debug, Clone)]
-pub struct AccountConfig {
-    /// Account name (e.g., "team_a").
-    pub name: String,
-    /// Usernames assigned to this account.
-    pub users: Vec<String>,
-    /// Subjects this account exports (makes available to other accounts).
-    pub exports: Vec<ExportRule>,
-    /// Subjects this account imports from other accounts.
-    pub imports: Vec<ImportRule>,
-}
-
-/// A subject export rule: makes subjects available for cross-account import.
-#[cfg(feature = "accounts")]
-#[derive(Debug, Clone)]
-pub struct ExportRule {
-    /// Subject pattern to export (e.g., "events.>"). Supports NATS wildcards.
-    pub subject: String,
-}
-
-/// A subject import rule: subscribes to subjects exported by another account.
-#[cfg(feature = "accounts")]
-#[derive(Debug, Clone)]
-pub struct ImportRule {
-    /// Source subject pattern to import (must match an export in the source account).
-    pub subject: String,
-    /// Name of the source account to import from.
-    pub account: String,
-    /// Optional local subject remapping (e.g., "team_a.events.>").
-    pub to: Option<String>,
-}
-
 /// Maps account names to numeric IDs and vice versa.
 #[cfg(feature = "accounts")]
 #[derive(Debug, Clone)]
@@ -651,68 +691,37 @@ pub(crate) fn build_reverse_imports(
     reverse
 }
 
-impl Default for LeafServerConfig {
-    fn default() -> Self {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        Self {
-            host: "0.0.0.0".to_string(),
-            port: 4222,
-            #[cfg(feature = "leaf")]
-            hub_url: None,
-            server_name: "open-wire".to_string(),
-            max_read_buf_capacity: 65536,
-            write_buf_capacity: 65536,
-            workers,
-            ws_port: None,
-            #[cfg(feature = "hub")]
-            leafnode_port: None,
-            max_pending: 64 * 1024 * 1024,
-            max_payload: 1_048_576,
-            max_connections: 65_536,
-            max_control_line: 4_096,
-            max_subscriptions: 0,
-            ping_interval: std::time::Duration::from_secs(120),
-            max_pings_outstanding: 2,
-            client_auth: ClientAuth::None,
-            #[cfg(feature = "hub")]
-            leaf_auth: LeafAuth::None,
-            #[cfg(feature = "leaf")]
-            hub_credentials: None,
-            #[cfg(feature = "leaf")]
-            hub_remotes: Vec::new(),
-            metrics_port: None,
-            tls_cert: None,
-            tls_key: None,
-            tls_ca_cert: None,
-            tls_verify: false,
-            pid_file: None,
-            log_file: None,
-            auth_timeout: std::time::Duration::from_secs(2),
-            lame_duck_duration: std::time::Duration::from_secs(30),
-            lame_duck_grace_period: std::time::Duration::from_secs(10),
-            monitoring_port: None,
-            #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
-            interest_collapse: Vec::new(),
-            #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
-            subject_mappings: Vec::new(),
-            #[cfg(feature = "cluster")]
-            cluster_port: None,
-            #[cfg(feature = "cluster")]
-            cluster_seeds: Vec::new(),
-            #[cfg(feature = "cluster")]
-            cluster_name: None,
-            #[cfg(feature = "gateway")]
-            gateway_port: None,
-            #[cfg(feature = "gateway")]
-            gateway_name: None,
-            #[cfg(feature = "gateway")]
-            gateway_remotes: Vec::new(),
-            #[cfg(feature = "accounts")]
-            accounts: Vec::new(),
-        }
+/// Generate a random nonce for NKey challenge-response auth.
+fn generate_nonce() -> String {
+    let mut data = [0u8; 11];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut data);
+    data_encoding::BASE64URL_NOPAD.encode(&data)
+}
+
+/// Compute a 6-character base36 hash from a string using FNV-1a.
+#[cfg(feature = "gateway")]
+fn fnv_hash_base36(s: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
     }
+    // Convert to base36, take first 6 chars
+    let mut buf = String::with_capacity(6);
+    let mut val = h;
+    for _ in 0..6 {
+        let digit = (val % 36) as u8;
+        let c = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
+        buf.push(c as char);
+        val /= 36;
+    }
+    buf
 }
 
 /// Install the Prometheus metrics exporter on the given port.
@@ -1423,15 +1432,6 @@ impl ServerState {
     pub(crate) fn resolve_account(&self, name: &str) -> AccountId {
         self.account_registry.id_by_name(name).unwrap_or(0)
     }
-}
-
-/// An open-wire NATS-compatible message relay server.
-///
-/// Accepts local client connections, routes messages between them,
-/// and optionally forwards traffic to an upstream NATS hub.
-pub struct LeafServer {
-    config: LeafServerConfig,
-    state: Arc<ServerState>,
 }
 
 impl LeafServer {
