@@ -166,7 +166,7 @@ state machine in the worker event loop.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> SendInfo : accept() → register fd
+    [*] --> SendInfo : accept → register fd
     SendInfo --> WaitConnect : INFO written to write_buf
     WaitConnect --> Active : valid CONNECT received
 
@@ -181,23 +181,23 @@ stateDiagram-v2
     Draining --> [*] : write_buf empty, close fd
 
     WaitConnect --> [*] : invalid CONNECT / timeout
-    Active --> [*] : protocol error (HandleResult Disconnect)
+    Active --> [*] : protocol error, HandleResult Disconnect
     Active --> [*] : I/O error / EOF
 
     note right of SendInfo
-        worker.rs — handle_writable()
+        worker.rs — handle_writable
         Writes INFO JSON to socket
     end note
 
     note right of WaitConnect
-        worker.rs — process_wait_connect()
+        worker.rs — process_wait_connect
         Parses CONNECT, validates auth
         Sets echo, no_responders, etc.
     end note
 
     note right of Active
-        worker.rs — process_active()
-        Calls H.parse_op() + H.handle_op()
+        worker.rs — process_active
+        Calls H.parse_op + H.handle_op
         via ConnectionHandler trait
         handler/conn.rs:25
     end note
@@ -376,7 +376,7 @@ stateDiagram-v2
             DrainMsgBuf --> WriteSocket
         }
         note right of EventFd
-            handle_eventfd()
+            handle_eventfd
             worker.rs:476
             Scans ALL conns for pending
             MsgWriter data
@@ -391,7 +391,7 @@ stateDiagram-v2
             state ProcessActive {
                 [*] --> ReadLoop
                 ReadLoop --> ParseOp : data available
-                ParseOp --> HandleOp : H.parse_op()
+                ParseOp --> HandleOp : H.parse_op
                 HandleOp --> ReadLoop : HandleResult Ok
                 HandleOp --> FlushAndRead : HandleResult Flush
                 HandleOp --> Disconnect : HandleResult Disconnect
@@ -399,7 +399,7 @@ stateDiagram-v2
             }
         }
         note right of ClientFd
-            process_active[H]()
+            process_active[H]
             worker.rs:2152
             Generic over ConnectionHandler
             handler/conn.rs:25
@@ -408,9 +408,9 @@ stateDiagram-v2
 
     HandleEvent --> FlushPending : all events processed
     note right of FlushPending
-        flush_pending()
+        flush_pending
         worker.rs:809
-        Same-worker delivery bypass:
+        Same-worker delivery bypass
         skip eventfd round-trip
     end note
     FlushPending --> EpollWait
@@ -529,7 +529,7 @@ stateDiagram-v2
         [*] --> ForwardAll
         ForwardAll : Forward all messages to peer gateway
         ForwardAll : No per-subject filtering
-        ForwardAll --> TrackNoInterest : peer sends RS- (no interest)
+        ForwardAll --> TrackNoInterest : peer sends RS-, no interest
         TrackNoInterest : Build deny list of subjects
         TrackNoInterest : Skip subjects in deny list
     }
