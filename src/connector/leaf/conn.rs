@@ -8,9 +8,9 @@ use std::io::{self, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
-use crate::core::buf::AdaptiveBuf;
-use crate::core::nats_proto::{self, LeafOp, MsgBuilder};
-use crate::core::types::HeaderMap;
+use crate::buf::AdaptiveBuf;
+use crate::nats_proto::{self, LeafOp, MsgBuilder};
+use crate::types::HeaderMap;
 
 /// Resolved credentials to include in a leaf CONNECT message to the hub.
 #[derive(Debug, Default)]
@@ -98,11 +98,11 @@ impl Write for HubStream {
 pub(crate) struct LeafConn {
     stream: HubStream,
     read_buf: AdaptiveBuf,
-    buf_config: crate::core::buf::BufConfig,
+    buf_config: crate::buf::BufConfig,
 }
 
 impl LeafConn {
-    pub(crate) fn new(stream: TcpStream, buf_config: crate::core::buf::BufConfig) -> Self {
+    pub(crate) fn new(stream: TcpStream, buf_config: crate::buf::BufConfig) -> Self {
         Self {
             stream: HubStream::Plain(stream),
             read_buf: AdaptiveBuf::new(buf_config.max_read_buf),
@@ -114,7 +114,7 @@ impl LeafConn {
     pub(crate) fn new_tls(
         tcp: TcpStream,
         tls_conn: rustls::ClientConnection,
-        buf_config: crate::core::buf::BufConfig,
+        buf_config: crate::buf::BufConfig,
     ) -> Self {
         Self {
             stream: HubStream::Tls {

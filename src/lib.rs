@@ -6,15 +6,24 @@
 
 // Internal module visibility is controlled at the item level within each module.
 // Modules are `pub` to allow re-exports from lib.rs; internal items use `pub(crate)`.
+pub mod config;
 pub mod connector;
 pub mod core;
+pub(crate) mod handler;
+pub(crate) mod io;
+pub mod protocol;
+pub mod pubsub;
+
+// Convenience re-exports (were in core/mod.rs).
+pub(crate) use io::buf;
+pub(crate) use io::msg_writer;
+pub(crate) use io::websocket;
+pub use protocol::nats_proto;
+pub use protocol::types;
+pub use pubsub::sub_list;
 
 // Public re-exports for external consumers (main.rs, tests, benchmarks).
-pub use core::config;
-pub use core::nats_proto;
 pub use core::server;
-pub use core::sub_list;
-pub use core::types;
 
 #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
 pub use connector::leaf::SubjectMapping;

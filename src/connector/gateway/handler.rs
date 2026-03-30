@@ -11,14 +11,14 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
-use crate::core::handler::propagation::unwrap_gateway_reply_bytes;
-use crate::core::handler::{
+use crate::handler::propagation::unwrap_gateway_reply_bytes;
+use crate::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
-use crate::core::nats_proto;
-use crate::core::nats_proto::GatewayOp;
-use crate::core::sub_list::Subscription;
+use crate::nats_proto;
+use crate::nats_proto::GatewayOp;
+use crate::sub_list::Subscription;
 
 /// Handles gateway protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct GatewayHandler;
@@ -233,7 +233,7 @@ impl GatewayHandler {
         wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         reply: Option<Bytes>,
-        headers: Option<crate::core::types::HeaderMap>,
+        headers: Option<crate::types::HeaderMap>,
         payload: Bytes,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         let payload_len = payload.len() as u64;

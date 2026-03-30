@@ -18,19 +18,19 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
-use crate::core::buf::Backoff;
-#[cfg(feature = "accounts")]
-use crate::core::handler::deliver_cross_account_upstream;
-use crate::core::handler::propagation::unwrap_gateway_reply_bytes;
-use crate::core::handler::{
-    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,
-};
-use crate::core::nats_proto::{self, GatewayOp, MsgBuilder};
+use crate::buf::Backoff;
 use crate::core::server::{
     GatewayInterestMode, GatewayInterestState, GatewayRemote, ServerState,
     GATEWAY_MAX_NI_BEFORE_SWITCH,
 };
-use crate::core::sub_list::{MsgWriter, Subscription};
+#[cfg(feature = "accounts")]
+use crate::handler::deliver_cross_account_upstream;
+use crate::handler::propagation::unwrap_gateway_reply_bytes;
+use crate::handler::{
+    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,
+};
+use crate::nats_proto::{self, GatewayOp, MsgBuilder};
+use crate::sub_list::{MsgWriter, Subscription};
 
 /// Virtual connection ID range for outbound gateway connections.
 /// Uses high IDs to avoid collision with inbound connection IDs and route IDs.

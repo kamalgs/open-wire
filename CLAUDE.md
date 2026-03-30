@@ -15,27 +15,27 @@ Built with raw epoll, zero-copy parsing, and no async runtime.
 src/
 ├── main.rs              # CLI binary (--port, --hub, --ws-port, --workers, --cluster-*)
 ├── lib.rs               # Module declarations + public re-exports
-├── core/                # Shared infrastructure
-│   ├── mod.rs           # Facade re-exports (protocol, io, pubsub, handler + convenience re-exports)
-│   ├── protocol/
-│   │   ├── mod.rs       # types + nats_proto
-│   │   ├── types.rs     # ServerInfo, ConnectInfo, HeaderMap
-│   │   └── nats_proto.rs # ClientOp/LeafOp/RouteOp, MsgBuilder, parsers
-│   ├── io/
-│   │   ├── mod.rs       # buf + msg_writer + websocket
-│   │   ├── buf.rs       # AdaptiveBuf, BufConfig, Backoff, op re-exports
-│   │   ├── msg_writer.rs # MsgWriter, create_eventfd
-│   │   └── websocket.rs # WsCodec, HTTP upgrade, SHA-1/Base64
-│   ├── pubsub/
-│   │   ├── mod.rs       # sub_list
-│   │   └── sub_list.rs  # SubscriptionManager, WildTrie, Subscription
-│   ├── handler/         # Handler framework + client protocol + propagation
-│   │   ├── mod.rs       # Facade re-exports
-│   │   ├── conn.rs      # ConnectionHandler trait, ConnCtx, ConnExt
-│   │   ├── delivery.rs  # Msg, deliver_to_subs, publish
-│   │   ├── client.rs    # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
-│   │   └── propagation.rs # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
-│   ├── config.rs        # Go nats-server .conf file parser
+├── config.rs            # Go nats-server .conf file parser
+├── protocol/
+│   ├── mod.rs           # types + nats_proto
+│   ├── types.rs         # ServerInfo, ConnectInfo, HeaderMap
+│   └── nats_proto.rs    # ClientOp/LeafOp/RouteOp, MsgBuilder, parsers
+├── io/
+│   ├── mod.rs           # buf + msg_writer + websocket
+│   ├── buf.rs           # AdaptiveBuf, BufConfig, Backoff, op re-exports
+│   ├── msg_writer.rs    # MsgWriter, create_eventfd
+│   └── websocket.rs     # WsCodec, HTTP upgrade, SHA-1/Base64
+├── pubsub/
+│   ├── mod.rs           # sub_list
+│   └── sub_list.rs      # SubscriptionManager, WildTrie, Subscription
+├── handler/             # Handler framework + client protocol + propagation
+│   ├── mod.rs           # Facade re-exports
+│   ├── conn.rs          # ConnectionHandler trait, ConnCtx, ConnExt
+│   ├── delivery.rs      # Msg, deliver_to_subs, publish
+│   ├── client.rs        # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
+│   └── propagation.rs   # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
+├── core/                # Core runtime only
+│   ├── mod.rs           # server + worker declarations
 │   ├── server.rs        # LeafServer, LeafServerConfig, ServerState
 │   └── worker.rs        # Worker epoll event loop
 └── connector/           # Protocol bridge connectors
@@ -187,7 +187,7 @@ Always run `cargo +nightly fmt` before committing.
 |------|----------|---------|
 | `LeafServer` | `core/server.rs` | Public API entry point |
 | `LeafServerConfig` | `core/server.rs` | Server configuration |
-| `load_config` | `core/config.rs` | Go nats-server `.conf` file parser |
+| `load_config` | `config.rs` | Go nats-server `.conf` file parser |
 | `Worker` | `core/worker.rs` | Per-thread epoll event loop |
 | `NatsProto` / `MsgBuilder` | `core/protocol/nats_proto.rs` | Protocol parser + message builder |
 | `SubscriptionManager` | `core/pubsub/sub_list.rs` | Subscription storage + wildcard matching |

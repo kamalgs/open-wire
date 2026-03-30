@@ -17,6 +17,9 @@ use bytes::{Buf, BufMut, BytesMut};
 use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
+#[cfg(feature = "mesh")]
+use crate::buf::RouteOp;
+use crate::buf::{AdaptiveBuf, ClientOp};
 #[cfg(feature = "gateway")]
 use crate::connector::gateway::GatewayHandler;
 #[cfg(feature = "hub")]
@@ -25,22 +28,19 @@ use crate::connector::leaf::LeafHandler;
 use crate::connector::leaf::UpstreamCmd;
 #[cfg(feature = "mesh")]
 use crate::connector::mesh::RouteHandler;
-#[cfg(feature = "mesh")]
-use crate::core::buf::RouteOp;
-use crate::core::buf::{AdaptiveBuf, ClientOp};
-use crate::core::handler::client::ClientHandler;
+use crate::core::server::ServerState;
+use crate::handler::client::ClientHandler;
 #[cfg(any(feature = "mesh", feature = "gateway"))]
-use crate::core::handler::propagation::send_existing_route_subs;
+use crate::handler::propagation::send_existing_route_subs;
 #[cfg(feature = "hub")]
-use crate::core::handler::propagation::send_existing_subs;
-use crate::core::handler::{
+use crate::handler::propagation::send_existing_subs;
+use crate::handler::{
     handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult,
     MessageDeliveryHub,
 };
-use crate::core::nats_proto;
-use crate::core::server::ServerState;
-use crate::core::sub_list::{create_eventfd, MsgWriter};
-use crate::core::websocket::{self, DecodeStatus, WsCodec};
+use crate::nats_proto;
+use crate::sub_list::{create_eventfd, MsgWriter};
+use crate::websocket::{self, DecodeStatus, WsCodec};
 
 use rustls::ServerConnection;
 

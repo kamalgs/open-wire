@@ -22,15 +22,15 @@ use std::time::Instant;
 use metrics::counter;
 use tracing::{error, info, warn};
 
-use crate::core::types::{ConnectInfo, ServerInfo};
+use crate::types::{ConnectInfo, ServerInfo};
 
+use crate::buf::BufConfig;
 #[cfg(feature = "leaf")]
 use crate::connector::leaf::{Upstream, UpstreamCmd};
-use crate::core::buf::BufConfig;
-#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
-use crate::core::sub_list::MsgWriter;
-use crate::core::sub_list::SubscriptionManager;
 use crate::core::worker::{Worker, WorkerHandle};
+#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
+use crate::sub_list::MsgWriter;
+use crate::sub_list::SubscriptionManager;
 
 /// An open-wire NATS-compatible message relay server.
 ///
@@ -322,7 +322,7 @@ impl Permission {
         if self
             .deny
             .iter()
-            .any(|p| crate::core::sub_list::subject_matches(p, subject))
+            .any(|p| crate::sub_list::subject_matches(p, subject))
         {
             return false;
         }
@@ -331,7 +331,7 @@ impl Permission {
         }
         self.allow
             .iter()
-            .any(|p| crate::core::sub_list::subject_matches(p, subject))
+            .any(|p| crate::sub_list::subject_matches(p, subject))
     }
 }
 
@@ -627,8 +627,8 @@ pub(crate) fn resolve_cross_account_routes(
             }
             let src_acct = &accounts[src_acct_idx];
             let matching_export = src_acct.exports.iter().find(|e| {
-                crate::core::sub_list::subject_matches(&e.subject, &import.subject)
-                    || crate::core::sub_list::subject_matches(&import.subject, &e.subject)
+                crate::sub_list::subject_matches(&e.subject, &import.subject)
+                    || crate::sub_list::subject_matches(&import.subject, &e.subject)
             });
             let export_pattern = match matching_export {
                 Some(e) => e.subject.clone(),
@@ -2176,7 +2176,7 @@ impl LeafServer {
     /// Reload configuration from file. Updates hot-reloadable values.
     fn reload_config(&self, path: &str) {
         info!(path, "reloading configuration");
-        match crate::core::config::load_config(std::path::Path::new(path)) {
+        match crate::config::load_config(std::path::Path::new(path)) {
             Ok(new_config) => {
                 // Hot-reload numeric limits
                 self.state

@@ -8,13 +8,13 @@ use bytes::Bytes;
 use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
-use crate::core::handler::propagation::propagate_all_interest;
-use crate::core::handler::{
+use crate::handler::propagation::propagate_all_interest;
+use crate::handler::{
     bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
-use crate::core::nats_proto::{self, ClientOp};
-use crate::core::sub_list::Subscription;
+use crate::nats_proto::{self, ClientOp};
+use crate::sub_list::Subscription;
 
 /// Handles client protocol operations (PUB, SUB, UNSUB, PING, PONG).
 pub(crate) struct ClientHandler;
@@ -179,7 +179,7 @@ impl ClientHandler {
         {
             if let Some(reverses) = wctx.state.reverse_imports.get(conn.account_id as usize) {
                 for ri in reverses {
-                    if crate::core::sub_list::subject_matches(&ri.local_pattern, subject_str) {
+                    if crate::sub_list::subject_matches(&ri.local_pattern, subject_str) {
                         let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                         #[cfg(feature = "leaf")]
                         {
@@ -284,7 +284,7 @@ impl ClientHandler {
         subject: Bytes,
         payload: Bytes,
         respond: Option<Bytes>,
-        headers: Option<crate::core::types::HeaderMap>,
+        headers: Option<crate::types::HeaderMap>,
     ) -> (HandleResult, Vec<(u64, u64)>) {
         // Check publish permissions
         if let Some(ref perms) = conn.permissions {
@@ -347,7 +347,7 @@ impl ClientHandler {
 
                     if !has_sub {
                         // Build 503 No Responders header and deliver to reply subject.
-                        let mut hdr = crate::core::types::HeaderMap::new();
+                        let mut hdr = crate::types::HeaderMap::new();
                         hdr.set_status(503, None);
                         let reply_str = bytes_to_str(reply_bytes);
                         let empty = Bytes::new();
@@ -441,7 +441,7 @@ fn propagate_reverse_unsub(
 ) {
     if let Some(reverses) = wctx.state.reverse_imports.get(account_id as usize) {
         for ri in reverses {
-            if crate::core::sub_list::subject_matches(&ri.local_pattern, subject) {
+            if crate::sub_list::subject_matches(&ri.local_pattern, subject) {
                 let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                 #[cfg(feature = "leaf")]
                 {

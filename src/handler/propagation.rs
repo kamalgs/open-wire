@@ -4,11 +4,11 @@
 //! leaf, route, and gateway peers. Also handles gateway reply rewriting.
 
 #[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
-use crate::core::nats_proto;
-#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::core::server::ServerState;
 #[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
-use crate::core::sub_list::MsgWriter;
+use crate::nats_proto;
+#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
+use crate::sub_list::MsgWriter;
 
 #[cfg(feature = "gateway")]
 use std::cell::RefCell;
@@ -390,9 +390,9 @@ mod tests {
             auth_timeout_ms: AtomicU64::new(0),
             max_pings_outstanding: AtomicU32::new(0),
             #[cfg(not(feature = "accounts"))]
-            subs: std::sync::RwLock::new(crate::core::sub_list::SubList::new()),
+            subs: std::sync::RwLock::new(crate::sub_list::SubList::new()),
             #[cfg(feature = "accounts")]
-            account_subs: vec![std::sync::RwLock::new(crate::core::sub_list::SubList::new())],
+            account_subs: vec![std::sync::RwLock::new(crate::sub_list::SubList::new())],
             #[cfg(feature = "accounts")]
             account_registry: crate::core::server::AccountRegistry::new(&[]),
             #[cfg(feature = "accounts")]
@@ -470,7 +470,7 @@ mod tests {
         use std::sync::Arc;
 
         use crate::core::server::{Permission, Permissions};
-        use crate::core::sub_list::MsgWriter;
+        use crate::sub_list::MsgWriter;
 
         let state = test_server_state();
         let writer = MsgWriter::new_dummy();
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     #[cfg(feature = "hub")]
     fn test_propagate_leaf_sends_to_all_leaves() {
-        use crate::core::sub_list::MsgWriter;
+        use crate::sub_list::MsgWriter;
 
         let state = test_server_state();
         let w1 = MsgWriter::new_dummy();
@@ -531,7 +531,7 @@ mod tests {
         use std::sync::Arc;
 
         use crate::core::server::{Permission, Permissions};
-        use crate::core::sub_list::{MsgWriter, Subscription};
+        use crate::sub_list::{MsgWriter, Subscription};
 
         let state = test_server_state();
 

@@ -11,14 +11,14 @@ use tracing::{debug, error, info, warn};
 
 use crate::connector::leaf::InterestPipeline;
 #[cfg(feature = "accounts")]
-use crate::core::handler::deliver_cross_account_upstream;
-use crate::core::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream, Msg};
-use crate::core::types::HeaderMap;
+use crate::handler::deliver_cross_account_upstream;
+use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream, Msg};
+use crate::types::HeaderMap;
 
+use crate::buf::LeafOp;
 use crate::connector::leaf::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
-use crate::core::buf::LeafOp;
 use crate::core::server::{HubCredentials, ServerState};
-use crate::core::sub_list::MsgWriter;
+use crate::sub_list::MsgWriter;
 
 /// Commands sent from the Upstream handle to the background writer thread.
 #[derive(Debug)]
@@ -36,7 +36,7 @@ pub(crate) enum UpstreamCmd {
     Shutdown,
 }
 
-use crate::core::buf::Backoff;
+use crate::buf::Backoff;
 
 /// Manages connection to an upstream NATS hub server using the leaf node protocol.
 /// Sends LS+/LS- for subscription interest and LMSG for messages.

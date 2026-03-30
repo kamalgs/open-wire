@@ -8,15 +8,15 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
-use crate::core::buf::RouteOp;
+use crate::buf::RouteOp;
 #[cfg(feature = "gateway")]
-use crate::core::handler::propagation::propagate_gateway_interest;
-use crate::core::handler::{
+use crate::handler::propagation::propagate_gateway_interest;
+use crate::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
-use crate::core::nats_proto;
-use crate::core::sub_list::Subscription;
+use crate::nats_proto;
+use crate::sub_list::Subscription;
 
 /// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct RouteHandler;
@@ -48,7 +48,7 @@ impl ConnectionHandler for RouteHandler {
             } => {
                 #[cfg(feature = "accounts")]
                 let account_id = {
-                    let acct_str = crate::core::handler::bytes_to_str(&account);
+                    let acct_str = crate::handler::bytes_to_str(&account);
                     wctx.state.resolve_account(acct_str)
                 };
                 let result = Self::handle_route_sub(
@@ -69,7 +69,7 @@ impl ConnectionHandler for RouteHandler {
             } => {
                 #[cfg(feature = "accounts")]
                 let account_id = {
-                    let acct_str = crate::core::handler::bytes_to_str(&account);
+                    let acct_str = crate::handler::bytes_to_str(&account);
                     wctx.state.resolve_account(acct_str)
                 };
                 let result = Self::handle_route_unsub(
@@ -92,7 +92,7 @@ impl ConnectionHandler for RouteHandler {
             } => {
                 #[cfg(feature = "accounts")]
                 let account_id = {
-                    let acct_str = crate::core::handler::bytes_to_str(&account);
+                    let acct_str = crate::handler::bytes_to_str(&account);
                     wctx.state.resolve_account(acct_str)
                 };
                 Self::handle_rmsg(
@@ -286,7 +286,7 @@ impl RouteHandler {
         wctx: &mut MessageDeliveryHub<'_>,
         subject: Bytes,
         reply: Option<Bytes>,
-        headers: Option<crate::core::types::HeaderMap>,
+        headers: Option<crate::types::HeaderMap>,
         payload: Bytes,
         #[cfg(feature = "accounts")] account_id: crate::core::server::AccountId,
     ) -> (HandleResult, Vec<(u64, u64)>) {

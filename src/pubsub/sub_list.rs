@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
-pub(crate) use crate::core::msg_writer::{create_eventfd, MsgWriter};
+pub(crate) use crate::msg_writer::{create_eventfd, MsgWriter};
 
 /// Backward-compatible alias for `MsgWriter`.
 pub(crate) type DirectWriter = MsgWriter;

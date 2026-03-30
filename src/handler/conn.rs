@@ -9,7 +9,7 @@ use std::io;
 use bytes::{Bytes, BytesMut};
 
 use crate::core::server::Permissions;
-use crate::core::sub_list::MsgWriter;
+use crate::sub_list::MsgWriter;
 
 #[cfg(feature = "leaf")]
 use crate::connector::leaf::UpstreamCmd;

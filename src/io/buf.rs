@@ -16,18 +16,18 @@ use std::time::Duration;
 use bytes::{BufMut, BytesMut};
 
 #[cfg(test)]
-use crate::core::nats_proto::{self, MsgBuilder};
+use crate::nats_proto::{self, MsgBuilder};
 #[cfg(test)]
-use crate::core::types::HeaderMap;
+use crate::types::HeaderMap;
 #[cfg(test)]
-use crate::core::types::ServerInfo;
+use crate::types::ServerInfo;
 
 // Re-export parsed op types so the rest of the crate uses nats_proto's types.
-pub(crate) use crate::core::nats_proto::ClientOp;
+pub(crate) use crate::nats_proto::ClientOp;
 #[cfg(any(feature = "leaf", feature = "hub"))]
-pub(crate) use crate::core::nats_proto::LeafOp;
+pub(crate) use crate::nats_proto::LeafOp;
 #[cfg(feature = "mesh")]
-pub(crate) use crate::core::nats_proto::RouteOp;
+pub(crate) use crate::nats_proto::RouteOp;
 
 // --- Adaptive read buffer (Go-style dynamic sizing) ---
 
@@ -548,7 +548,7 @@ mod tests {
         hub.flush().unwrap();
 
         let op = reader.read_leaf_op().unwrap().unwrap();
-        assert!(matches!(op, crate::core::nats_proto::LeafOp::Ping));
+        assert!(matches!(op, crate::nats_proto::LeafOp::Ping));
     }
 
     // --- AdaptiveBuf tests ---

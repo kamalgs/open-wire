@@ -24,8 +24,8 @@ use super::ConnCtx;
 #[cfg(feature = "leaf")]
 use crate::connector::leaf::UpstreamCmd;
 use crate::core::server::ServerState;
-use crate::core::sub_list::MsgWriter;
-use crate::core::types::HeaderMap;
+use crate::sub_list::MsgWriter;
+use crate::types::HeaderMap;
 
 /// Worker-level context for delivery and notification.
 pub(crate) struct MessageDeliveryHub<'a> {
@@ -208,7 +208,7 @@ impl MessageDeliveryHub<'_> {
 #[inline]
 #[allow(unused_variables)]
 pub(crate) fn deliver_to_sub_inner(
-    sub: &crate::core::sub_list::Subscription,
+    sub: &crate::sub_list::Subscription,
     msg: &Msg<'_>,
     #[cfg(feature = "accounts")] account_name: &[u8],
 ) -> bool {
@@ -256,7 +256,7 @@ pub(crate) fn deliver_to_sub_inner(
 #[inline]
 #[allow(unused_variables)]
 fn deliver_to_subs_core<F>(
-    subs: &crate::core::sub_list::SubscriptionManager,
+    subs: &crate::sub_list::SubscriptionManager,
     msg: &Msg<'_>,
     skip_conn_id: u64,
     scope: &DeliveryScope,
@@ -265,7 +265,7 @@ fn deliver_to_subs_core<F>(
     mut on_deliver: F,
 ) -> (usize, Vec<(u64, u64)>)
 where
-    F: FnMut(&crate::core::sub_list::Subscription),
+    F: FnMut(&crate::sub_list::Subscription),
 {
     let mut delivered: usize = 0;
     let (_match_count, expired) = subs.for_each_match(msg.subject_str, |sub| {
@@ -286,8 +286,7 @@ where
         // Dispatch: gateway subs get reply-rewritten RMSG, others go through deliver_to_sub_inner.
         #[cfg(feature = "gateway")]
         if sub.is_gateway {
-            let gw_reply =
-                crate::core::handler::propagation::rewrite_gateway_reply(msg.reply, state);
+            let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, state);
             sub.writer.write_rmsg(
                 msg.subject,
                 gw_reply.as_deref(),
@@ -612,8 +611,7 @@ pub(crate) fn forward_to_optimistic_gateways(
         }
 
         // Rewrite reply with _GR_ prefix before forwarding across gateway.
-        let gw_reply =
-            crate::core::handler::propagation::rewrite_gateway_reply(msg.reply, wctx.state);
+        let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, wctx.state);
         gis.writer.write_rmsg(
             msg.subject,
             gw_reply.as_deref(),
@@ -655,18 +653,15 @@ pub(crate) fn deliver_cross_account(
     let mut all_expired = Vec::new();
 
     for route in routes {
-        if !crate::core::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
+        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
             continue;
         }
 
         let (dst_subject_str, dst_subject_bytes);
         match &route.remap {
             Some(r) => {
-                dst_subject_str = crate::core::sub_list::remap_subject(
-                    &r.from_pattern,
-                    &r.to_pattern,
-                    msg.subject_str,
-                );
+                dst_subject_str =
+                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, msg.subject_str);
                 dst_subject_bytes = dst_subject_str.as_bytes();
             }
             None => {
@@ -720,18 +715,15 @@ pub(crate) fn deliver_cross_account_upstream(
     let mut all_expired = Vec::new();
 
     for route in routes {
-        if !crate::core::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
+        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
             continue;
         }
 
         let (dst_subject_str, dst_subject_bytes_owned);
         match &route.remap {
             Some(r) => {
-                dst_subject_str = crate::core::sub_list::remap_subject(
-                    &r.from_pattern,
-                    &r.to_pattern,
-                    msg.subject_str,
-                );
+                dst_subject_str =
+                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, msg.subject_str);
                 dst_subject_bytes_owned = Some(dst_subject_str.as_bytes().to_vec());
             }
             None => {
@@ -771,7 +763,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
     use std::sync::Arc;
 
-    use crate::core::sub_list::{DirectWriter, SubList, Subscription};
+    use crate::sub_list::{DirectWriter, SubList, Subscription};
 
     use super::*;
 
