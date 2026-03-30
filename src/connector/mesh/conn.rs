@@ -18,12 +18,12 @@ use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
 use crate::core::buf::Backoff;
+use crate::core::handler::{
+    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,
+};
 use crate::core::nats_proto::{self, MsgBuilder, RouteOp};
 use crate::core::server::ServerState;
 use crate::core::sub_list::{MsgWriter, Subscription};
-use crate::handler::{
-    deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,
-};
 
 /// Virtual connection ID range for outbound route connections.
 /// Uses high IDs to avoid collision with inbound connection IDs.

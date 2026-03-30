@@ -870,7 +870,7 @@ async fn leaf_queue_distribution() {
 // --- Cluster mode helpers ---
 
 /// Start a LeafServer in cluster mode, returning the shutdown sender.
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 fn spawn_cluster_node(
     client_port: u16,
     cluster_port: u16,
@@ -904,7 +904,7 @@ fn spawn_cluster_node(
 // --- Cluster mode tests ---
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_two_node_pub_sub() {
     // Node A: cluster port, no seeds
     let port_a = free_port();
@@ -964,7 +964,7 @@ async fn cluster_two_node_pub_sub() {
 }
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_reverse_direction() {
     // Test message flow: publish on A, subscribe on B
     let port_a = free_port();
@@ -1017,7 +1017,7 @@ async fn cluster_reverse_direction() {
 }
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_three_node() {
     // Three-node cluster: A ← B (seed A), A ← C (seed A)
     let port_a = free_port();
@@ -1096,7 +1096,7 @@ async fn cluster_three_node() {
 }
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_gossip_discovery() {
     // Three-node cluster where B and C only seed A.
     // B and C should discover each other via A's gossip and form a direct route.
@@ -1168,7 +1168,7 @@ async fn cluster_gossip_discovery() {
 }
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_partial_seed() {
     // Chain topology: A seeds B, B seeds C.
     // C should discover A via transitive gossip and form a full mesh.
@@ -1236,7 +1236,7 @@ async fn cluster_partial_seed() {
 }
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_queue_semantics() {
     let port_a = free_port();
     let cport_a = free_port();
@@ -1306,7 +1306,7 @@ async fn cluster_queue_semantics() {
 }
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_one_hop_enforcement() {
     // 3-node cluster: A, B (seed A), C (seed A)
     let port_a = free_port();
@@ -1373,7 +1373,7 @@ async fn cluster_one_hop_enforcement() {
 }
 
 #[tokio::test]
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 async fn cluster_sub_unsub_propagation() {
     let port_a = free_port();
     let cport_a = free_port();
@@ -1465,11 +1465,11 @@ fn spawn_gateway_node(
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: server_name.to_string(),
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         cluster_port: Some(_cluster_port),
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         cluster_seeds: _cluster_seeds,
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         cluster_name: Some(gateway_name.to_string()),
         gateway_port: Some(gateway_port),
         gateway_name: Some(gateway_name.to_string()),

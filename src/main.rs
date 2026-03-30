@@ -193,17 +193,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Cluster flags
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     if let Some(v) = args.opt_value_from_str("--cluster-port")? {
         config.cluster_port = Some(v);
     }
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     if let Some(v) = args.opt_value_from_str::<_, String>("--cluster-seeds")? {
         config
             .cluster_seeds
             .extend(v.split(',').map(|s| s.trim().to_string()));
     }
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     if let Some(v) = args.opt_value_from_str("--cluster-name")? {
         config.cluster_name = Some(v);
     }

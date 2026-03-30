@@ -145,7 +145,7 @@ echo ""
 echo "Building Rust leaf server (release)..."
 if [[ "$MODE" == "full" ]]; then
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --release --features cluster,gateway 2>&1 | tail -1
+    --release --features mesh,gateway 2>&1 | tail -1
 else
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
     --release 2>&1 | tail -1

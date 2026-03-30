@@ -105,7 +105,7 @@ impl MsgWriter {
     }
 
     /// Format and append an RMSG to the shared buffer (for route/gateway delivery).
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub(crate) fn write_rmsg(
         &self,
         subject: &[u8],
@@ -130,7 +130,7 @@ impl MsgWriter {
     }
 
     /// Append raw protocol bytes to the shared buffer (e.g. LS+/LS-/RS+ lines).
-    #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
     pub(crate) fn write_raw(&self, data: &[u8]) {
         let mut buf = self.buf.lock().unwrap();
         buf.extend_from_slice(data);
@@ -153,7 +153,7 @@ impl MsgWriter {
     }
 
     /// Drain all buffered data. Returns `None` if buffer was empty.
-    #[cfg(any(test, feature = "cluster", feature = "gateway"))]
+    #[cfg(any(test, feature = "mesh", feature = "gateway"))]
     pub(crate) fn drain(&self) -> Option<BytesMut> {
         let mut buf = self.buf.lock().unwrap();
         if buf.is_empty() {

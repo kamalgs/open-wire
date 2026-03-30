@@ -813,7 +813,7 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
             "leafnodes" => apply_leafnodes(&mut config, value)?,
 
             // --- cluster block ---
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             "cluster" => apply_cluster(&mut config, value)?,
 
             // --- gateway block ---
@@ -983,7 +983,7 @@ fn parse_leaf_users_array(
 }
 
 /// Parse a `cluster { ... }` block.
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 fn apply_cluster(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
     let entries = match value.as_map() {
         Some(e) => e,
@@ -1188,7 +1188,7 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
     #[cfg(feature = "interest-collapse")]
     let mut collapse_templates: Vec<String> = Vec::new();
     #[cfg(feature = "subject-mapping")]
-    let mut mappings: Vec<crate::leaf::SubjectMapping> = Vec::new();
+    let mut mappings: Vec<crate::connector::leaf::SubjectMapping> = Vec::new();
 
     for (rkey, rval) in entries {
         match rkey.as_str() {
@@ -1228,7 +1228,7 @@ fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), Con
                                 }
                             }
                             if !from.is_empty() && !to.is_empty() {
-                                mappings.push(crate::leaf::SubjectMapping { from, to });
+                                mappings.push(crate::connector::leaf::SubjectMapping { from, to });
                             }
                         }
                     }

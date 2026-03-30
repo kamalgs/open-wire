@@ -1,11 +1,11 @@
 #[cfg(any(
     feature = "hub",
-    feature = "cluster",
+    feature = "mesh",
     feature = "gateway",
     feature = "worker-affinity"
 ))]
 use std::collections::HashMap;
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 use std::collections::HashSet;
 use std::io;
 use std::net::{TcpListener, TcpStream};
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 #[cfg(feature = "leaf")]
 use std::sync::mpsc;
 use std::sync::Arc;
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -24,13 +24,13 @@ use tracing::{error, info, warn};
 
 use crate::core::types::{ConnectInfo, ServerInfo};
 
+#[cfg(feature = "leaf")]
+use crate::connector::leaf::{Upstream, UpstreamCmd};
 use crate::core::buf::BufConfig;
-#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::core::sub_list::MsgWriter;
 use crate::core::sub_list::SubscriptionManager;
 use crate::core::worker::{Worker, WorkerHandle};
-#[cfg(feature = "leaf")]
-use crate::leaf::{Upstream, UpstreamCmd};
 
 /// An open-wire NATS-compatible message relay server.
 ///
@@ -135,16 +135,16 @@ pub struct LeafServerConfig {
     /// before sending upstream. Supports prefix mappings (`local.>` → `prod.>`) and
     /// exact mappings.
     #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
-    pub subject_mappings: Vec<crate::leaf::SubjectMapping>,
+    pub subject_mappings: Vec<crate::connector::leaf::SubjectMapping>,
     /// Port for cluster route connections. When set, the server listens for
     /// inbound route connections and participates in full mesh clustering.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub cluster_port: Option<u16>,
     /// Seed route URLs for outbound connections (e.g., `["nats-route://host2:4248"]`).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub cluster_seeds: Vec<String>,
     /// Cluster name. All nodes in a cluster must use the same name.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub cluster_name: Option<String>,
     /// Port for gateway connections. When set, the server listens for
     /// inbound gateway connections from other clusters.
@@ -207,11 +207,11 @@ impl Default for LeafServerConfig {
             interest_collapse: Vec::new(),
             #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
             subject_mappings: Vec::new(),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_port: None,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_seeds: Vec::new(),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_name: None,
             #[cfg(feature = "gateway")]
             gateway_port: None,
@@ -303,7 +303,7 @@ pub struct HubRemote {
     pub interest_collapse: Vec<String>,
     /// Subject mapping rules for this remote.
     #[cfg(feature = "subject-mapping")]
-    pub subject_mappings: Vec<crate::leaf::SubjectMapping>,
+    pub subject_mappings: Vec<crate::connector::leaf::SubjectMapping>,
 }
 
 /// Per-subject permission rule with allow/deny lists.
@@ -958,7 +958,7 @@ impl Default for ServerStats {
 }
 
 /// Registry of connected route peers and known route URLs for gossip discovery.
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 pub(crate) struct RoutePeerRegistry {
     /// server_id → route address for all connected peers.
     pub connected: HashMap<String, String>,
@@ -1165,23 +1165,23 @@ pub(crate) struct ServerState {
     pub leaf_auth: LeafAuth,
     /// Registry of MsgWriters for inbound route connections.
     /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub route_writers: std::sync::RwLock<HashMap<u64, MsgWriter>>,
     /// Port for inbound route connections. `None` when cluster mode is not enabled.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub cluster_port: Option<u16>,
     /// Cluster name. Must match between peers.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub cluster_name: Option<String>,
     /// Seed route URLs for outbound connections.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub cluster_seeds: Vec<String>,
     /// Registry of connected route peers and known route URLs.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub route_peers: Mutex<RoutePeerRegistry>,
     /// Channel sender for the route coordinator thread. New gossip-discovered URLs
     /// are sent here to trigger outbound connections.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub route_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
     /// Registry of MsgWriters for inbound gateway connections.
     #[cfg(feature = "gateway")]
@@ -1239,16 +1239,16 @@ impl ServerState {
         max_subscriptions: usize,
         #[cfg(feature = "hub")] leafnode_port: Option<u16>,
         #[cfg(feature = "hub")] leaf_auth: LeafAuth,
-        #[cfg(feature = "cluster")] cluster_port: Option<u16>,
-        #[cfg(feature = "cluster")] cluster_name: Option<String>,
-        #[cfg(feature = "cluster")] cluster_seeds: Vec<String>,
+        #[cfg(feature = "mesh")] cluster_port: Option<u16>,
+        #[cfg(feature = "mesh")] cluster_name: Option<String>,
+        #[cfg(feature = "mesh")] cluster_seeds: Vec<String>,
         #[cfg(feature = "gateway")] gateway_port: Option<u16>,
         #[cfg(feature = "gateway")] gateway_name: Option<String>,
         #[cfg(feature = "gateway")] gateway_remotes: Vec<GatewayRemote>,
         #[cfg(feature = "accounts")] accounts: Vec<AccountConfig>,
         #[cfg(feature = "worker-affinity")] num_workers: usize,
     ) -> Self {
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         let cluster_self_host = if info.host.is_empty() || info.host == "0.0.0.0" {
             "127.0.0.1".to_string()
         } else {
@@ -1330,13 +1330,13 @@ impl ServerState {
             leaf_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "hub")]
             leaf_auth,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_port,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_name,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_peers: {
                 let mut known_urls = HashSet::new();
                 // Add own cluster endpoint (use configured host or 127.0.0.1;
@@ -1346,16 +1346,16 @@ impl ServerState {
                 }
                 // Add all configured seeds
                 for seed in &cluster_seeds {
-                    known_urls.insert(crate::cluster::normalize_route_url(seed));
+                    known_urls.insert(crate::connector::mesh::normalize_route_url(seed));
                 }
                 Mutex::new(RoutePeerRegistry {
                     connected: HashMap::new(),
                     known_urls,
                 })
             },
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_connect_tx: Mutex::new(None),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_seeds,
             #[cfg(feature = "gateway")]
             gateway_writers: std::sync::RwLock::new(HashMap::new()),
@@ -1496,11 +1496,11 @@ impl LeafServer {
                 config.leafnode_port,
                 #[cfg(feature = "hub")]
                 config.leaf_auth.clone(),
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 config.cluster_port,
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 config.cluster_name.clone(),
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 config.cluster_seeds.clone(),
                 #[cfg(feature = "gateway")]
                 config.gateway_port,
@@ -1537,7 +1537,7 @@ impl LeafServer {
             #[cfg(feature = "subject-mapping")]
             let subject_mappings = remote.subject_mappings.clone();
             let build_pipeline = move || {
-                crate::leaf::InterestPipeline::new(
+                crate::connector::leaf::InterestPipeline::new(
                     #[cfg(feature = "interest-collapse")]
                     collapse_templates.clone(),
                     #[cfg(feature = "subject-mapping")]
@@ -1660,7 +1660,7 @@ impl LeafServer {
     }
 
     /// Distribute a new inbound route TCP connection to the next worker (round-robin).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn accept_route_tcp(
         &self,
         tcp_stream: TcpStream,
@@ -1710,10 +1710,10 @@ impl LeafServer {
         self.connect_upstream();
 
         // Spawn outbound route connections to seed peers
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         let _route_mgr = if !self.state.cluster_seeds.is_empty() {
             info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
-            Some(crate::cluster::RouteConnManager::spawn(Arc::clone(
+            Some(crate::connector::mesh::RouteConnManager::spawn(Arc::clone(
                 &self.state,
             )))
         } else {
@@ -1748,7 +1748,7 @@ impl LeafServer {
         #[cfg(not(feature = "hub"))]
         let leaf_listener: Option<TcpListener> = None;
 
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         let cluster_listener = if let Some(cluster_port) = self.config.cluster_port {
             let cluster_addr = format!("{}:{}", self.config.host, cluster_port);
             let cl = TcpListener::bind(&cluster_addr)?;
@@ -1757,7 +1757,7 @@ impl LeafServer {
         } else {
             None
         };
-        #[cfg(not(feature = "cluster"))]
+        #[cfg(not(feature = "mesh"))]
         let cluster_listener: Option<TcpListener> = None;
 
         #[cfg(feature = "gateway")]
@@ -1776,9 +1776,9 @@ impl LeafServer {
         #[cfg(feature = "gateway")]
         let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
             info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
-            Some(crate::gateway::GatewayConnManager::spawn(Arc::clone(
-                &self.state,
-            )))
+            Some(crate::connector::gateway::GatewayConnManager::spawn(
+                Arc::clone(&self.state),
+            ))
         } else {
             None
         };
@@ -1870,7 +1870,7 @@ impl LeafServer {
                         }
                     }
                 }
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 if pfds[3].revents & libc::POLLIN != 0 {
                     if let Some(ref cl) = cluster_listener {
                         while let Ok((stream, addr)) = cl.accept() {
@@ -1925,10 +1925,10 @@ impl LeafServer {
         self.connect_upstream();
 
         // Spawn outbound route connections to seed peers
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         let _route_mgr = if !self.state.cluster_seeds.is_empty() {
             info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
-            Some(crate::cluster::RouteConnManager::spawn(Arc::clone(
+            Some(crate::connector::mesh::RouteConnManager::spawn(Arc::clone(
                 &self.state,
             )))
         } else {
@@ -1966,7 +1966,7 @@ impl LeafServer {
         #[cfg(not(feature = "hub"))]
         let leaf_listener: Option<TcpListener> = None;
 
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         let cluster_listener = if let Some(cluster_port) = self.config.cluster_port {
             let cluster_addr = format!("{}:{}", self.config.host, cluster_port);
             let cl = TcpListener::bind(&cluster_addr)?;
@@ -1976,7 +1976,7 @@ impl LeafServer {
         } else {
             None
         };
-        #[cfg(not(feature = "cluster"))]
+        #[cfg(not(feature = "mesh"))]
         let cluster_listener: Option<TcpListener> = None;
 
         #[cfg(feature = "gateway")]
@@ -1996,9 +1996,9 @@ impl LeafServer {
         #[cfg(feature = "gateway")]
         let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
             info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
-            Some(crate::gateway::GatewayConnManager::spawn(Arc::clone(
-                &self.state,
-            )))
+            Some(crate::connector::gateway::GatewayConnManager::spawn(
+                Arc::clone(&self.state),
+            ))
         } else {
             None
         };
@@ -2091,7 +2091,7 @@ impl LeafServer {
                 }
             }
 
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             if ret > 0 && pfds[3].revents & libc::POLLIN != 0 {
                 if let Some(ref cl) = cluster_listener {
                     while let Ok((stream, addr)) = cl.accept() {

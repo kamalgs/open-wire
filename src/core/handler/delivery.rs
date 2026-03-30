@@ -21,11 +21,11 @@ use metrics::gauge;
 use tracing::debug;
 
 use super::ConnCtx;
+#[cfg(feature = "leaf")]
+use crate::connector::leaf::UpstreamCmd;
 use crate::core::server::ServerState;
 use crate::core::sub_list::MsgWriter;
 use crate::core::types::HeaderMap;
-#[cfg(feature = "leaf")]
-use crate::leaf::UpstreamCmd;
 
 /// Worker-level context for delivery and notification.
 pub(crate) struct MessageDeliveryHub<'a> {
@@ -105,7 +105,7 @@ pub(crate) struct DeliveryScope {
     /// Skip delivery back to the publishing connection.
     pub skip_echo: bool,
     /// Skip route subscriptions (one-hop enforcement from routes).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub skip_routes: bool,
     /// Skip gateway subscriptions (one-hop enforcement from gateways).
     #[cfg(feature = "gateway")]
@@ -118,7 +118,7 @@ impl DeliveryScope {
     pub(crate) fn local(skip_echo: bool) -> Self {
         Self {
             skip_echo,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             skip_routes: false,
             #[cfg(feature = "gateway")]
             skip_gateways: false,
@@ -126,7 +126,7 @@ impl DeliveryScope {
     }
 
     /// Scope for messages arriving from a route peer (one-hop: skip routes).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     #[inline]
     pub(crate) fn from_route() -> Self {
         Self {
@@ -143,7 +143,7 @@ impl DeliveryScope {
     pub(crate) fn from_gateway() -> Self {
         Self {
             skip_echo: true,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             skip_routes: true,
             skip_gateways: true,
         }
@@ -212,7 +212,7 @@ pub(crate) fn deliver_to_sub_inner(
     msg: &Msg<'_>,
     #[cfg(feature = "accounts")] account_name: &[u8],
 ) -> bool {
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     if sub.is_route {
         sub.writer.write_rmsg(
             msg.subject,
@@ -274,7 +274,7 @@ where
             return;
         }
         // One-hop rule: messages from routes are never re-forwarded to other routes.
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         if scope.skip_routes && sub.is_route {
             return;
         }
@@ -286,7 +286,8 @@ where
         // Dispatch: gateway subs get reply-rewritten RMSG, others go through deliver_to_sub_inner.
         #[cfg(feature = "gateway")]
         if sub.is_gateway {
-            let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, state);
+            let gw_reply =
+                crate::core::handler::propagation::rewrite_gateway_reply(msg.reply, state);
             sub.writer.write_rmsg(
                 msg.subject,
                 gw_reply.as_deref(),
@@ -611,7 +612,8 @@ pub(crate) fn forward_to_optimistic_gateways(
         }
 
         // Rewrite reply with _GR_ prefix before forwarding across gateway.
-        let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, wctx.state);
+        let gw_reply =
+            crate::core::handler::propagation::rewrite_gateway_reply(msg.reply, wctx.state);
         gis.writer.write_rmsg(
             msg.subject,
             gw_reply.as_deref(),
@@ -814,20 +816,20 @@ mod tests {
             leaf_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "hub")]
             leaf_auth: Default::default(),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_port: None,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_name: None,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_seeds: Vec::new(),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_peers: std::sync::Mutex::new(crate::core::server::RoutePeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_connect_tx: std::sync::Mutex::new(None),
             #[cfg(feature = "gateway")]
             gateway_writers: std::sync::RwLock::new(HashMap::new()),
@@ -875,7 +877,7 @@ mod tests {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
@@ -1006,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_from_route_skips_route_subs() {
         let writer = DirectWriter::new_dummy();
         let mut subs = SubList::new();
@@ -1022,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_from_route_delivers_to_client_subs() {
         let client_w = DirectWriter::new_dummy();
         let route_w = DirectWriter::new_dummy();
@@ -1047,7 +1049,7 @@ mod tests {
         let mut subs = SubList::new();
         subs.insert(sub_with_writer(1, 1, "foo", None, &client_w));
 
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         {
             let route_w = DirectWriter::new_dummy();
             let mut route_sub = sub_with_writer(2, 1, "foo", None, &route_w);
@@ -1076,7 +1078,7 @@ mod tests {
         #[allow(unused_mut)]
         let mut total_expected = 1;
 
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         {
             let route_w = DirectWriter::new_dummy();
             let mut route_sub = sub_with_writer(2, 1, "foo", None, &route_w);
@@ -1152,7 +1154,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_deliver_to_route_sub_writes_rmsg() {
         let writer = DirectWriter::new_dummy();
         let mut sub = sub_with_writer(1, 1, "foo.bar", None, &writer);

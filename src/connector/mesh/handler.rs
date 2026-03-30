@@ -9,14 +9,14 @@ use metrics::gauge;
 use tracing::debug;
 
 use crate::core::buf::RouteOp;
-use crate::core::nats_proto;
-use crate::core::sub_list::Subscription;
 #[cfg(feature = "gateway")]
-use crate::handler::propagation::propagate_gateway_interest;
-use crate::handler::{
+use crate::core::handler::propagation::propagate_gateway_interest;
+use crate::core::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
+use crate::core::nats_proto;
+use crate::core::sub_list::Subscription;
 
 /// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct RouteHandler;
@@ -48,7 +48,7 @@ impl ConnectionHandler for RouteHandler {
             } => {
                 #[cfg(feature = "accounts")]
                 let account_id = {
-                    let acct_str = crate::handler::bytes_to_str(&account);
+                    let acct_str = crate::core::handler::bytes_to_str(&account);
                     wctx.state.resolve_account(acct_str)
                 };
                 let result = Self::handle_route_sub(
@@ -69,7 +69,7 @@ impl ConnectionHandler for RouteHandler {
             } => {
                 #[cfg(feature = "accounts")]
                 let account_id = {
-                    let acct_str = crate::handler::bytes_to_str(&account);
+                    let acct_str = crate::core::handler::bytes_to_str(&account);
                     wctx.state.resolve_account(acct_str)
                 };
                 let result = Self::handle_route_unsub(
@@ -92,7 +92,7 @@ impl ConnectionHandler for RouteHandler {
             } => {
                 #[cfg(feature = "accounts")]
                 let account_id = {
-                    let acct_str = crate::handler::bytes_to_str(&account);
+                    let acct_str = crate::core::handler::bytes_to_str(&account);
                     wctx.state.resolve_account(acct_str)
                 };
                 Self::handle_rmsg(
@@ -112,7 +112,7 @@ impl ConnectionHandler for RouteHandler {
                     let mut peers = wctx.state.route_peers.lock().unwrap();
                     let tx = wctx.state.route_connect_tx.lock().unwrap();
                     for url in &info.connect_urls {
-                        let normalized = crate::cluster::normalize_route_url(url);
+                        let normalized = crate::connector::mesh::normalize_route_url(url);
                         if peers.known_urls.insert(normalized.clone()) {
                             if let Some(ref sender) = *tx {
                                 let _ = sender.send(normalized);

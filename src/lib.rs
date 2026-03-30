@@ -6,16 +6,8 @@
 
 // Internal module visibility is controlled at the item level within each module.
 // Modules are `pub` to allow re-exports from lib.rs; internal items use `pub(crate)`.
+pub mod connector;
 pub mod core;
-
-pub(crate) mod handler;
-
-#[cfg(feature = "cluster")]
-pub(crate) mod cluster;
-#[cfg(feature = "gateway")]
-pub(crate) mod gateway;
-#[cfg(any(feature = "leaf", feature = "hub"))]
-pub mod leaf;
 
 // Public re-exports for external consumers (main.rs, tests, benchmarks).
 pub use core::config;
@@ -24,6 +16,8 @@ pub use core::server;
 pub use core::sub_list;
 pub use core::types;
 
+#[cfg(all(feature = "leaf", feature = "subject-mapping"))]
+pub use connector::leaf::SubjectMapping;
 #[cfg(feature = "gateway")]
 pub use core::server::GatewayRemote;
 #[cfg(feature = "leaf")]
@@ -35,5 +29,3 @@ pub use core::server::{AccountConfig, AccountId, AccountRegistry};
 pub use core::server::{
     ClientAuth, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig,
 };
-#[cfg(all(feature = "leaf", feature = "subject-mapping"))]
-pub use leaf::SubjectMapping;

@@ -179,7 +179,7 @@ pub enum LeafOp {
 }
 
 /// A parsed route protocol operation (RS+, RS-, RMSG, INFO, CONNECT, PING, PONG).
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 #[derive(Debug)]
 pub enum RouteOp {
     Info(Box<ServerInfo>),
@@ -862,7 +862,7 @@ pub fn try_parse_gateway_op(buf: &mut BytesMut) -> io::Result<Option<GatewayOp>>
 }
 
 /// Try to parse the next route protocol operation from `buf`.
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 pub fn try_parse_route_op(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     if buf.is_empty() {
         return Ok(None);
@@ -956,7 +956,7 @@ pub fn try_parse_route_op(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
 }
 
 /// Parse `RS+ account subject [queue [weight]]` or `RS- account subject`.
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     let nl = match find_newline(buf) {
         Some(i) => i,
@@ -1006,7 +1006,7 @@ fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
 }
 
 /// Parse `RMSG account subject [reply] [hdr_size] total_size\r\n<payload>\r\n`.
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     let nl = match find_newline(buf) {
         Some(i) => i,
@@ -1110,7 +1110,7 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     }
 }
 
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 fn route_proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
     if let Some(nl) = find_newline(buf) {
         buf.advance(nl + 1);
@@ -1384,7 +1384,7 @@ impl MsgBuilder {
     }
 
     /// Build `RMSG $G subject [reply] [hdr_len] total_len\r\npayload\r\n`.
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub fn build_rmsg(
         &mut self,
         subject: &[u8],
@@ -1444,7 +1444,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS+ account subject\r\n`.
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub fn build_route_sub(
         &mut self,
         subject: &[u8],
@@ -1463,7 +1463,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS- account subject\r\n`.
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub fn build_route_unsub(
         &mut self,
         subject: &[u8],
@@ -1482,7 +1482,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS+ account subject queue weight\r\n` for queue group route subscriptions.
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub fn build_route_sub_queue(
         &mut self,
         subject: &[u8],
@@ -1504,7 +1504,7 @@ impl MsgBuilder {
     }
 
     /// Build `RS- account subject\r\n` for queue group route unsubscriptions.
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub fn build_route_unsub_queue(
         &mut self,
         subject: &[u8],
@@ -2174,7 +2174,7 @@ mod tests {
     // -- Route protocol parser tests -------------------------------------------
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_route_sub() {
         let mut buf = BytesMut::from("RS+ $G test.subject\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
@@ -2189,7 +2189,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_route_sub_queue() {
         let mut buf = BytesMut::from("RS+ $G test.subject myqueue 1\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
@@ -2203,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_route_unsub() {
         let mut buf = BytesMut::from("RS- $G test.subject\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
@@ -2216,7 +2216,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_rmsg_no_reply() {
         let mut buf = BytesMut::from("RMSG $G test.sub 5\r\nhello\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
@@ -2239,7 +2239,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_rmsg_with_reply() {
         let mut buf = BytesMut::from("RMSG $G test.sub reply.to 2\r\nhi\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
@@ -2259,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_rmsg_incomplete() {
         let mut buf = BytesMut::from("RMSG $G test.sub 10\r\nhel");
         let op = try_parse_route_op(&mut buf).unwrap();
@@ -2267,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_route_ping_pong() {
         let mut buf = BytesMut::from("PING\r\nPONG\r\n");
         let op = try_parse_route_op(&mut buf).unwrap().unwrap();
@@ -2277,7 +2277,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_parse_route_info() {
         let mut buf = BytesMut::from(
             "INFO {\"server_id\":\"test\",\"server_name\":\"node1\",\"port\":4248}\r\n",
@@ -2294,7 +2294,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_build_rmsg() {
         let mut b = MsgBuilder::new();
         let data = b.build_rmsg(
@@ -2309,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_build_rmsg_with_reply() {
         let mut b = MsgBuilder::new();
         let data = b.build_rmsg(
@@ -2324,7 +2324,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_build_route_sub() {
         let mut b = MsgBuilder::new();
         let data = b.build_route_sub(
@@ -2336,7 +2336,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_build_route_unsub() {
         let mut b = MsgBuilder::new();
         let data = b.build_route_unsub(
@@ -2348,7 +2348,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_build_route_sub_queue() {
         let mut b = MsgBuilder::new();
         let data = b.build_route_sub_queue(
@@ -2361,7 +2361,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn test_rmsg_roundtrip() {
         let mut builder = MsgBuilder::new();
         let wire = builder.build_rmsg(

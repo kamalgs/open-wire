@@ -17,30 +17,30 @@ use bytes::{Buf, BufMut, BytesMut};
 use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "cluster")]
-use crate::cluster::RouteHandler;
-#[cfg(feature = "cluster")]
+#[cfg(feature = "gateway")]
+use crate::connector::gateway::GatewayHandler;
+#[cfg(feature = "hub")]
+use crate::connector::leaf::LeafHandler;
+#[cfg(feature = "leaf")]
+use crate::connector::leaf::UpstreamCmd;
+#[cfg(feature = "mesh")]
+use crate::connector::mesh::RouteHandler;
+#[cfg(feature = "mesh")]
 use crate::core::buf::RouteOp;
 use crate::core::buf::{AdaptiveBuf, ClientOp};
+use crate::core::handler::client::ClientHandler;
+#[cfg(any(feature = "mesh", feature = "gateway"))]
+use crate::core::handler::propagation::send_existing_route_subs;
+#[cfg(feature = "hub")]
+use crate::core::handler::propagation::send_existing_subs;
+use crate::core::handler::{
+    handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult,
+    MessageDeliveryHub,
+};
 use crate::core::nats_proto;
 use crate::core::server::ServerState;
 use crate::core::sub_list::{create_eventfd, MsgWriter};
 use crate::core::websocket::{self, DecodeStatus, WsCodec};
-#[cfg(feature = "gateway")]
-use crate::gateway::GatewayHandler;
-use crate::handler::client::ClientHandler;
-#[cfg(any(feature = "cluster", feature = "gateway"))]
-use crate::handler::propagation::send_existing_route_subs;
-#[cfg(feature = "hub")]
-use crate::handler::propagation::send_existing_subs;
-use crate::handler::{
-    handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult,
-    MessageDeliveryHub,
-};
-#[cfg(feature = "hub")]
-use crate::leaf::LeafHandler;
-#[cfg(feature = "leaf")]
-use crate::leaf::UpstreamCmd;
 
 use rustls::ServerConnection;
 
@@ -64,7 +64,7 @@ pub(crate) enum WorkerCmd {
         addr: SocketAddr,
     },
     /// Accept an inbound route connection (cluster mode).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     NewRouteConn {
         id: u64,
         stream: TcpStream,
@@ -111,7 +111,7 @@ impl WorkerHandle {
     }
 
     /// Send a new inbound route connection to this worker and wake it.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub fn send_route_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewRouteConn { id, stream, addr });
         self.wake();
@@ -500,7 +500,7 @@ impl Worker {
                 WorkerCmd::NewLeafConn { id, stream, addr } => {
                     self.add_leaf_conn(id, stream, addr);
                 }
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 WorkerCmd::NewRouteConn { id, stream, addr } => {
                     self.add_route_conn(id, stream, addr);
                 }
@@ -625,7 +625,7 @@ impl Worker {
     ///
     /// Configures the socket, registers with epoll, creates MsgWriter,
     /// queues the INFO line, and inserts into the connection map.
-    #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
     fn register_conn(
         &mut self,
         id: u64,
@@ -714,9 +714,9 @@ impl Worker {
         );
     }
 
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     fn add_route_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        let info = crate::cluster::build_route_info(&self.state);
+        let info = crate::connector::mesh::build_route_info(&self.state);
         self.register_conn(
             id,
             stream,
@@ -732,7 +732,7 @@ impl Worker {
 
     #[cfg(feature = "gateway")]
     fn add_gateway_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        let info = crate::gateway::get_gateway_info(&self.state);
+        let info = crate::connector::gateway::get_gateway_info(&self.state);
         self.register_conn(
             id,
             stream,
@@ -768,7 +768,7 @@ impl Worker {
                 self.state.leaf_writers.write().unwrap().remove(&conn_id);
             }
             // Unregister route MsgWriter and peer from shared registries.
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             if client.ext.is_route() {
                 self.state.route_writers.write().unwrap().remove(&conn_id);
                 if let ConnExt::Route {
@@ -1786,16 +1786,16 @@ impl Worker {
     /// Returns `true` if the caller should `continue` the loop, `false` to `return`.
     fn process_wait_connect(&mut self, conn_id: u64) -> bool {
         // Route connections use the route protocol parser (INFO+CONNECT+PING).
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         let is_route_conn = self
             .conns
             .get(&conn_id)
             .map(|c| c.ext.is_route())
             .unwrap_or(false);
-        #[cfg(not(feature = "cluster"))]
+        #[cfg(not(feature = "mesh"))]
         let _is_route_conn = false;
 
-        #[cfg(feature = "cluster")]
+        #[cfg(feature = "mesh")]
         if is_route_conn {
             let route_op = {
                 let client = self.conns.get_mut(&conn_id).unwrap();
@@ -1811,7 +1811,10 @@ impl Worker {
                 Some(RouteOp::Info(peer_info)) => {
                     // Process gossip connect_urls from peer's INFO.
                     if !peer_info.connect_urls.is_empty() {
-                        crate::cluster::process_gossip_urls(&self.state, &peer_info.connect_urls);
+                        crate::connector::mesh::process_gossip_urls(
+                            &self.state,
+                            &peer_info.connect_urls,
+                        );
                     }
                     return true; // continue
                 }
@@ -1865,7 +1868,7 @@ impl Worker {
                     send_existing_route_subs(&self.state, &client.direct_writer);
 
                     // Broadcast updated INFO to all routes (gossip re-broadcast).
-                    crate::cluster::broadcast_route_info(&self.state);
+                    crate::connector::mesh::broadcast_route_info(&self.state);
 
                     info!(conn_id, "inbound route connected");
                 }
@@ -1971,7 +1974,7 @@ impl Worker {
                     send_existing_route_subs(&self.state, &client.direct_writer);
 
                     // Broadcast updated INFO to all gateways (gossip).
-                    crate::gateway::broadcast_gateway_info(&self.state);
+                    crate::connector::gateway::broadcast_gateway_info(&self.state);
 
                     info!(
                         conn_id,
@@ -2135,7 +2138,7 @@ impl Worker {
         match conn_kind {
             #[cfg(feature = "hub")]
             ConnKind::Leaf => self.process_active::<LeafHandler>(conn_id),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             ConnKind::Route => self.process_active::<RouteHandler>(conn_id),
             #[cfg(feature = "gateway")]
             ConnKind::Gateway => self.process_active::<GatewayHandler>(conn_id),

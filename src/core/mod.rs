@@ -1,6 +1,7 @@
 //! Shared infrastructure: server, workers, protocol parsing, subscriptions, I/O.
 
 pub mod config;
+pub(crate) mod handler;
 pub(crate) mod io;
 pub mod protocol;
 pub mod pubsub;

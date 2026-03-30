@@ -8,13 +8,13 @@ use bytes::Bytes;
 use metrics::{counter, gauge};
 use tracing::{debug, warn};
 
-use crate::core::nats_proto::{self, ClientOp};
-use crate::core::sub_list::Subscription;
-use crate::handler::propagation::propagate_all_interest;
-use crate::handler::{
+use crate::core::handler::propagation::propagate_all_interest;
+use crate::core::handler::{
     bytes_to_str, deliver_to_subs, ConnCtx, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
+use crate::core::nats_proto::{self, ClientOp};
+use crate::core::sub_list::Subscription;
 
 /// Handles client protocol operations (PUB, SUB, UNSUB, PING, PONG).
 pub(crate) struct ClientHandler;
@@ -122,7 +122,7 @@ impl ClientHandler {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,

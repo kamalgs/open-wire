@@ -9,16 +9,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use tracing::{debug, error, info, warn};
 
-use crate::core::types::HeaderMap;
+use crate::connector::leaf::InterestPipeline;
 #[cfg(feature = "accounts")]
-use crate::handler::deliver_cross_account_upstream;
-use crate::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream, Msg};
-use crate::leaf::InterestPipeline;
+use crate::core::handler::deliver_cross_account_upstream;
+use crate::core::handler::{deliver_to_subs_upstream, handle_expired_subs_upstream, Msg};
+use crate::core::types::HeaderMap;
 
+use crate::connector::leaf::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
 use crate::core::buf::LeafOp;
 use crate::core::server::{HubCredentials, ServerState};
 use crate::core::sub_list::MsgWriter;
-use crate::leaf::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
 
 /// Commands sent from the Upstream handle to the background writer thread.
 #[derive(Debug)]
@@ -979,7 +979,7 @@ mod tests {
 
     // --- add_interest / remove_interest with pipeline ---
 
-    use crate::leaf::InterestPipeline;
+    use crate::connector::leaf::InterestPipeline;
 
     /// Helper: create an Upstream with a pipeline but no real connection.
     fn test_upstream(

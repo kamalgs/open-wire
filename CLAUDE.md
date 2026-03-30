@@ -16,7 +16,7 @@ src/
 ├── main.rs              # CLI binary (--port, --hub, --ws-port, --workers, --cluster-*)
 ├── lib.rs               # Module declarations + public re-exports
 ├── core/                # Shared infrastructure
-│   ├── mod.rs           # Facade re-exports (protocol, io, pubsub + convenience re-exports)
+│   ├── mod.rs           # Facade re-exports (protocol, io, pubsub, handler + convenience re-exports)
 │   ├── protocol/
 │   │   ├── mod.rs       # types + nats_proto
 │   │   ├── types.rs     # ServerInfo, ConnectInfo, HeaderMap
@@ -29,29 +29,31 @@ src/
 │   ├── pubsub/
 │   │   ├── mod.rs       # sub_list
 │   │   └── sub_list.rs  # SubscriptionManager, WildTrie, Subscription
+│   ├── handler/         # Handler framework + client protocol + propagation
+│   │   ├── mod.rs       # Facade re-exports
+│   │   ├── conn.rs      # ConnectionHandler trait, ConnCtx, ConnExt
+│   │   ├── delivery.rs  # Msg, deliver_to_subs, publish
+│   │   ├── client.rs    # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
+│   │   └── propagation.rs # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
 │   ├── config.rs        # Go nats-server .conf file parser
 │   ├── server.rs        # LeafServer, LeafServerConfig, ServerState
 │   └── worker.rs        # Worker epoll event loop
-├── handler/             # Handler framework + client protocol + propagation
-│   ├── mod.rs           # Facade re-exports
-│   ├── conn.rs          # ConnectionHandler trait, ConnCtx, ConnExt
-│   ├── delivery.rs      # Msg, deliver_to_subs, publish
-│   ├── client.rs        # Client protocol dispatch (PUB/SUB/UNSUB/PING/PONG)
-│   └── propagation.rs   # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
-├── cluster/             # Full-mesh clustering [feature = "cluster"]
-│   ├── mod.rs           # Facade re-exports
-│   ├── conn.rs          # Outbound route connection manager
-│   └── handler.rs       # Route protocol dispatch (RS+/RS-/RMSG)
-├── gateway/             # Gateway inter-cluster traffic [feature = "gateway"]
-│   ├── mod.rs           # Facade re-exports
-│   ├── conn.rs          # Outbound gateway connection manager
-│   └── handler.rs       # Gateway protocol dispatch (RS+/RS-/RMSG)
-└── leaf/                # Leaf node + hub connection [features "leaf"/"hub"]
-    ├── mod.rs           # Facade re-exports (per-submodule feature gates)
-    ├── conn.rs          # LeafConn, LeafReader, LeafWriter, HubStream
-    ├── handler.rs       # Inbound leaf protocol dispatch (LS+/LS-/LMSG)
-    ├── upstream.rs      # Hub connection via leaf node protocol
-    └── interest.rs      # InterestPipeline: subject mapping + interest collapse
+└── connector/           # Protocol bridge connectors
+    ├── mod.rs           # Feature-gated sub-module declarations
+    ├── mesh/            # Full-mesh clustering [feature = "mesh"]
+    │   ├── mod.rs       # Facade re-exports
+    │   ├── conn.rs      # RouteConnManager (outbound route connections)
+    │   └── handler.rs   # Route protocol dispatch (RS+/RS-/RMSG)
+    ├── gateway/         # Gateway inter-cluster traffic [feature = "gateway"]
+    │   ├── mod.rs       # Facade re-exports
+    │   ├── conn.rs      # Outbound gateway connection manager
+    │   └── handler.rs   # Gateway protocol dispatch (RS+/RS-/RMSG)
+    └── leaf/            # Leaf node + hub connection [features "leaf"/"hub"]
+        ├── mod.rs       # Facade re-exports (per-submodule feature gates)
+        ├── conn.rs      # LeafConn, LeafReader, LeafWriter, HubStream
+        ├── handler.rs   # Inbound leaf protocol dispatch (LS+/LS-/LMSG)
+        ├── upstream.rs  # Hub connection via leaf node protocol
+        └── interest.rs  # InterestPipeline: subject mapping + interest collapse
 examples/
 └── chat/            # Sample chat app (HTML + README)
 tests/
@@ -88,33 +90,33 @@ CLAUDE.md  LICENSE  NOTICE  README.md
 # Check
 cargo check
 
-# Check with cluster feature
-cargo check --features cluster
+# Check with mesh feature
+cargo check --features mesh
 
 # Test (unit — no external deps)
 cargo test --lib
 
-# Test with cluster feature
-cargo test --lib --features cluster
+# Test with mesh feature
+cargo test --lib --features mesh
 
 # Test (all — requires nats-server in PATH)
 cargo test
 
-# Test cluster integration tests
-cargo test --test e2e --features cluster -- cluster
+# Test mesh integration tests
+cargo test --test e2e --features mesh -- mesh
 
 # Format (required: nightly toolchain)
 cargo +nightly fmt
 
 # Lint
 cargo clippy --all-targets -- --deny clippy::all
-cargo clippy --all-targets --features cluster -- --deny clippy::all
+cargo clippy --all-targets --features mesh -- --deny clippy::all
 
 # Build release
 cargo build --release
 
-# Build release with cluster
-cargo build --release --features cluster
+# Build release with mesh
+cargo build --release --features mesh
 
 # Build release with frame pointers (for perf profiling)
 RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
@@ -122,7 +124,7 @@ RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
 # Benchmarks (quick — 5 core scenarios)
 cd tests && ./throughput.sh
 
-# Benchmarks (full — all 16 scenarios including cluster)
+# Benchmarks (full — all 16 scenarios including mesh)
 cd tests && ./throughput.sh --full
 
 cd tests && ./smoke_test.sh
@@ -176,7 +178,7 @@ Always run `cargo +nightly fmt` before committing.
 - **No async runtime**: Pure `std::thread` + `epoll` + `std::sync::mpsc`.
 - **Connection state machine**: `SendInfo → WaitConnect → Active` phases in worker.
 - **AdaptiveBuf**: Go-style dynamic buffer sizing (512B → 64KB).
-- **Full-mesh clustering** (`cluster` feature): Route connections between peers using RS+/RS-/RMSG
+- **Full-mesh clustering** (`mesh` feature): Route connections between peers using RS+/RS-/RMSG
   protocol. One-hop message forwarding — messages from routes are never re-forwarded to other routes.
 
 ### Key Types
@@ -193,13 +195,13 @@ Always run `cargo +nightly fmt` before committing.
 | `ServerConn` | `core/io/buf.rs` | Connection I/O wrapper (test-only) |
 | `Backoff` | `core/io/buf.rs` | Exponential backoff with jitter |
 | `AdaptiveBuf` | `core/io/buf.rs` | Dynamic read buffer |
-| `LeafConn` | `leaf/conn.rs` | Leaf connection I/O wrapper |
-| `Upstream` | `leaf/upstream.rs` | Hub connection management |
-| `InterestPipeline` | `leaf/interest.rs` | Subject mapping + interest collapse |
-| `RouteHandler` | `cluster/handler.rs` | Route protocol dispatch (`cluster`) |
-| `RouteConnManager` | `cluster/conn.rs` | Outbound route connections (`cluster`) |
-| `GatewayHandler` | `gateway/handler.rs` | Gateway protocol dispatch (`gateway`) |
-| `GatewayConnManager` | `gateway/conn.rs` | Outbound gateway connections (`gateway`) |
+| `LeafConn` | `connector/leaf/conn.rs` | Leaf connection I/O wrapper |
+| `Upstream` | `connector/leaf/upstream.rs` | Hub connection management |
+| `InterestPipeline` | `connector/leaf/interest.rs` | Subject mapping + interest collapse |
+| `RouteHandler` | `connector/mesh/handler.rs` | Route protocol dispatch (`mesh`) |
+| `RouteConnManager` | `connector/mesh/conn.rs` | Outbound route connections (`mesh`) |
+| `GatewayHandler` | `connector/gateway/handler.rs` | Gateway protocol dispatch (`gateway`) |
+| `GatewayConnManager` | `connector/gateway/conn.rs` | Outbound gateway connections (`gateway`) |
 
 ## Feature Flags
 
@@ -209,7 +211,7 @@ Always run `cargo +nightly fmt` before committing.
 | `hub` | yes | Inbound leaf node connection support |
 | `interest-collapse` | yes | N:1 wildcard aggregation for upstream subs |
 | `subject-mapping` | yes | Stateless subject rewriting before upstream |
-| `cluster` | no | Full mesh route clustering (RS+/RS-/RMSG) |
+| `mesh` | no | Full mesh route clustering (RS+/RS-/RMSG) |
 | `gateway` | no | Gateway inter-cluster traffic |
 | `accounts` | no | Multi-tenant per-account subject isolation |
 | `worker-affinity` | no | Subject-based worker affinity tracking |
@@ -250,7 +252,7 @@ New dependencies should use permissive licenses: MIT, Apache-2.0, ISC, BSD-2-Cla
 - **No `unwrap()` or `expect()`** in library code.
 - **Imports**: Group std → external crates → crate-internal.
 - All public items should have doc comments.
-- Tests go in `#[cfg(test)] mod tests` within each source file (295 unit tests with `--all-features`).
+- Tests go in `#[cfg(test)] mod tests` within each source file (314 unit tests with `--all-features`).
 - Integration tests in `tests/e2e.rs` use `async-nats` client against a real `nats-server`.
 
 ## Commit & PR Standards

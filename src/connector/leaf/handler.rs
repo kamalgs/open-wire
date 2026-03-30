@@ -11,13 +11,13 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::core::buf::LeafOp;
-use crate::core::nats_proto;
-use crate::core::sub_list::Subscription;
-use crate::handler::propagation::propagate_route_gateway_interest;
-use crate::handler::{
+use crate::core::handler::propagation::propagate_route_gateway_interest;
+use crate::core::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
+use crate::core::nats_proto;
+use crate::core::sub_list::Subscription;
 
 /// Handles leaf node protocol operations (LS+, LS-, LMSG, PING, PONG).
 pub(crate) struct LeafHandler;
@@ -104,7 +104,7 @@ impl LeafHandler {
                 sid
             }
             ConnExt::Client => unreachable!("leaf op on client connection"),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
             #[cfg(feature = "gateway")]
             ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
@@ -123,7 +123,7 @@ impl LeafHandler {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: true,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
@@ -191,7 +191,7 @@ impl LeafHandler {
                 None => return HandleResult::Ok,
             },
             ConnExt::Client => unreachable!("leaf op on client connection"),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
             #[cfg(feature = "gateway")]
             ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),

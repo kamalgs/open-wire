@@ -29,7 +29,7 @@ pub struct Subscription {
     /// True for inbound leaf node subscriptions (deliver via LMSG, not MSG).
     pub is_leaf: bool,
     /// True for route peer subscriptions (deliver via RMSG, not MSG).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub is_route: bool,
     /// True for gateway peer subscriptions (deliver via RMSG, not MSG).
     #[cfg(feature = "gateway")]
@@ -55,7 +55,7 @@ impl Clone for Subscription {
             max_msgs: AtomicU64::new(self.max_msgs.load(Ordering::Relaxed)),
             delivered: AtomicU64::new(self.delivered.load(Ordering::Relaxed)),
             is_leaf: self.is_leaf,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             is_route: self.is_route,
             #[cfg(feature = "gateway")]
             is_gateway: self.is_gateway,
@@ -82,7 +82,7 @@ impl Subscription {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
@@ -612,7 +612,7 @@ impl SubscriptionManager {
         // Check exact subs
         if let Some(subs) = self.exact.get(subject) {
             for sub in subs {
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 if sub.is_route {
                     continue;
                 }
@@ -628,7 +628,7 @@ impl SubscriptionManager {
             if found {
                 return;
             }
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             if sub.is_route {
                 return;
             }
@@ -648,7 +648,7 @@ impl SubscriptionManager {
         for (subj, subs) in &self.exact {
             for sub in subs {
                 if !sub.is_leaf {
-                    #[cfg(feature = "cluster")]
+                    #[cfg(feature = "mesh")]
                     if sub.is_route {
                         continue;
                     }
@@ -662,7 +662,7 @@ impl SubscriptionManager {
         }
         self.wild.for_each_sub(|sub| {
             if !sub.is_leaf {
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 if sub.is_route {
                     return;
                 }
@@ -678,12 +678,12 @@ impl SubscriptionManager {
 
     /// Returns unique local (client + leaf) (subject, queue) pairs for route/gateway interest
     /// propagation. Excludes route and gateway subscriptions (avoids loops).
-    #[cfg(any(feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub fn local_interests(&self) -> Vec<(&str, Option<&str>)> {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
             for sub in subs {
-                #[cfg(feature = "cluster")]
+                #[cfg(feature = "mesh")]
                 if sub.is_route {
                     continue;
                 }
@@ -695,7 +695,7 @@ impl SubscriptionManager {
             }
         }
         self.wild.for_each_sub(|sub| {
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             if sub.is_route {
                 return;
             }

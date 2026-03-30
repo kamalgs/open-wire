@@ -3,11 +3,11 @@
 //! Propagates LS+/LS-, RS+/RS-, and gateway interest changes to connected
 //! leaf, route, and gateway peers. Also handles gateway reply rewriting.
 
-#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::core::nats_proto;
-#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::core::server::ServerState;
-#[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::core::sub_list::MsgWriter;
 
 #[cfg(feature = "gateway")]
@@ -103,7 +103,7 @@ pub(crate) fn send_existing_subs(
 }
 
 /// Propagate RS+ (`is_sub=true`) or RS- (`is_sub=false`) to all inbound route connections.
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 pub(crate) fn propagate_route_interest(
     state: &ServerState,
     subject: &[u8],
@@ -156,7 +156,7 @@ pub(crate) fn propagate_route_interest(
 /// Both route and gateway peers use the same RS+ wire format, so this single
 /// function replaces the old `send_existing_subs_to_route` and
 /// `send_existing_subs_to_gateway`.
-#[cfg(any(feature = "cluster", feature = "gateway"))]
+#[cfg(any(feature = "mesh", feature = "gateway"))]
 pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) {
     let mut builder = nats_proto::MsgBuilder::new();
 
@@ -285,7 +285,7 @@ pub(crate) fn propagate_all_interest(
 ) {
     #[cfg(feature = "hub")]
     propagate_leaf_interest(state, subject, queue, is_sub);
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     propagate_route_interest(
         state,
         subject,
@@ -316,7 +316,7 @@ pub(crate) fn propagate_route_gateway_interest(
     is_sub: bool,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     propagate_route_interest(
         state,
         subject,
@@ -421,20 +421,20 @@ mod tests {
             leaf_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "hub")]
             leaf_auth: Default::default(),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_port: None,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_name: None,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             cluster_seeds: Vec::new(),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_peers: std::sync::Mutex::new(crate::core::server::RoutePeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             route_connect_tx: std::sync::Mutex::new(None),
             #[cfg(feature = "gateway")]
             gateway_writers: std::sync::RwLock::new(HashMap::new()),

@@ -26,7 +26,7 @@ use crate::core::types::ServerInfo;
 pub(crate) use crate::core::nats_proto::ClientOp;
 #[cfg(any(feature = "leaf", feature = "hub"))]
 pub(crate) use crate::core::nats_proto::LeafOp;
-#[cfg(feature = "cluster")]
+#[cfg(feature = "mesh")]
 pub(crate) use crate::core::nats_proto::RouteOp;
 
 // --- Adaptive read buffer (Go-style dynamic sizing) ---
@@ -435,9 +435,9 @@ mod tests {
     // Leaf protocol parsing tests live in nats_proto.rs.
 
     #[cfg(feature = "leaf")]
-    fn make_leaf_pair() -> (crate::leaf::LeafConn, TcpStream) {
+    fn make_leaf_pair() -> (crate::connector::leaf::LeafConn, TcpStream) {
         let (server, client) = tcp_pair();
-        let conn = crate::leaf::LeafConn::new(server, BufConfig::default());
+        let conn = crate::connector::leaf::LeafConn::new(server, BufConfig::default());
         (conn, client)
     }
 
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     #[cfg(feature = "leaf")]
     fn test_leaf_connect_with_creds() {
-        use crate::leaf::UpstreamConnectCreds;
+        use crate::connector::leaf::UpstreamConnectCreds;
         let (mut conn, mut hub) = make_leaf_pair();
         let creds = UpstreamConnectCreds {
             user: Some("admin".into()),

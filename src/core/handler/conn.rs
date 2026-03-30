@@ -12,7 +12,7 @@ use crate::core::server::Permissions;
 use crate::core::sub_list::MsgWriter;
 
 #[cfg(feature = "leaf")]
-use crate::leaf::UpstreamCmd;
+use crate::connector::leaf::UpstreamCmd;
 #[cfg(feature = "leaf")]
 use std::sync::mpsc;
 
@@ -74,7 +74,7 @@ pub(crate) enum ConnExt {
         leaf_sids: HashMap<(Bytes, Option<Bytes>), u64>,
     },
     /// Inbound route connection (uses RMSG for delivery, RS+/RS- for interest).
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     Route {
         route_sid_counter: u64,
         route_sids: HashMap<(Bytes, Option<Bytes>), u64>,
@@ -101,7 +101,7 @@ pub(crate) enum ConnKind {
     #[cfg(feature = "hub")]
     Leaf,
     /// Inbound route connection.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     Route,
     /// Inbound gateway connection.
     #[cfg(feature = "gateway")]
@@ -115,7 +115,7 @@ impl ConnExt {
             Self::Client => ConnKind::Client,
             #[cfg(feature = "hub")]
             Self::Leaf { .. } => ConnKind::Leaf,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             Self::Route { .. } => ConnKind::Route,
             #[cfg(feature = "gateway")]
             Self::Gateway { .. } => ConnKind::Gateway,
@@ -135,13 +135,13 @@ impl ConnExt {
     }
 
     /// Returns `true` for inbound route connections.
-    #[cfg(feature = "cluster")]
+    #[cfg(feature = "mesh")]
     pub fn is_route(&self) -> bool {
         matches!(self, Self::Route { .. })
     }
 
     /// Returns `true` for inbound route connections.
-    #[cfg(not(feature = "cluster"))]
+    #[cfg(not(feature = "mesh"))]
     #[allow(dead_code)]
     pub fn is_route(&self) -> bool {
         false
@@ -161,13 +161,13 @@ impl ConnExt {
     }
 
     /// Connection type label for metrics and logging.
-    #[cfg(any(feature = "hub", feature = "cluster", feature = "gateway"))]
+    #[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Client => "client",
             #[cfg(feature = "hub")]
             Self::Leaf { .. } => "leaf",
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             Self::Route { .. } => "route",
             #[cfg(feature = "gateway")]
             Self::Gateway { .. } => "gateway",

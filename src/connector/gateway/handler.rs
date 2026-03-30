@@ -11,14 +11,14 @@ use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
 
-use crate::core::nats_proto;
-use crate::core::nats_proto::GatewayOp;
-use crate::core::sub_list::Subscription;
-use crate::handler::propagation::unwrap_gateway_reply_bytes;
-use crate::handler::{
+use crate::core::handler::propagation::unwrap_gateway_reply_bytes;
+use crate::core::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
     MessageDeliveryHub, Msg,
 };
+use crate::core::nats_proto;
+use crate::core::nats_proto::GatewayOp;
+use crate::core::sub_list::Subscription;
 
 /// Handles gateway protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct GatewayHandler;
@@ -75,7 +75,7 @@ impl ConnectionHandler for GatewayHandler {
                         drop(peers);
                         drop(tx);
                         if changed {
-                            crate::gateway::rebuild_gateway_info(wctx.state);
+                            crate::connector::gateway::rebuild_gateway_info(wctx.state);
                         }
                     }
                 }
@@ -130,7 +130,7 @@ impl GatewayHandler {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            #[cfg(feature = "cluster")]
+            #[cfg(feature = "mesh")]
             is_route: false,
             is_gateway: true,
             #[cfg(feature = "accounts")]
