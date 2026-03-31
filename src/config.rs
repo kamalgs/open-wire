@@ -23,6 +23,195 @@ use crate::core::server::HubCredentials;
 use crate::core::server::{AccountConfig, ExportRule, ImportRule};
 use crate::core::server::{ClientAuth, LeafServerConfig, Permission, Permissions, UserConfig};
 
+const USAGE: &str = "\
+Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
+[--hub URL] [--name NAME] \
+[--read-buf-max BYTES] [--write-buf-size BYTES] [--workers N] \
+[--ws-port PORT] [--token TOKEN] [--user USER] [--pass PASS] \
+[--nkey PUBKEY] [--hub-user USER] [--hub-pass PASS] \
+[--hub-token TOKEN] [--hub-creds PATH] \
+[--metrics-port PORT] [--tls-cert PATH] [--tls-key PATH] \
+[--tls-ca-cert PATH] [--tls-verify] \
+[--max-payload BYTES] [--max-connections N] \
+[--max-control-line BYTES] [--max-subscriptions N] \
+[--pid-file PATH] [--log-file PATH] [--monitoring-port PORT] \
+[--auth-timeout SECS]";
+
+/// Parse CLI arguments into a [`LeafServerConfig`].
+///
+/// Loads a config file as the base when `--config` is supplied, then applies
+/// any flag overrides on top. Returns `(config, config_file_path)`.
+pub fn from_args() -> Result<(LeafServerConfig, Option<String>), Box<dyn std::error::Error>> {
+    let mut args = pico_args::Arguments::from_env();
+
+    let cfg_path: Option<String> = args.opt_value_from_str(["-c", "--config"])?;
+    let mut config = if let Some(ref path) = cfg_path {
+        load_config(Path::new(path)).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
+    } else {
+        LeafServerConfig::default()
+    };
+
+    if let Some(v) = args.opt_value_from_str(["-p", "--port"])? {
+        config.port = v;
+    }
+    if let Some(v) = args.opt_value_from_str(["-h", "--host"])? {
+        config.host = v;
+    }
+    if let Some(v) = args.opt_value_from_str(["-w", "--workers"])? {
+        config.workers = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--name")? {
+        config.server_name = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--ws-port")? {
+        config.ws_port = Some(v);
+    }
+    if let Some(v) = args.opt_value_from_str("--read-buf-max")? {
+        config.max_read_buf_capacity = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--write-buf-size")? {
+        config.write_buf_capacity = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--metrics-port")? {
+        config.metrics_port = Some(v);
+    }
+    if let Some(v) = args.opt_value_from_str("--max-payload")? {
+        config.max_payload = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--max-connections")? {
+        config.max_connections = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--max-control-line")? {
+        config.max_control_line = v;
+    }
+    if let Some(v) = args.opt_value_from_str("--max-subscriptions")? {
+        config.max_subscriptions = v;
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--tls-cert")? {
+        config.tls_cert = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--tls-key")? {
+        config.tls_key = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--tls-ca-cert")? {
+        config.tls_ca_cert = Some(std::path::PathBuf::from(v));
+    }
+    if args.contains("--tls-verify") {
+        config.tls_verify = true;
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--pid-file")? {
+        config.pid_file = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str::<_, String>("--log-file")? {
+        config.log_file = Some(std::path::PathBuf::from(v));
+    }
+    if let Some(v) = args.opt_value_from_str(["--monitoring-port", "--http-port"])? {
+        config.monitoring_port = Some(v);
+    }
+    if let Some(secs) = args.opt_value_from_str::<_, u64>("--auth-timeout")? {
+        config.auth_timeout = std::time::Duration::from_secs(secs);
+    }
+
+    let auth_token: Option<String> = args.opt_value_from_str("--token")?;
+    let auth_user: Option<String> = args.opt_value_from_str("--user")?;
+    let auth_pass: Option<String> = args.opt_value_from_str("--pass")?;
+    let mut auth_nkeys: Vec<String> = Vec::new();
+    while let Some(v) = args.opt_value_from_str::<_, String>("--nkey")? {
+        auth_nkeys.push(v);
+    }
+
+    if !auth_nkeys.is_empty() {
+        config.client_auth = ClientAuth::NKey(auth_nkeys);
+    } else if let Some(token) = auth_token {
+        config.client_auth = ClientAuth::Token(token);
+    } else if let (Some(user), Some(pass)) = (auth_user, auth_pass) {
+        config.client_auth = ClientAuth::UserPass { user, pass };
+    }
+
+    #[cfg(feature = "leaf")]
+    {
+        if let Some(v) = args.opt_value_from_str("--hub")? {
+            config.hub_url = Some(v);
+        }
+        let mut hub_creds = HubCredentials::default();
+        let mut has_hub_creds = false;
+        if let Some(v) = args.opt_value_from_str::<_, String>("--hub-user")? {
+            hub_creds.user = Some(v);
+            has_hub_creds = true;
+        }
+        if let Some(v) = args.opt_value_from_str::<_, String>("--hub-pass")? {
+            hub_creds.pass = Some(v);
+            has_hub_creds = true;
+        }
+        if let Some(v) = args.opt_value_from_str::<_, String>("--hub-token")? {
+            hub_creds.token = Some(v);
+            has_hub_creds = true;
+        }
+        if let Some(v) = args.opt_value_from_str::<_, String>("--hub-creds")? {
+            hub_creds.creds_file = Some(v);
+            has_hub_creds = true;
+        }
+        if has_hub_creds {
+            config.hub_credentials = Some(hub_creds);
+        }
+    }
+
+    #[cfg(feature = "mesh")]
+    {
+        if let Some(v) = args.opt_value_from_str("--cluster-port")? {
+            config.cluster_port = Some(v);
+        }
+        if let Some(v) = args.opt_value_from_str::<_, String>("--cluster-seeds")? {
+            config
+                .cluster_seeds
+                .extend(v.split(',').map(|s| s.trim().to_string()));
+        }
+        if let Some(v) = args.opt_value_from_str("--cluster-name")? {
+            config.cluster_name = Some(v);
+        }
+    }
+
+    #[cfg(feature = "gateway")]
+    {
+        if let Some(v) = args.opt_value_from_str("--gateway-port")? {
+            config.gateway_port = Some(v);
+        }
+        if let Some(v) = args.opt_value_from_str("--gateway-name")? {
+            config.gateway_name = Some(v);
+        }
+        if let Some(v) = args.opt_value_from_str::<_, String>("--gateway-remotes")? {
+            // Format: "cluster-b=host1:7222,host2:7222;cluster-c=host3:7222"
+            for cluster_spec in v.split(';') {
+                let cluster_spec = cluster_spec.trim();
+                if cluster_spec.is_empty() {
+                    continue;
+                }
+                if let Some((name, urls_str)) = cluster_spec.split_once('=') {
+                    let urls: Vec<String> =
+                        urls_str.split(',').map(|s| s.trim().to_string()).collect();
+                    config
+                        .gateway_remotes
+                        .push(crate::core::server::GatewayRemote {
+                            name: name.trim().to_string(),
+                            urls,
+                        });
+                }
+            }
+        }
+    }
+
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        for arg in &remaining {
+            eprintln!("Unknown argument: {}", arg.to_string_lossy());
+        }
+        eprintln!("{USAGE}");
+        std::process::exit(1);
+    }
+
+    Ok((config, cfg_path))
+}
+
 /// Errors that can occur during config parsing.
 #[derive(Debug)]
 pub enum ConfigError {
