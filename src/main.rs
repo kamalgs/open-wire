@@ -12,7 +12,7 @@ mod signals;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use open_wire::{config, LeafServer};
+use open_wire::{config, Server};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, cfg_path) = config::from_args()?;
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown, reload) = signals::setup();
     let pid_file = config.pid_file.clone();
-    let server = LeafServer::new(config);
+    let server = Server::new(config);
     let result = server.run_until_shutdown(shutdown, reload, cfg_path.as_deref());
 
     signals::clear();

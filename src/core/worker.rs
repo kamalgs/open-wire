@@ -185,7 +185,7 @@ pub(crate) struct Worker {
     info_line: Vec<u8>,
     /// INFO line for inbound leaf connections (port set to leafnode_port).
     #[cfg(feature = "hub")]
-    leaf_info_line: Vec<u8>,
+    hub_info_line: Vec<u8>,
     shutdown: bool,
     /// Accumulated eventfd notifications. Flushed after processing a read batch.
     /// Deduplicates across multiple PUBs in the same read buffer.
@@ -316,7 +316,7 @@ impl Worker {
         // The Go nats-server checks CID != 0 && leafnode_urls != nil to confirm
         // it connected to a leafnode port (not a client port).
         #[cfg(feature = "hub")]
-        let leaf_info_line = if let Some(lp) = state.leafnode_port {
+        let hub_info_line = if let Some(lp) = state.leafnode_port {
             let mut leaf_info = state.info.clone();
             leaf_info.port = lp;
             leaf_info.client_id = 1; // non-zero signals leafnode port
@@ -358,7 +358,7 @@ impl Worker {
                     state,
                     info_line,
                     #[cfg(feature = "hub")]
-                    leaf_info_line,
+                    hub_info_line,
                     shutdown: false,
                     pending_notify: [-1; 16],
                     pending_notify_count: 0,
@@ -690,7 +690,7 @@ impl Worker {
 
     #[cfg(feature = "hub")]
     fn add_leaf_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        let info = self.leaf_info_line.clone();
+        let info = self.hub_info_line.clone();
         self.register_conn(
             id,
             stream,
@@ -753,7 +753,11 @@ impl Worker {
 
             #[cfg(feature = "hub")]
             if client.ext.is_leaf() {
-                self.state.leaf_writers.write().unwrap().remove(&conn_id);
+                self.state
+                    .inbound_leaf_writers
+                    .write()
+                    .unwrap()
+                    .remove(&conn_id);
             }
             #[cfg(feature = "mesh")]
             if client.ext.is_route() {
@@ -1961,7 +1965,7 @@ impl Worker {
                     // Inbound leaf node — validate leaf auth, send PING, go Active.
                     #[cfg(feature = "hub")]
                     {
-                        let leaf_perms = self.state.leaf_auth.validate(&connect_info);
+                        let leaf_perms = self.state.inbound_leaf_auth.validate(&connect_info);
                         let leaf_perms = match leaf_perms {
                             Some(p) => p.map(std::sync::Arc::new),
                             None => {
@@ -1994,7 +1998,7 @@ impl Worker {
 
                         let dw = client.direct_writer.clone();
                         self.state
-                            .leaf_writers
+                            .inbound_leaf_writers
                             .write()
                             .unwrap()
                             .insert(conn_id, (dw, leaf_perms.clone()));

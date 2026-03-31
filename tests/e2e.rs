@@ -12,7 +12,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 #[cfg(feature = "gateway")]
 use open_wire::GatewayRemote;
-use open_wire::{LeafServer, LeafServerConfig};
+use open_wire::{Server, ServerConfig};
 use tokio::time::timeout;
 
 /// Drain a subscriber, counting messages until a timeout gap with no messages.
@@ -93,7 +93,7 @@ impl Drop for NatsServer {
     }
 }
 
-/// Start a LeafServer on the given port with optional hub_url, returning the
+/// Start a Server on the given port with optional hub_url, returning the
 /// shutdown sender. The server runs in a background tokio task.
 #[cfg(feature = "leaf")]
 fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
@@ -101,14 +101,14 @@ fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
     let shutdown_clone = Arc::clone(&shutdown);
     let reload = Arc::new(AtomicBool::new(false));
 
-    let config = LeafServerConfig {
+    let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port,
         hub_url,
         server_name: format!("test-leaf-{}", port),
         ..Default::default()
     };
-    let server = LeafServer::new(config);
+    let server = Server::new(config);
 
     std::thread::spawn(move || {
         if let Err(e) = server.run_until_shutdown(shutdown_clone, reload, None) {
@@ -515,21 +515,21 @@ async fn no_echo_publish() {
 
 // --- Hub mode helpers ---
 
-/// Start a LeafServer in hub mode (with leafnode_port), returning the shutdown sender.
+/// Start a Server in hub mode (with leafnode_port), returning the shutdown sender.
 #[cfg(feature = "hub")]
 fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = Arc::clone(&shutdown);
     let reload = Arc::new(AtomicBool::new(false));
 
-    let config = LeafServerConfig {
+    let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: format!("test-hub-{}", client_port),
         leafnode_port: Some(leafnode_port),
         ..Default::default()
     };
-    let server = LeafServer::new(config);
+    let server = Server::new(config);
 
     std::thread::spawn(move || {
         if let Err(e) = server.run_until_shutdown(shutdown_clone, reload, None) {
@@ -869,7 +869,7 @@ async fn leaf_queue_distribution() {
 
 // --- Cluster mode helpers ---
 
-/// Start a LeafServer in cluster mode, returning the shutdown sender.
+/// Start a Server in cluster mode, returning the shutdown sender.
 #[cfg(feature = "mesh")]
 fn spawn_cluster_node(
     client_port: u16,
@@ -881,7 +881,7 @@ fn spawn_cluster_node(
     let shutdown_clone = Arc::clone(&shutdown);
     let reload = Arc::new(AtomicBool::new(false));
 
-    let config = LeafServerConfig {
+    let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: name.to_string(),
@@ -890,7 +890,7 @@ fn spawn_cluster_node(
         cluster_name: Some("test-cluster".to_string()),
         ..Default::default()
     };
-    let server = LeafServer::new(config);
+    let server = Server::new(config);
     std::thread::Builder::new()
         .name(format!("cluster-{}", name))
         .spawn(move || {
@@ -1438,7 +1438,7 @@ async fn cluster_sub_unsub_propagation() {
 
 // --- Gateway mode helpers ---
 
-/// Start a LeafServer in gateway mode, returning the shutdown sender.
+/// Start a Server in gateway mode, returning the shutdown sender.
 #[cfg(feature = "gateway")]
 fn spawn_gateway_node(
     client_port: u16,
@@ -1461,7 +1461,7 @@ fn spawn_gateway_node(
         })
         .collect();
 
-    let config = LeafServerConfig {
+    let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: server_name.to_string(),
@@ -1476,7 +1476,7 @@ fn spawn_gateway_node(
         gateway_remotes,
         ..Default::default()
     };
-    let server = LeafServer::new(config);
+    let server = Server::new(config);
     std::thread::Builder::new()
         .name(format!("gw-{}", server_name))
         .spawn(move || {

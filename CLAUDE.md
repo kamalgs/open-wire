@@ -36,7 +36,7 @@ src/
 │   └── propagation.rs   # Interest propagation (LS+/LS-, RS+/RS-) + gateway reply rewriting
 ├── core/                # Core runtime only
 │   ├── mod.rs           # server + worker declarations
-│   ├── server.rs        # LeafServer, LeafServerConfig, ServerState
+│   ├── server.rs        # Server, ServerConfig, ServerState
 │   └── worker.rs        # Worker epoll event loop
 └── connector/           # Protocol bridge connectors
     ├── mod.rs           # Feature-gated sub-module declarations
@@ -185,8 +185,8 @@ Always run `cargo +nightly fmt` before committing.
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `LeafServer` | `core/server.rs` | Public API entry point |
-| `LeafServerConfig` | `core/server.rs` | Server configuration |
+| `Server` | `core/server.rs` | Public API entry point |
+| `ServerConfig` | `core/server.rs` | Server configuration |
 | `load_config` | `config.rs` | Go nats-server `.conf` file parser |
 | `Worker` | `core/worker.rs` | Per-thread epoll event loop |
 | `NatsProto` / `MsgBuilder` | `core/protocol/nats_proto.rs` | Protocol parser + message builder |

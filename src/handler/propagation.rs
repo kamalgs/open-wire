@@ -23,7 +23,7 @@ pub(crate) fn propagate_leaf_interest(
     queue: Option<&[u8]>,
     is_sub: bool,
 ) {
-    let writers = state.leaf_writers.read().unwrap();
+    let writers = state.inbound_leaf_writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
@@ -417,9 +417,9 @@ mod tests {
             #[cfg(feature = "hub")]
             leafnode_port: None,
             #[cfg(feature = "hub")]
-            leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            inbound_leaf_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "hub")]
-            leaf_auth: Default::default(),
+            inbound_leaf_auth: Default::default(),
             #[cfg(feature = "mesh")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "mesh")]
@@ -485,7 +485,7 @@ mod tests {
             },
         };
         state
-            .leaf_writers
+            .inbound_leaf_writers
             .write()
             .unwrap()
             .insert(100, (writer.clone(), Some(Arc::new(perms))));
@@ -513,7 +513,7 @@ mod tests {
         let w2 = MsgWriter::new_dummy();
 
         {
-            let mut writers = state.leaf_writers.write().unwrap();
+            let mut writers = state.inbound_leaf_writers.write().unwrap();
             writers.insert(1, (w1.clone(), None));
             writers.insert(2, (w2.clone(), None));
         }

@@ -21,7 +21,7 @@ use std::path::Path;
 use crate::core::server::HubCredentials;
 #[cfg(feature = "accounts")]
 use crate::core::server::{AccountConfig, ExportRule, ImportRule};
-use crate::core::server::{ClientAuth, LeafServerConfig, Permission, Permissions, UserConfig};
+use crate::core::server::{ClientAuth, Permission, Permissions, ServerConfig, UserConfig};
 
 const USAGE: &str = "\
 Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
@@ -37,18 +37,18 @@ Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
 [--pid-file PATH] [--log-file PATH] [--monitoring-port PORT] \
 [--auth-timeout SECS]";
 
-/// Parse CLI arguments into a [`LeafServerConfig`].
+/// Parse CLI arguments into a [`ServerConfig`].
 ///
 /// Loads a config file as the base when `--config` is supplied, then applies
 /// any flag overrides on top. Returns `(config, config_file_path)`.
-pub fn from_args() -> Result<(LeafServerConfig, Option<String>), Box<dyn std::error::Error>> {
+pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error::Error>> {
     let mut args = pico_args::Arguments::from_env();
 
     let cfg_path: Option<String> = args.opt_value_from_str(["-c", "--config"])?;
     let mut config = if let Some(ref path) = cfg_path {
         load_config(Path::new(path)).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
     } else {
-        LeafServerConfig::default()
+        ServerConfig::default()
     };
 
     if let Some(v) = args.opt_value_from_str(["-p", "--port"])? {
@@ -872,29 +872,29 @@ const IGNORED_KEYS: &[&str] = &[
     "strict",
 ];
 
-/// Load a Go nats-server `.conf` file and produce a [`LeafServerConfig`].
+/// Load a Go nats-server `.conf` file and produce a [`ServerConfig`].
 ///
 /// Unknown keys are logged at debug level and otherwise ignored, so this
 /// parser can read real Go nats-server configs without erroring on features
 /// open-wire does not support.
-pub fn load_config(path: &Path) -> Result<LeafServerConfig, ConfigError> {
+pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     let contents = std::fs::read_to_string(path)?;
     load_config_str(&contents)
 }
 
 /// Parse a config string (for testing).
-pub fn load_config_str(input: &str) -> Result<LeafServerConfig, ConfigError> {
+pub fn load_config_str(input: &str) -> Result<ServerConfig, ConfigError> {
     let root = parse(input)?;
     build_config(&root)
 }
 
-fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
+fn build_config(root: &Value) -> Result<ServerConfig, ConfigError> {
     let entries = match root.as_map() {
         Some(e) => e,
         None => return Err(ConfigError::Value("top-level must be a map".into())),
     };
 
-    let mut config = LeafServerConfig::default();
+    let mut config = ServerConfig::default();
     let mut auth_token: Option<String> = None;
     let mut auth_user: Option<String> = None;
     let mut auth_pass: Option<String> = None;
@@ -1060,7 +1060,7 @@ fn build_config(root: &Value) -> Result<LeafServerConfig, ConfigError> {
 }
 
 #[cfg(any(feature = "leaf", feature = "hub"))]
-fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigError> {
     let entries = match value.as_map() {
         Some(e) => e,
         None => return Ok(()),
@@ -1092,7 +1092,8 @@ fn apply_leafnodes(config: &mut LeafServerConfig, value: &Value) -> Result<(), C
                         if akey == "users" {
                             if let Some(arr) = aval.as_array() {
                                 let leaf_users = parse_leaf_users_array(arr)?;
-                                config.leaf_auth = crate::core::server::LeafAuth::Users(leaf_users);
+                                config.inbound_leaf_auth =
+                                    crate::core::server::LeafAuth::Users(leaf_users);
                             }
                         }
                     }
@@ -1145,7 +1146,7 @@ fn parse_leaf_users_array(
 
 /// Parse a `cluster { ... }` block.
 #[cfg(feature = "mesh")]
-fn apply_cluster(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+fn apply_cluster(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigError> {
     let entries = match value.as_map() {
         Some(e) => e,
         None => return Ok(()),
@@ -1182,7 +1183,7 @@ fn apply_cluster(config: &mut LeafServerConfig, value: &Value) -> Result<(), Con
 
 /// Parse a `gateway { ... }` block.
 #[cfg(feature = "gateway")]
-fn apply_gateway(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+fn apply_gateway(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigError> {
     use crate::core::server::GatewayRemote;
 
     let entries = match value.as_map() {
@@ -1257,7 +1258,7 @@ fn apply_gateway(config: &mut LeafServerConfig, value: &Value) -> Result<(), Con
 /// }
 /// ```
 #[cfg(feature = "accounts")]
-fn apply_accounts(config: &mut LeafServerConfig, value: &Value) -> Result<(), ConfigError> {
+fn apply_accounts(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigError> {
     let entries = match value.as_map() {
         Some(e) => e,
         None => return Ok(()),
@@ -1337,7 +1338,7 @@ fn apply_accounts(config: &mut LeafServerConfig, value: &Value) -> Result<(), Co
 }
 
 #[cfg(feature = "leaf")]
-fn apply_remote(config: &mut LeafServerConfig, remote: &Value) -> Result<(), ConfigError> {
+fn apply_remote(config: &mut ServerConfig, remote: &Value) -> Result<(), ConfigError> {
     let entries = match remote.as_map() {
         Some(e) => e,
         None => return Ok(()),
@@ -2124,7 +2125,7 @@ leafnodes {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        match &config.leaf_auth {
+        match &config.inbound_leaf_auth {
             crate::core::server::LeafAuth::Users(users) => {
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].user, "leaf1");
@@ -2150,7 +2151,7 @@ leafnodes {
 "#;
         let config = load_config_str(input).unwrap();
         assert!(matches!(
-            config.leaf_auth,
+            config.inbound_leaf_auth,
             crate::core::server::LeafAuth::None
         ));
     }

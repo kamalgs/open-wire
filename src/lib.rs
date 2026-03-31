@@ -33,6 +33,4 @@ pub use core::server::HubCredentials;
 pub use core::server::HubRemote;
 #[cfg(feature = "accounts")]
 pub use core::server::{AccountConfig, AccountId, AccountRegistry};
-pub use core::server::{
-    ClientAuth, LeafServer, LeafServerConfig, Permission, Permissions, UserConfig,
-};
+pub use core::server::{ClientAuth, Permission, Permissions, Server, ServerConfig, UserConfig};

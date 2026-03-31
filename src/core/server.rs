@@ -36,14 +36,14 @@ use crate::sub_list::SubscriptionManager;
 ///
 /// Accepts local client connections, routes messages between them,
 /// and optionally forwards traffic to an upstream NATS hub.
-pub struct LeafServer {
-    config: LeafServerConfig,
+pub struct Server {
+    config: ServerConfig,
     state: Arc<ServerState>,
 }
 
 /// Configuration for the leaf node server.
 #[derive(Debug, Clone)]
-pub struct LeafServerConfig {
+pub struct ServerConfig {
     /// Address to listen on (e.g., "0.0.0.0").
     pub host: String,
     pub port: u16,
@@ -86,7 +86,7 @@ pub struct LeafServerConfig {
     pub client_auth: ClientAuth,
     /// Inbound leaf node authentication configuration.
     #[cfg(feature = "hub")]
-    pub leaf_auth: LeafAuth,
+    pub inbound_leaf_auth: LeafAuth,
     /// Credentials for connecting to the upstream hub.
     #[cfg(feature = "leaf")]
     pub hub_credentials: Option<HubCredentials>,
@@ -159,7 +159,7 @@ pub struct LeafServerConfig {
     pub accounts: Vec<AccountConfig>,
 }
 
-impl Default for LeafServerConfig {
+impl Default for ServerConfig {
     fn default() -> Self {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -185,7 +185,7 @@ impl Default for LeafServerConfig {
             max_pings_outstanding: 2,
             client_auth: ClientAuth::None,
             #[cfg(feature = "hub")]
-            leaf_auth: LeafAuth::None,
+            inbound_leaf_auth: LeafAuth::None,
             #[cfg(feature = "leaf")]
             hub_credentials: None,
             #[cfg(feature = "leaf")]
@@ -1148,10 +1148,11 @@ pub(crate) struct ServerState {
     /// Each entry stores the writer and the leaf's optional publish permissions.
     #[cfg(feature = "hub")]
     #[allow(clippy::type_complexity)]
-    pub leaf_writers: std::sync::RwLock<HashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
+    pub inbound_leaf_writers:
+        std::sync::RwLock<HashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
     /// Inbound leaf node authentication configuration.
     #[cfg(feature = "hub")]
-    pub leaf_auth: LeafAuth,
+    pub inbound_leaf_auth: LeafAuth,
     /// Registry of MsgWriters for inbound route connections.
     /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
     #[cfg(feature = "mesh")]
@@ -1227,7 +1228,7 @@ impl ServerState {
         max_control_line: usize,
         max_subscriptions: usize,
         #[cfg(feature = "hub")] leafnode_port: Option<u16>,
-        #[cfg(feature = "hub")] leaf_auth: LeafAuth,
+        #[cfg(feature = "hub")] inbound_leaf_auth: LeafAuth,
         #[cfg(feature = "mesh")] cluster_port: Option<u16>,
         #[cfg(feature = "mesh")] cluster_name: Option<String>,
         #[cfg(feature = "mesh")] cluster_seeds: Vec<String>,
@@ -1316,9 +1317,9 @@ impl ServerState {
             #[cfg(feature = "hub")]
             leafnode_port,
             #[cfg(feature = "hub")]
-            leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            inbound_leaf_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "hub")]
-            leaf_auth,
+            inbound_leaf_auth,
             #[cfg(feature = "mesh")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "mesh")]
@@ -1423,9 +1424,9 @@ impl ServerState {
     }
 }
 
-impl LeafServer {
+impl Server {
     /// Create a new leaf server with the given configuration.
-    pub fn new(config: LeafServerConfig) -> Self {
+    pub fn new(config: ServerConfig) -> Self {
         let nonce = if config.client_auth.needs_nonce() {
             generate_nonce()
         } else {
@@ -1484,7 +1485,7 @@ impl LeafServer {
                 #[cfg(feature = "hub")]
                 config.leafnode_port,
                 #[cfg(feature = "hub")]
-                config.leaf_auth.clone(),
+                config.inbound_leaf_auth.clone(),
                 #[cfg(feature = "mesh")]
                 config.cluster_port,
                 #[cfg(feature = "mesh")]
@@ -2401,7 +2402,7 @@ mod tests {
 
     #[test]
     fn default_metrics_port_is_none() {
-        let config = LeafServerConfig::default();
+        let config = ServerConfig::default();
         assert!(config.metrics_port.is_none());
     }
 
@@ -2532,7 +2533,7 @@ mod tests {
 
     #[test]
     fn default_auth_timeout() {
-        let config = LeafServerConfig::default();
+        let config = ServerConfig::default();
         assert_eq!(config.auth_timeout, std::time::Duration::from_secs(2));
     }
 

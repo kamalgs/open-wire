@@ -778,9 +778,9 @@ mod tests {
             #[cfg(feature = "hub")]
             leafnode_port: None,
             #[cfg(feature = "hub")]
-            leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            inbound_leaf_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "hub")]
-            leaf_auth: Default::default(),
+            inbound_leaf_auth: Default::default(),
             #[cfg(feature = "mesh")]
             route_writers: std::sync::RwLock::new(HashMap::new()),
             #[cfg(feature = "mesh")]
