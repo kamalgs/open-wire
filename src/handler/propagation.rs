@@ -379,6 +379,7 @@ pub(crate) fn unwrap_gateway_reply_bytes(reply: &bytes::Bytes) -> bytes::Bytes {
 mod tests {
     #[cfg(any(feature = "hub", feature = "gateway"))]
     pub(crate) fn test_server_state() -> crate::core::server::ServerState {
+        use rustc_hash::FxHashMap;
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 
@@ -417,11 +418,11 @@ mod tests {
             #[cfg(feature = "hub")]
             leafnode_port: None,
             #[cfg(feature = "hub")]
-            inbound_leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            inbound_leaf_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "hub")]
             inbound_leaf_auth: Default::default(),
             #[cfg(feature = "mesh")]
-            route_writers: std::sync::RwLock::new(HashMap::new()),
+            route_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "mesh")]
             cluster_port: None,
             #[cfg(feature = "mesh")]
@@ -436,7 +437,7 @@ mod tests {
             #[cfg(feature = "mesh")]
             route_connect_tx: std::sync::Mutex::new(None),
             #[cfg(feature = "gateway")]
-            gateway_writers: std::sync::RwLock::new(HashMap::new()),
+            gateway_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "gateway")]
             gateway_port: None,
             #[cfg(feature = "gateway")]
@@ -455,7 +456,7 @@ mod tests {
             #[cfg(feature = "gateway")]
             cached_gateway_info: std::sync::Mutex::new(String::new()),
             #[cfg(feature = "gateway")]
-            gateway_interest: std::sync::RwLock::new(HashMap::new()),
+            gateway_interest: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "gateway")]
             has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]

@@ -5,6 +5,58 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-01 — WildTrie null-object + FxHashMap for connection maps (full 19-scenario run)
+
+**Changes since last benchmark:**
+Two hot-path optimisations:
+
+1. **WildTrie null-object pattern** (`src/pubsub/sub_list.rs`): Renamed `WildTrie` →
+   `WildTrieInner` and wrapped it in a `enum WildTrie { Empty, Active(WildTrieInner) }`.
+   When no wildcard subscriptions exist the trie is `Empty` — `for_each_match` becomes a
+   single branch with no heap allocation. Previously `WildTrieInner::for_each_match`
+   unconditionally called `subject.split('.').collect()` (Vec alloc) and allocated a
+   traversal stack, costing ~7% CPU at 3M pub/s even with zero wildcard subscribers.
+
+2. **FxHashMap for integer-keyed connection maps** (`rustc-hash = "2"`): Replaced
+   `std::collections::HashMap` (SipHash) with `FxHashMap` for maps keyed on internal
+   server-assigned `u64` connection IDs (`Worker::conns`, `Worker::fd_to_conn`,
+   `ServerState::inbound_leaf_writers`, `route_writers`, `gateway_writers`,
+   `gateway_interest`). String-keyed maps (subjects, queue groups) retain SipHash for
+   HashDoS protection. Before the change, hashing consumed ~28% CPU in the pub-only
+   profile (`BuildHasher::hash_one` 17% + `Hasher::write` 8% + `get_mut` 3%).
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Rust msg/s | Go msg/s | Rust/Go % | Previous |
+|---|---|---|---|---|
+| Pub only | ~1,380K | ~1,496K | **92%** | 70% |
+| Local pub/sub (pub) | ~1,014K | ~379K | **268%** | 169% |
+| Fan-out x5 (pub) | ~417K | ~176K | **237%** | 256% |
+| Leaf → Hub (pub) | ~1,054K | ~452K | **233%** | 117% |
+| Hub → Leaf (pub) | ~296K | ~338K | **88%** | 112% |
+| WS pub/sub (pub) | ~705K | ~488K | **144%** | — |
+| WS fan-out x5 (pub) | ~329K | ~133K | **247%** | — |
+| WS fan-out x10 (pub) | ~140K | ~53K | **263%** | — |
+| Hub pub only | ~1,504K | ~1,384K | **109%** | — |
+| Hub pub/sub (pub) | ~1,102K | ~421K | **262%** | — |
+| Hub fan-out x5 (pub) | ~411K | ~151K | **273%** | — |
+
+**Takeaways:**
+- **Pub/sub: 109% → 268%** — the single biggest jump. FxHashMap eliminates the
+  SipHash overhead on every `conns[conn_id]` lookup during subscriber delivery.
+  The ~28% CPU reclaimed from hashing flows directly into throughput.
+- **Leaf→Hub: 117% → 233%** — same cause: the forwarding path hits the connection
+  map for every message routed upstream.
+- **Fan-out x5: 256% → 237%** — slight apparent regression is within 3-run noise;
+  the absolute Rust throughput (~417K) is higher than before (~311K).
+- **Pub only: 70% → 92%** — improvement visible despite pub-only not involving
+  subscriber delivery; gains come from WildTrie (no alloc on empty trie) and
+  FxHashMap on `fd_to_conn` (looked up on every epoll event).
+- **Hub→Leaf: 88%** — noisy (Go range 260K–397K across 3 runs). Not a confirmed
+  regression; requires more runs to distinguish from measurement variance.
+
+---
+
 ## 2026-03-19 — Cross-account import/export (quick sanity check)
 
 **Changes since last benchmark:**

@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting leaf node server"
     );
     #[cfg(feature = "leaf")]
-    if let Some(ref hub) = config.hub_url {
+    if let Some(ref hub) = config.hub.url {
         info!(hub, "upstream hub");
     }
     if let Some(ws_port) = config.ws_port {

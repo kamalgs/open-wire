@@ -76,28 +76,28 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
         config.metrics_port = Some(v);
     }
     if let Some(v) = args.opt_value_from_str("--max-payload")? {
-        config.max_payload = v;
+        config.limits.max_payload = v;
     }
     if let Some(v) = args.opt_value_from_str("--max-connections")? {
-        config.max_connections = v;
+        config.limits.max_connections = v;
     }
     if let Some(v) = args.opt_value_from_str("--max-control-line")? {
-        config.max_control_line = v;
+        config.limits.max_control_line = v;
     }
     if let Some(v) = args.opt_value_from_str("--max-subscriptions")? {
-        config.max_subscriptions = v;
+        config.limits.max_subscriptions = v;
     }
     if let Some(v) = args.opt_value_from_str::<_, String>("--tls-cert")? {
-        config.tls_cert = Some(std::path::PathBuf::from(v));
+        config.tls.cert = Some(std::path::PathBuf::from(v));
     }
     if let Some(v) = args.opt_value_from_str::<_, String>("--tls-key")? {
-        config.tls_key = Some(std::path::PathBuf::from(v));
+        config.tls.key = Some(std::path::PathBuf::from(v));
     }
     if let Some(v) = args.opt_value_from_str::<_, String>("--tls-ca-cert")? {
-        config.tls_ca_cert = Some(std::path::PathBuf::from(v));
+        config.tls.ca_cert = Some(std::path::PathBuf::from(v));
     }
     if args.contains("--tls-verify") {
-        config.tls_verify = true;
+        config.tls.verify = true;
     }
     if let Some(v) = args.opt_value_from_str::<_, String>("--pid-file")? {
         config.pid_file = Some(std::path::PathBuf::from(v));
@@ -131,7 +131,7 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
     #[cfg(feature = "leaf")]
     {
         if let Some(v) = args.opt_value_from_str("--hub")? {
-            config.hub_url = Some(v);
+            config.hub.url = Some(v);
         }
         let mut hub_creds = HubCredentials::default();
         let mut has_hub_creds = false;
@@ -152,32 +152,33 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
             has_hub_creds = true;
         }
         if has_hub_creds {
-            config.hub_credentials = Some(hub_creds);
+            config.hub.credentials = Some(hub_creds);
         }
     }
 
     #[cfg(feature = "mesh")]
     {
         if let Some(v) = args.opt_value_from_str("--cluster-port")? {
-            config.cluster_port = Some(v);
+            config.cluster.port = Some(v);
         }
         if let Some(v) = args.opt_value_from_str::<_, String>("--cluster-seeds")? {
             config
-                .cluster_seeds
+                .cluster
+                .seeds
                 .extend(v.split(',').map(|s| s.trim().to_string()));
         }
         if let Some(v) = args.opt_value_from_str("--cluster-name")? {
-            config.cluster_name = Some(v);
+            config.cluster.name = Some(v);
         }
     }
 
     #[cfg(feature = "gateway")]
     {
         if let Some(v) = args.opt_value_from_str("--gateway-port")? {
-            config.gateway_port = Some(v);
+            config.gateway.port = Some(v);
         }
         if let Some(v) = args.opt_value_from_str("--gateway-name")? {
-            config.gateway_name = Some(v);
+            config.gateway.name = Some(v);
         }
         if let Some(v) = args.opt_value_from_str::<_, String>("--gateway-remotes")? {
             // Format: "cluster-b=host1:7222,host2:7222;cluster-c=host3:7222"
@@ -190,7 +191,8 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
                     let urls: Vec<String> =
                         urls_str.split(',').map(|s| s.trim().to_string()).collect();
                     config
-                        .gateway_remotes
+                        .gateway
+                        .remotes
                         .push(crate::core::server::GatewayRemote {
                             name: name.trim().to_string(),
                             urls,
@@ -916,11 +918,11 @@ fn build_config(root: &Value) -> Result<ServerConfig, ConfigError> {
             "host" => config.host = as_string(value)?,
             "port" => config.port = as_u16(value)?,
             "server_name" => config.server_name = as_string(value)?,
-            "max_payload" => config.max_payload = parse_size(value)?,
-            "max_pending" => config.max_pending = parse_size(value)?,
-            "max_connections" => config.max_connections = as_usize(value)?,
-            "max_control_line" => config.max_control_line = parse_size(value)?,
-            "max_subscriptions" => config.max_subscriptions = as_usize(value)?,
+            "max_payload" => config.limits.max_payload = parse_size(value)?,
+            "max_pending" => config.limits.max_pending = parse_size(value)?,
+            "max_connections" => config.limits.max_connections = as_usize(value)?,
+            "max_control_line" => config.limits.max_control_line = parse_size(value)?,
+            "max_subscriptions" => config.limits.max_subscriptions = as_usize(value)?,
             "ping_interval" => {
                 let secs = parse_duration_secs(value)?;
                 config.ping_interval = std::time::Duration::from_secs(secs);
@@ -1016,17 +1018,17 @@ fn build_config(root: &Value) -> Result<ServerConfig, ConfigError> {
                     for (tkey, tval) in entries {
                         match tkey.as_str() {
                             "cert_file" => {
-                                config.tls_cert = Some(std::path::PathBuf::from(as_string(tval)?));
+                                config.tls.cert = Some(std::path::PathBuf::from(as_string(tval)?));
                             }
                             "key_file" => {
-                                config.tls_key = Some(std::path::PathBuf::from(as_string(tval)?));
+                                config.tls.key = Some(std::path::PathBuf::from(as_string(tval)?));
                             }
                             "ca_file" => {
-                                config.tls_ca_cert =
+                                config.tls.ca_cert =
                                     Some(std::path::PathBuf::from(as_string(tval)?));
                             }
                             "verify" => {
-                                config.tls_verify = matches!(tval, Value::Bool(true));
+                                config.tls.verify = matches!(tval, Value::Bool(true));
                             }
                             _ => {
                                 tracing::debug!("ignoring tls key: {tkey}");
@@ -1082,7 +1084,7 @@ fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), Confi
                 let s = as_string(lval)?;
                 let (_host, port) = parse_listen(&s)?;
                 if let Some(p) = port {
-                    config.leafnode_port = Some(p);
+                    config.leafnodes.port = Some(p);
                 }
             }
             #[cfg(feature = "hub")]
@@ -1092,7 +1094,7 @@ fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), Confi
                         if akey == "users" {
                             if let Some(arr) = aval.as_array() {
                                 let leaf_users = parse_leaf_users_array(arr)?;
-                                config.inbound_leaf_auth =
+                                config.leafnodes.auth =
                                     crate::core::server::LeafAuth::Users(leaf_users);
                             }
                         }
@@ -1158,17 +1160,17 @@ fn apply_cluster(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigE
                 let s = as_string(cval)?;
                 let (_host, port) = parse_listen(&s)?;
                 if let Some(p) = port {
-                    config.cluster_port = Some(p);
+                    config.cluster.port = Some(p);
                 }
             }
             "name" => {
-                config.cluster_name = Some(as_string(cval)?);
+                config.cluster.name = Some(as_string(cval)?);
             }
             "routes" => {
                 if let Some(arr) = cval.as_array() {
                     for v in arr {
                         if let Ok(s) = as_string(v) {
-                            config.cluster_seeds.push(s);
+                            config.cluster.seeds.push(s);
                         }
                     }
                 }
@@ -1197,12 +1199,12 @@ fn apply_gateway(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigE
                 let s = as_string(gval)?;
                 let (_host, port) = parse_listen(&s)?;
                 if let Some(p) = port {
-                    config.gateway_port = Some(p);
+                    config.gateway.port = Some(p);
                 }
             }
-            "port" => config.gateway_port = Some(as_u16(gval)?),
+            "port" => config.gateway.port = Some(as_u16(gval)?),
             "name" => {
-                config.gateway_name = Some(as_string(gval)?);
+                config.gateway.name = Some(as_string(gval)?);
             }
             "gateways" => {
                 if let Some(arr) = gval.as_array() {
@@ -1234,7 +1236,7 @@ fn apply_gateway(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigE
                                 }
                             }
                             if !name.is_empty() && !urls.is_empty() {
-                                config.gateway_remotes.push(GatewayRemote { name, urls });
+                                config.gateway.remotes.push(GatewayRemote { name, urls });
                             }
                         }
                     }
@@ -1415,23 +1417,23 @@ fn apply_remote(config: &mut ServerConfig, remote: &Value) -> Result<(), ConfigE
             #[cfg(feature = "subject-mapping")]
             subject_mappings: mappings.clone(),
         };
-        config.hub_remotes.push(hub_remote);
+        config.hub.remotes.push(hub_remote);
     }
 
     // Also set legacy fields for backward compat (first remote wins)
-    if config.hub_url.is_none() && !url.is_empty() {
-        config.hub_url = Some(url);
+    if config.hub.url.is_none() && !url.is_empty() {
+        config.hub.url = Some(url);
     }
-    if has_creds && config.hub_credentials.is_none() {
-        config.hub_credentials = Some(hub_creds);
+    if has_creds && config.hub.credentials.is_none() {
+        config.hub.credentials = Some(hub_creds);
     }
     #[cfg(feature = "interest-collapse")]
-    if config.interest_collapse.is_empty() && !collapse_templates.is_empty() {
-        config.interest_collapse = collapse_templates;
+    if config.hub.interest_collapse.is_empty() && !collapse_templates.is_empty() {
+        config.hub.interest_collapse = collapse_templates;
     }
     #[cfg(feature = "subject-mapping")]
-    if config.subject_mappings.is_empty() && !mappings.is_empty() {
-        config.subject_mappings = mappings;
+    if config.hub.subject_mappings.is_empty() && !mappings.is_empty() {
+        config.hub.subject_mappings = mappings;
     }
 
     Ok(())
@@ -1692,7 +1694,7 @@ leafnodes {
         let config = load_config_str(input).unwrap();
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 4225);
-        assert_eq!(config.hub_url.as_deref(), Some("nats://127.0.0.1:7422"));
+        assert_eq!(config.hub.url.as_deref(), Some("nats://127.0.0.1:7422"));
     }
 
     #[test]
@@ -1711,7 +1713,7 @@ websocket {
         let config = load_config_str(input).unwrap();
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 4225);
-        assert_eq!(config.hub_url.as_deref(), Some("nats://127.0.0.1:7422"));
+        assert_eq!(config.hub.url.as_deref(), Some("nats://127.0.0.1:7422"));
         assert_eq!(config.ws_port, Some(4226));
     }
 
@@ -1727,8 +1729,8 @@ leafnodes {
         let config = load_config_str(input).unwrap();
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 4333);
-        assert!(config.hub_url.is_none());
-        assert_eq!(config.leafnode_port, Some(7422));
+        assert!(config.hub.url.is_none());
+        assert_eq!(config.leafnodes.port, Some(7422));
     }
 
     #[test]
@@ -1788,11 +1790,11 @@ websocket {
         assert_eq!(config.server_name, "my-leaf");
         assert_eq!(config.host, "10.0.0.1");
         assert_eq!(config.port, 5222);
-        assert_eq!(config.max_payload, 2 * 1024 * 1024);
-        assert_eq!(config.max_pending, 128 * 1024 * 1024);
-        assert_eq!(config.max_connections, 1000);
-        assert_eq!(config.max_control_line, 8 * 1024);
-        assert_eq!(config.max_subscriptions, 100);
+        assert_eq!(config.limits.max_payload, 2 * 1024 * 1024);
+        assert_eq!(config.limits.max_pending, 128 * 1024 * 1024);
+        assert_eq!(config.limits.max_connections, 1000);
+        assert_eq!(config.limits.max_control_line, 8 * 1024);
+        assert_eq!(config.limits.max_subscriptions, 100);
         assert_eq!(config.ping_interval, std::time::Duration::from_secs(30));
         assert_eq!(config.max_pings_outstanding, 5);
         assert_eq!(config.workers, 4);
@@ -1802,17 +1804,17 @@ websocket {
             if user == "admin" && pass == "secret")
         );
         assert_eq!(
-            config.hub_url.as_deref(),
+            config.hub.url.as_deref(),
             Some("nats://hub.example.com:7422")
         );
-        let creds = config.hub_credentials.as_ref().unwrap();
+        let creds = config.hub.credentials.as_ref().unwrap();
         assert_eq!(creds.creds_file.as_deref(), Some("/path/to/hub.creds"));
         assert_eq!(
-            config.tls_cert.as_ref().unwrap().to_str().unwrap(),
+            config.tls.cert.as_ref().unwrap().to_str().unwrap(),
             "/etc/tls/cert.pem"
         );
         assert_eq!(
-            config.tls_key.as_ref().unwrap().to_str().unwrap(),
+            config.tls.key.as_ref().unwrap().to_str().unwrap(),
             "/etc/tls/key.pem"
         );
         assert_eq!(config.ws_port, Some(8222));
@@ -1918,7 +1920,7 @@ another_unknown {
         let config = load_config_str(input).unwrap();
         assert_eq!(config.port, 4222);
         assert_eq!(config.host, "0.0.0.0");
-        assert_eq!(config.max_connections, 100);
+        assert_eq!(config.limits.max_connections, 100);
     }
 
     #[test]
@@ -1933,7 +1935,7 @@ leafnodes {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        assert_eq!(config.hub_url.as_deref(), Some("nats://first:7422"));
+        assert_eq!(config.hub.url.as_deref(), Some("nats://first:7422"));
     }
 
     #[test]
@@ -1955,10 +1957,10 @@ tls {
 "#;
         let config = load_config_str(input).unwrap();
         assert_eq!(
-            config.tls_ca_cert.as_deref(),
+            config.tls.ca_cert.as_deref(),
             Some(std::path::Path::new("/path/to/ca.pem"))
         );
-        assert!(config.tls_verify);
+        assert!(config.tls.verify);
     }
 
     #[test]
@@ -1970,8 +1972,8 @@ tls {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        assert!(config.tls_ca_cert.is_none());
-        assert!(!config.tls_verify);
+        assert!(config.tls.ca_cert.is_none());
+        assert!(!config.tls.verify);
     }
 
     #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
@@ -1989,9 +1991,9 @@ leafnodes {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        assert_eq!(config.interest_collapse.len(), 2);
-        assert_eq!(config.interest_collapse[0], "app.*.sessions.>");
-        assert_eq!(config.interest_collapse[1], "telemetry.*.metrics.*");
+        assert_eq!(config.hub.interest_collapse.len(), 2);
+        assert_eq!(config.hub.interest_collapse[0], "app.*.sessions.>");
+        assert_eq!(config.hub.interest_collapse[1], "telemetry.*.metrics.*");
     }
 
     #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
@@ -2005,7 +2007,7 @@ leafnodes {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        assert!(config.interest_collapse.is_empty());
+        assert!(config.hub.interest_collapse.is_empty());
     }
 
     #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
@@ -2023,11 +2025,11 @@ leafnodes {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        assert_eq!(config.subject_mappings.len(), 2);
-        assert_eq!(config.subject_mappings[0].from, "local.>");
-        assert_eq!(config.subject_mappings[0].to, "prod.region1.>");
-        assert_eq!(config.subject_mappings[1].from, "old.exact");
-        assert_eq!(config.subject_mappings[1].to, "new.exact");
+        assert_eq!(config.hub.subject_mappings.len(), 2);
+        assert_eq!(config.hub.subject_mappings[0].from, "local.>");
+        assert_eq!(config.hub.subject_mappings[0].to, "prod.region1.>");
+        assert_eq!(config.hub.subject_mappings[1].from, "old.exact");
+        assert_eq!(config.hub.subject_mappings[1].to, "new.exact");
     }
 
     #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
@@ -2041,7 +2043,7 @@ leafnodes {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        assert!(config.subject_mappings.is_empty());
+        assert!(config.hub.subject_mappings.is_empty());
     }
 
     #[cfg(feature = "accounts")]
@@ -2125,7 +2127,7 @@ leafnodes {
 }
 "#;
         let config = load_config_str(input).unwrap();
-        match &config.inbound_leaf_auth {
+        match &config.leafnodes.auth {
             crate::core::server::LeafAuth::Users(users) => {
                 assert_eq!(users.len(), 2);
                 assert_eq!(users[0].user, "leaf1");
@@ -2151,7 +2153,7 @@ leafnodes {
 "#;
         let config = load_config_str(input).unwrap();
         assert!(matches!(
-            config.inbound_leaf_auth,
+            config.leafnodes.auth,
             crate::core::server::LeafAuth::None
         ));
     }

@@ -5,6 +5,8 @@
 //! connections on the same worker costs 1 eventfd write, not 100.
 
 use std::collections::HashMap;
+
+use rustc_hash::FxHashMap;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -178,8 +180,8 @@ impl WorkerHandle {
 pub(crate) struct Worker {
     epoll_fd: OwnedFd,
     event_fd: Arc<OwnedFd>,
-    conns: HashMap<u64, ClientState>,
-    fd_to_conn: HashMap<RawFd, u64>,
+    conns: FxHashMap<u64, ClientState>,
+    fd_to_conn: FxHashMap<RawFd, u64>,
     rx: mpsc::Receiver<WorkerCmd>,
     state: Arc<ServerState>,
     info_line: Vec<u8>,
@@ -352,8 +354,8 @@ impl Worker {
                 let mut worker = Worker {
                     epoll_fd,
                     event_fd,
-                    conns: HashMap::new(),
-                    fd_to_conn: HashMap::new(),
+                    conns: FxHashMap::default(),
+                    fd_to_conn: FxHashMap::default(),
                     rx,
                     state,
                     info_line,

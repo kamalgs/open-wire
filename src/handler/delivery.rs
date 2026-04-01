@@ -9,7 +9,6 @@
 //! - `forward_to_upstream()` — send to hub via mpsc
 //! - `handle_expired_subs()` — cleanup after delivery
 
-use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
 #[cfg(feature = "leaf")]
@@ -484,7 +483,7 @@ impl ConnCtx<'_> {
 pub(crate) fn handle_expired_subs(
     expired: &[(u64, u64)],
     state: &ServerState,
-    conns: &mut HashMap<u64, crate::core::worker::ClientState>,
+    conns: &mut rustc_hash::FxHashMap<u64, crate::core::worker::ClientState>,
     worker_label: &str,
     #[cfg(feature = "accounts")] account_id: crate::core::server::AccountId,
 ) {
@@ -741,6 +740,8 @@ mod tests {
     use super::*;
 
     fn test_server_state() -> crate::core::server::ServerState {
+        use rustc_hash::FxHashMap;
+        #[allow(unused_imports)]
         use std::collections::HashMap;
 
         crate::core::server::ServerState {
@@ -778,11 +779,11 @@ mod tests {
             #[cfg(feature = "hub")]
             leafnode_port: None,
             #[cfg(feature = "hub")]
-            inbound_leaf_writers: std::sync::RwLock::new(HashMap::new()),
+            inbound_leaf_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "hub")]
             inbound_leaf_auth: Default::default(),
             #[cfg(feature = "mesh")]
-            route_writers: std::sync::RwLock::new(HashMap::new()),
+            route_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "mesh")]
             cluster_port: None,
             #[cfg(feature = "mesh")]
@@ -797,7 +798,7 @@ mod tests {
             #[cfg(feature = "mesh")]
             route_connect_tx: std::sync::Mutex::new(None),
             #[cfg(feature = "gateway")]
-            gateway_writers: std::sync::RwLock::new(HashMap::new()),
+            gateway_writers: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "gateway")]
             gateway_port: None,
             #[cfg(feature = "gateway")]
@@ -816,7 +817,7 @@ mod tests {
             #[cfg(feature = "gateway")]
             cached_gateway_info: std::sync::Mutex::new(String::new()),
             #[cfg(feature = "gateway")]
-            gateway_interest: std::sync::RwLock::new(HashMap::new()),
+            gateway_interest: std::sync::RwLock::new(FxHashMap::default()),
             #[cfg(feature = "gateway")]
             has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]

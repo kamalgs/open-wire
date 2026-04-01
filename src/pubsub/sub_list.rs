@@ -117,13 +117,13 @@ struct TrieNode {
     gt_subs: Vec<Subscription>,
 }
 
-/// Trie-based wildcard subscription storage.
+/// Trie-based wildcard subscription storage (real implementation).
 ///
 /// Provides O(depth) matching instead of O(N) linear scan. Each wildcard
 /// subscription is inserted into a trie keyed by its dotted subject tokens.
 /// Matching walks only the branches that could match the publish subject.
 #[derive(Debug, Default)]
-struct WildTrie {
+struct WildTrieInner {
     root: TrieNode,
     len: usize,
     /// (conn_id, sid) → subject pattern. For O(1) remove lookup.
@@ -132,7 +132,7 @@ struct WildTrie {
     conn_index: HashMap<u64, Vec<u64>>,
 }
 
-impl WildTrie {
+impl WildTrieInner {
     fn insert(&mut self, sub: Subscription) {
         let subject = sub.subject.clone();
         let conn_id = sub.conn_id;
@@ -364,8 +364,78 @@ impl WildTrie {
             .find(|s| s.conn_id == conn_id && s.sid == sid)
     }
 
+    #[allow(dead_code)]
     fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+/// Null-object wrapper around the wildcard trie.
+///
+/// Starts as `Empty` — all query methods are zero-cost no-ops with no heap
+/// allocation. Transitions to `Active` on the first wildcard `insert`, and
+/// back to `Empty` when the last wildcard subscription is removed, freeing
+/// the trie memory.
+#[derive(Debug, Default)]
+enum WildTrie {
+    #[default]
+    Empty,
+    Active(WildTrieInner),
+}
+
+impl WildTrie {
+    fn insert(&mut self, sub: Subscription) {
+        if matches!(self, WildTrie::Empty) {
+            *self = WildTrie::Active(WildTrieInner::default());
+        }
+        if let WildTrie::Active(inner) = self {
+            inner.insert(sub);
+        }
+    }
+
+    fn remove(&mut self, conn_id: u64, sid: u64) -> Option<Subscription> {
+        let WildTrie::Active(inner) = self else {
+            return None;
+        };
+        let result = inner.remove(conn_id, sid);
+        if inner.len == 0 {
+            *self = WildTrie::Empty;
+        }
+        result
+    }
+
+    fn remove_conn(&mut self, conn_id: u64) -> Vec<Subscription> {
+        let WildTrie::Active(inner) = self else {
+            return Vec::new();
+        };
+        let result = inner.remove_conn(conn_id);
+        if inner.len == 0 {
+            *self = WildTrie::Empty;
+        }
+        result
+    }
+
+    fn for_each_match<'a>(&'a self, subject: &str, f: impl FnMut(&'a Subscription)) {
+        if let WildTrie::Active(inner) = self {
+            inner.for_each_match(subject, f);
+        }
+    }
+
+    fn for_each_sub<'a>(&'a self, f: impl FnMut(&'a Subscription)) {
+        if let WildTrie::Active(inner) = self {
+            inner.for_each_sub(f);
+        }
+    }
+
+    fn find(&self, conn_id: u64, sid: u64) -> Option<&Subscription> {
+        match self {
+            WildTrie::Active(inner) => inner.find(conn_id, sid),
+            WildTrie::Empty => None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, WildTrie::Empty)
     }
 }
 
