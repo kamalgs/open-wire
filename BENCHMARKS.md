@@ -5,6 +5,44 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-01 — Rust+Rust vs Go+Go comparison (full 10-scenario run)
+
+**Changes since last benchmark:**
+Benchmark updated to compare **Rust+Rust** (Rust leaf + Rust hub) against **Go+Go**
+(Go native leaf + Go hub). Previous benchmarks compared Rust leaf against Go leaf, both
+connected to the same Go hub — this masked Rust's hub delivery performance.
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Rust+Rust msg/s | Go+Go msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | ~1,326K | ~1,550K | **86%** |
+| Local pub/sub (pub) | ~841K | ~585K | **144%** |
+| Fan-out x5 (pub) | ~430K | ~156K | **277%** |
+| Leaf→Hub (pub) | ~1,296K | ~420K | **308%** |
+| Hub→Leaf (pub) | ~1,267K | ~437K | **290%** |
+| Cluster A→B (pub) | ~599K | ~435K | **138%** |
+| Cluster fan x3 (pub) | ~314K | ~214K | **147%** |
+| Cluster B+C (pub) | ~311K | ~268K | **116%** |
+| Gateway A→B (pub) | ~1,296K | ~518K | **250%** |
+| Gateway fan (pub) | ~964K | ~291K | **332%** |
+
+**Takeaways:**
+- **Pub only 86%**: The only scenario where Go wins. With no subscribers, both leaf
+  nodes forward no messages (interest collapse); the bottleneck is raw protocol
+  parsing. Go's parser has a slight edge here.
+- **Fan-out, cross-server, gateway (2.5–3.3x)**: Where Rust excels. The epoll +
+  batched eventfd delivery model handles fan-out and forwarding far better than Go's
+  goroutine-per-connection approach.
+- **Leaf→Hub / Hub→Leaf (3x)**: With both sides Rust, the forwarding TCP link is
+  saturated by fast servers on each end. Previously both used Go hub; now the Rust
+  hub's receiver and delivery path removes the Go bottleneck entirely.
+- **Cluster / Gateway**: Moderate to large wins (16–47% cluster, 2.5–3.3x gateway).
+  Gateway shows the largest gain because Rust's interest tracking and delivery
+  batching is particularly efficient for multi-hop forwarding.
+
+---
+
 ## 2026-04-01 — WildTrie null-object + FxHashMap for connection maps (full 19-scenario run)
 
 **Changes since last benchmark:**
