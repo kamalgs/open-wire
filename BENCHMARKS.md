@@ -5,6 +5,49 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-02 — Per-message hot-path overhead eliminated (full 10-scenario run)
+
+**Changes since last benchmark:**
+Two hot-path micro-optimisations:
+
+1. **`check_max_control_line` moved out of dispatch loop** (`src/core/worker.rs`):
+   Previously called once per message in `process_read_buf`'s Active phase, doing a
+   FxHashMap lookup + memchr scan per message (~3M calls in the pub-only benchmark).
+   Moved into `parse_client_op`/`parse_conn_op`'s `Ok(None)` arm — fires only once per
+   read event when the buffer is exhausted. The `buf.len() > max_ctrl` short-circuit
+   means in normal operation the memchr scan never runs.
+
+2. **`memrchr2` in `skip_pub`/`skip_hpub`** (`src/protocol/nats_proto.rs`):
+   Replaced `iter().rposition(...)` with `memchr::memrchr2()` for a SIMD-accelerated
+   backward scan to locate the payload size argument.
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Rust+Rust msg/s | Go+Go msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | ~1,241K | ~1,313K | **94%** |
+| Local pub/sub (pub) | ~912K | ~505K | **180%** |
+| Fan-out x5 (pub) | ~370K | ~147K | **252%** |
+| Leaf→Hub (pub) | ~833K | ~363K | **229%** |
+| Hub→Leaf (pub) | ~1,132K | ~399K | **284%** |
+| Cluster A→B (pub) | ~510K | ~346K | **147%** |
+| Cluster fan x3 (pub) | ~261K | ~191K | **136%** |
+| Cluster B+C (pub) | ~371K | ~222K | **167%** |
+| Gateway A→B (pub) | ~1,052K | ~475K | **221%** |
+| Gateway fan (pub) | ~583K | ~248K | **234%** |
+
+**Takeaways:**
+- **Pub only 94% → up from 86%**: The per-message overhead removal narrowed the gap.
+  Raw single-publisher parsing is the closest scenario to Go parity. The remaining gap
+  is structural: epoll dispatch cost per event (hashmap lookup) vs Go's
+  goroutine-per-connection model.
+- **Pub/sub 180%**: Larger improvement than expected, possibly run-to-run variance
+  combining with the hot-path fix.
+- **Delivery scenarios (2–3x)**: Fan-out, leaf, hub, gateway all remain strongly ahead.
+  Cluster ratios improved due to natural variance.
+
+---
+
 ## 2026-04-01 — Rust+Rust vs Go+Go comparison (full 10-scenario run)
 
 **Changes since last benchmark:**
