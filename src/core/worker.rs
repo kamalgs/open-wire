@@ -1613,9 +1613,6 @@ impl Worker {
                     }
                 }
                 ConnPhase::Active | ConnPhase::Draining => {
-                    if self.check_max_control_line(conn_id) {
-                        return;
-                    }
                     if !self.dispatch_active(conn_id) {
                         return;
                     }
@@ -2096,8 +2093,9 @@ impl Worker {
     /// Parse the next protocol operation from a connection's read buffer.
     ///
     /// Returns `Some(op)` on success. On `None` (need more data) shrinks the
-    /// buffer; on error disconnects the connection.
+    /// buffer and checks the max-control-line limit; on error disconnects.
     fn parse_conn_op<H: ConnectionHandler>(&mut self, conn_id: u64) -> Option<H::Op> {
+        let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
         let result = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             H::parse_op(&mut client.read_buf)
@@ -2105,7 +2103,28 @@ impl Worker {
         match result {
             Ok(Some(op)) => Some(op),
             Ok(None) => {
-                if let Some(client) = self.conns.get_mut(&conn_id) {
+                // Check max control line only when incomplete and buffer is large.
+                // In the hot path buf.len() <= max_ctrl so this is a no-op.
+                let exceeded = max_ctrl > 0
+                    && self.conns.get(&conn_id).map_or(false, |c| {
+                        let buf: &[u8] = &c.read_buf;
+                        buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
+                    });
+                if exceeded {
+                    warn!(
+                        conn_id,
+                        max_control_line = max_ctrl,
+                        "maximum control line exceeded"
+                    );
+                    counter!("connections_rejected_total").increment(1);
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client
+                            .write_buf
+                            .extend_from_slice(b"-ERR 'Maximum Control Line Exceeded'\r\n");
+                    }
+                    self.try_flush_conn(conn_id);
+                    self.remove_conn(conn_id);
+                } else if let Some(client) = self.conns.get_mut(&conn_id) {
                     client.read_buf.try_shrink();
                 }
                 None
@@ -2213,6 +2232,7 @@ impl Worker {
 
     /// Parse a client op, optionally using the skip-publish fast path.
     fn parse_client_op(&mut self, conn_id: u64, can_skip: bool) -> Option<ClientOp> {
+        let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
         let result = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             if can_skip {
@@ -2224,7 +2244,28 @@ impl Worker {
         match result {
             Ok(Some(op)) => Some(op),
             Ok(None) => {
-                if let Some(client) = self.conns.get_mut(&conn_id) {
+                // Check max control line only when incomplete and buffer is large.
+                // In the hot path buf.len() <= max_ctrl so this is a no-op.
+                let exceeded = max_ctrl > 0
+                    && self.conns.get(&conn_id).map_or(false, |c| {
+                        let buf: &[u8] = &c.read_buf;
+                        buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
+                    });
+                if exceeded {
+                    warn!(
+                        conn_id,
+                        max_control_line = max_ctrl,
+                        "maximum control line exceeded"
+                    );
+                    counter!("connections_rejected_total").increment(1);
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client
+                            .write_buf
+                            .extend_from_slice(b"-ERR 'Maximum Control Line Exceeded'\r\n");
+                    }
+                    self.try_flush_conn(conn_id);
+                    self.remove_conn(conn_id);
+                } else if let Some(client) = self.conns.get_mut(&conn_id) {
                     client.read_buf.try_shrink();
                 }
                 None
