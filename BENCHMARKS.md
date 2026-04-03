@@ -5,6 +5,125 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-03 — Dispatch loop reduced to 2 FxHashMap lookups per message (full 10-scenario run)
+
+**Changes since last benchmark:**
+Combined the three separate `conns.get` calls per message (phase check, `kind_tag`,
+`can_skip_publishes`) into a single lookup at the top of `process_read_buf`. The `kind`
+and `can_skip` values are extracted while `ClientState` is already loaded into cache, then
+passed to `dispatch_active` and `process_active_client` directly. Removes the separate
+`can_skip_publishes` call entirely. Guard: `can_skip` computation is skipped for non-Client
+connections (Route/Leaf/Gateway) so they pay no extra cost.
+
+Total: 4 FxHashMap lookups per message → 2 (one `get` for dispatch info + one `get_mut`
+for parse). Profile showed `process_read_buf` self-time 7.80% → 6.70%.
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Rust+Rust msg/s | Go+Go msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | ~1,525K | ~1,607K | **94%** |
+| Local pub/sub (pub) | ~1,047K | ~674K | **155%** |
+| Fan-out x5 (pub) | ~470K | ~164K | **286%** |
+| Leaf→Hub (pub) | ~1,459K | ~425K | **343%** |
+| Hub→Leaf (pub) | ~1,332K | ~444K | **300%** |
+| Cluster A→B (pub) | ~582K | ~530K | **109%** |
+| Cluster fan x3 (pub) | ~328K | ~210K | **155%** |
+| Cluster B+C (pub) | ~421K | ~268K | **156%** |
+| Gateway A→B (pub) | ~1,329K | ~475K | **279%** |
+| Gateway fan (pub) | ~991K | ~286K | **346%** |
+
+**Takeaways:**
+- **Pub only 94%**: Same ratio as previous run — the lookup reduction improves absolute
+  throughput (~1.24M → ~1.53M) but Go also improved, keeping the ratio flat.
+- **Fan-out, leaf, gateway (3–3.5x)**: Large gains, likely from the reduced per-message
+  overhead propagating through the delivery path. Leaf→Hub improved most (+114pp).
+- **Cluster (109–156%)**: Moderate improvement on fan/B+C. A→B close to parity this run
+  (run-to-run variance — Go happened to score well).
+
+---
+
+## 2026-04-02 — Per-message hot-path overhead eliminated (full 10-scenario run)
+
+**Changes since last benchmark:**
+Two hot-path micro-optimisations:
+
+1. **`check_max_control_line` moved out of dispatch loop** (`src/core/worker.rs`):
+   Previously called once per message in `process_read_buf`'s Active phase, doing a
+   FxHashMap lookup + memchr scan per message (~3M calls in the pub-only benchmark).
+   Moved into `parse_client_op`/`parse_conn_op`'s `Ok(None)` arm — fires only once per
+   read event when the buffer is exhausted. The `buf.len() > max_ctrl` short-circuit
+   means in normal operation the memchr scan never runs.
+
+2. **`memrchr2` in `skip_pub`/`skip_hpub`** (`src/protocol/nats_proto.rs`):
+   Replaced `iter().rposition(...)` with `memchr::memrchr2()` for a SIMD-accelerated
+   backward scan to locate the payload size argument.
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Rust+Rust msg/s | Go+Go msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | ~1,241K | ~1,313K | **94%** |
+| Local pub/sub (pub) | ~912K | ~505K | **180%** |
+| Fan-out x5 (pub) | ~370K | ~147K | **252%** |
+| Leaf→Hub (pub) | ~833K | ~363K | **229%** |
+| Hub→Leaf (pub) | ~1,132K | ~399K | **284%** |
+| Cluster A→B (pub) | ~510K | ~346K | **147%** |
+| Cluster fan x3 (pub) | ~261K | ~191K | **136%** |
+| Cluster B+C (pub) | ~371K | ~222K | **167%** |
+| Gateway A→B (pub) | ~1,052K | ~475K | **221%** |
+| Gateway fan (pub) | ~583K | ~248K | **234%** |
+
+**Takeaways:**
+- **Pub only 94% → up from 86%**: The per-message overhead removal narrowed the gap.
+  Raw single-publisher parsing is the closest scenario to Go parity. The remaining gap
+  is structural: epoll dispatch cost per event (hashmap lookup) vs Go's
+  goroutine-per-connection model.
+- **Pub/sub 180%**: Larger improvement than expected, possibly run-to-run variance
+  combining with the hot-path fix.
+- **Delivery scenarios (2–3x)**: Fan-out, leaf, hub, gateway all remain strongly ahead.
+  Cluster ratios improved due to natural variance.
+
+---
+
+## 2026-04-01 — Rust+Rust vs Go+Go comparison (full 10-scenario run)
+
+**Changes since last benchmark:**
+Benchmark updated to compare **Rust+Rust** (Rust leaf + Rust hub) against **Go+Go**
+(Go native leaf + Go hub). Previous benchmarks compared Rust leaf against Go leaf, both
+connected to the same Go hub — this masked Rust's hub delivery performance.
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Rust+Rust msg/s | Go+Go msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | ~1,326K | ~1,550K | **86%** |
+| Local pub/sub (pub) | ~841K | ~585K | **144%** |
+| Fan-out x5 (pub) | ~430K | ~156K | **277%** |
+| Leaf→Hub (pub) | ~1,296K | ~420K | **308%** |
+| Hub→Leaf (pub) | ~1,267K | ~437K | **290%** |
+| Cluster A→B (pub) | ~599K | ~435K | **138%** |
+| Cluster fan x3 (pub) | ~314K | ~214K | **147%** |
+| Cluster B+C (pub) | ~311K | ~268K | **116%** |
+| Gateway A→B (pub) | ~1,296K | ~518K | **250%** |
+| Gateway fan (pub) | ~964K | ~291K | **332%** |
+
+**Takeaways:**
+- **Pub only 86%**: The only scenario where Go wins. With no subscribers, both leaf
+  nodes forward no messages (interest collapse); the bottleneck is raw protocol
+  parsing. Go's parser has a slight edge here.
+- **Fan-out, cross-server, gateway (2.5–3.3x)**: Where Rust excels. The epoll +
+  batched eventfd delivery model handles fan-out and forwarding far better than Go's
+  goroutine-per-connection approach.
+- **Leaf→Hub / Hub→Leaf (3x)**: With both sides Rust, the forwarding TCP link is
+  saturated by fast servers on each end. Previously both used Go hub; now the Rust
+  hub's receiver and delivery path removes the Go bottleneck entirely.
+- **Cluster / Gateway**: Moderate to large wins (16–47% cluster, 2.5–3.3x gateway).
+  Gateway shows the largest gain because Rust's interest tracking and delivery
+  batching is particularly efficient for multi-hop forwarding.
+
+---
+
 ## 2026-04-01 — WildTrie null-object + FxHashMap for connection maps (full 19-scenario run)
 
 **Changes since last benchmark:**

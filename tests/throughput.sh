@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Leaf node benchmark: Rust leaf vs Go native leaf vs direct hub.
+# Leaf node benchmark: Rust+Rust (Rust leaf + Rust hub) vs Go+Go (Go leaf + Go hub).
 #
 # Modes:
 #   --quick (default) — 5 core scenarios, 1 run, 100K msgs (~1-2 min)
@@ -77,6 +77,7 @@ RUST_LEAF_PORT=5223
 RUST_LEAF_WS_PORT=5224
 RUST_HUB_CLIENT_PORT=6333
 RUST_HUB_LEAF_PORT=6422
+RUST_LEAF2_PORT=5225      # Rust leaf connected to Rust hub (for Rust+Rust pair)
 GO_LEAF_TO_RUST_PORT=6225
 
 # 3-node cluster ports (full mode only)
@@ -118,9 +119,9 @@ done
 
 # Check ports are free
 PORTS_TO_CHECK="$HUB_CLIENT_PORT $HUB_LEAF_PORT $GO_LEAF_PORT $GO_LEAF_WS_PORT \
-  $RUST_LEAF_PORT $RUST_LEAF_WS_PORT"
+  $RUST_LEAF_PORT $RUST_LEAF_WS_PORT $RUST_HUB_CLIENT_PORT $RUST_HUB_LEAF_PORT $RUST_LEAF2_PORT"
 if [[ "$MODE" == "full" ]]; then
-  PORTS_TO_CHECK="$PORTS_TO_CHECK $RUST_HUB_CLIENT_PORT $RUST_HUB_LEAF_PORT $GO_LEAF_TO_RUST_PORT \
+  PORTS_TO_CHECK="$PORTS_TO_CHECK $GO_LEAF_TO_RUST_PORT \
     $GO_CLUSTER_A_PORT $GO_CLUSTER_A_ROUTE $GO_CLUSTER_B_PORT $GO_CLUSTER_B_ROUTE \
     $GO_CLUSTER_C_PORT $GO_CLUSTER_C_ROUTE \
     $RUST_CLUSTER_A_PORT $RUST_CLUSTER_A_ROUTE $RUST_CLUSTER_B_PORT $RUST_CLUSTER_B_ROUTE \
@@ -166,7 +167,7 @@ PIDS+=($!)
 GO_LEAF_PID=$!
 sleep 1
 
-# --- Start Rust leaf (with WebSocket) ---
+# --- Start Rust leaf (with WebSocket) — connects to Go hub ---
 echo "Starting Rust leaf (tcp=$RUST_LEAF_PORT, ws=$RUST_LEAF_WS_PORT)..."
 RUST_LOG=warn "$RUST_BIN" --port "$RUST_LEAF_PORT" --ws-port "$RUST_LEAF_WS_PORT" \
   --hub "nats://127.0.0.1:$HUB_LEAF_PORT" &
@@ -174,14 +175,23 @@ PIDS+=($!)
 RUST_LEAF_PID=$!
 sleep 2
 
-if [[ "$MODE" == "full" ]]; then
-  # --- Start Rust hub (hub mode — accepts inbound leaf connections) ---
-  echo "Starting Rust hub (client=$RUST_HUB_CLIENT_PORT, leafnode=$RUST_HUB_LEAF_PORT)..."
-  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_hub.conf" &
-  PIDS+=($!)
-  sleep 1
+# --- Start Rust hub (hub mode — accepts inbound leaf connections) ---
+echo "Starting Rust hub (client=$RUST_HUB_CLIENT_PORT, leafnode=$RUST_HUB_LEAF_PORT)..."
+RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_hub.conf" &
+PIDS+=($!)
+RUST_HUB_PID=$!
+sleep 1
 
-  # --- Start Go leaf connecting to Rust hub ---
+# --- Start Rust leaf → Rust hub (for Rust+Rust comparison) ---
+echo "Starting Rust leaf → Rust hub (tcp=$RUST_LEAF2_PORT)..."
+RUST_LOG=warn "$RUST_BIN" --port "$RUST_LEAF2_PORT" \
+  --hub "nats://127.0.0.1:$RUST_HUB_LEAF_PORT" &
+PIDS+=($!)
+RUST_LEAF2_PID=$!
+sleep 2
+
+if [[ "$MODE" == "full" ]]; then
+  # --- Start Go leaf connecting to Rust hub (for hub-mode scenarios 12-13) ---
   echo "Starting Go leaf → Rust hub (tcp=$GO_LEAF_TO_RUST_PORT)..."
   nats-server -c "$SCRIPT_DIR/configs/bench_go_leaf_to_rust.conf" &
   PIDS+=($!)
@@ -191,17 +201,18 @@ fi
 # Verify connections
 echo ""
 echo "Verifying connectivity..."
-nats pub _bench.ping pong -s "nats://127.0.0.1:$HUB_CLIENT_PORT" >/dev/null 2>&1 || { echo "FAIL: hub"; exit 1; }
-nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_LEAF_PORT"    >/dev/null 2>&1 || { echo "FAIL: go leaf"; exit 1; }
-nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_LEAF_PORT"  >/dev/null 2>&1 || { echo "FAIL: rust leaf"; exit 1; }
+nats pub _bench.ping pong -s "nats://127.0.0.1:$HUB_CLIENT_PORT"      >/dev/null 2>&1 || { echo "FAIL: hub"; exit 1; }
+nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_LEAF_PORT"         >/dev/null 2>&1 || { echo "FAIL: go leaf"; exit 1; }
+nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_LEAF_PORT"       >/dev/null 2>&1 || { echo "FAIL: rust leaf"; exit 1; }
+nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" >/dev/null 2>&1 || { echo "FAIL: rust hub"; exit 1; }
+nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_LEAF2_PORT"      >/dev/null 2>&1 || { echo "FAIL: rust leaf2"; exit 1; }
 if [[ "$MODE" == "full" ]]; then
-  nats pub _bench.ping pong -s "ws://127.0.0.1:$GO_LEAF_WS_PORT"   >/dev/null 2>&1 || { echo "FAIL: go leaf ws"; exit 1; }
-  nats pub _bench.ping pong -s "ws://127.0.0.1:$RUST_LEAF_WS_PORT" >/dev/null 2>&1 || { echo "FAIL: rust leaf ws"; exit 1; }
-  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" >/dev/null 2>&1 || { echo "FAIL: rust hub"; exit 1; }
+  nats pub _bench.ping pong -s "ws://127.0.0.1:$GO_LEAF_WS_PORT"      >/dev/null 2>&1 || { echo "FAIL: go leaf ws"; exit 1; }
+  nats pub _bench.ping pong -s "ws://127.0.0.1:$RUST_LEAF_WS_PORT"    >/dev/null 2>&1 || { echo "FAIL: rust leaf ws"; exit 1; }
   nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT" >/dev/null 2>&1 || { echo "FAIL: go leaf→rust hub"; exit 1; }
-  echo "All servers responding (TCP + WebSocket + Hub mode)."
+  echo "All servers responding (TCP + WebSocket + Rust+Rust pair)."
 else
-  echo "All servers responding (TCP)."
+  echo "All servers responding (TCP + Rust+Rust pair)."
 fi
 echo ""
 
@@ -270,7 +281,7 @@ SUMMARY_GO_CTX=()
 
 # Extract msgs/sec from nats bench output (pub stats line)
 extract_rate() {
-  grep -oP '[\d,]+(?= msgs/sec)' | head -1 | tr -d ','
+  grep -oP '[\d,]+(?= msgs/sec)' | head -1 | tr -d ',' || true
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -494,10 +505,10 @@ echo ""
 if [[ "$MODE" == "full" ]]; then
   run_pub_only "Direct Hub" "nats://127.0.0.1:$HUB_CLIENT_PORT"
 fi
-run_pub_only_capture "Go Native Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" "$GO_LEAF_PID"
+run_pub_only_capture "Go+Go Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" "$GO_LEAF_PID"
 go_pub_rate=$CAPTURED_RATE go_pub_cpu=$CAPTURED_CPU go_pub_rss=$CAPTURED_RSS go_pub_ctx=$CAPTURED_CTX
 
-run_pub_only_capture "Rust Leaf" "nats://127.0.0.1:$RUST_LEAF_PORT" "$RUST_LEAF_PID"
+run_pub_only_capture "Rust+Rust Leaf" "nats://127.0.0.1:$RUST_LEAF2_PORT" "$RUST_LEAF2_PID"
 rust_pub_rate=$CAPTURED_RATE rust_pub_cpu=$CAPTURED_CPU rust_pub_rss=$CAPTURED_RSS rust_pub_ctx=$CAPTURED_CTX
 
 record_summary "Pub only" \
@@ -517,10 +528,10 @@ echo ""
 if [[ "$MODE" == "full" ]]; then
   run_url_pubsub "Direct Hub" "nats://127.0.0.1:$HUB_CLIENT_PORT" 1
 fi
-run_url_pubsub_capture "Go Native Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" 1 "$GO_LEAF_PID"
+run_url_pubsub_capture "Go+Go Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" 1 "$GO_LEAF_PID"
 go_ps_rate=$CAPTURED_RATE go_ps_cpu=$CAPTURED_CPU go_ps_rss=$CAPTURED_RSS go_ps_ctx=$CAPTURED_CTX
 
-run_url_pubsub_capture "Rust Leaf" "nats://127.0.0.1:$RUST_LEAF_PORT" 1 "$RUST_LEAF_PID"
+run_url_pubsub_capture "Rust+Rust Leaf" "nats://127.0.0.1:$RUST_LEAF2_PORT" 1 "$RUST_LEAF2_PID"
 rust_ps_rate=$CAPTURED_RATE rust_ps_cpu=$CAPTURED_CPU rust_ps_rss=$CAPTURED_RSS rust_ps_ctx=$CAPTURED_CTX
 
 record_summary "Pub/sub" \
@@ -540,10 +551,10 @@ echo ""
 if [[ "$MODE" == "full" ]]; then
   run_url_pubsub "Direct Hub" "nats://127.0.0.1:$HUB_CLIENT_PORT" 5
 fi
-run_url_pubsub_capture "Go Native Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" 5 "$GO_LEAF_PID"
+run_url_pubsub_capture "Go+Go Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" 5 "$GO_LEAF_PID"
 go_fan_rate=$CAPTURED_RATE go_fan_cpu=$CAPTURED_CPU go_fan_rss=$CAPTURED_RSS go_fan_ctx=$CAPTURED_CTX
 
-run_url_pubsub_capture "Rust Leaf" "nats://127.0.0.1:$RUST_LEAF_PORT" 5 "$RUST_LEAF_PID"
+run_url_pubsub_capture "Rust+Rust Leaf" "nats://127.0.0.1:$RUST_LEAF2_PORT" 5 "$RUST_LEAF2_PID"
 rust_fan_rate=$CAPTURED_RATE rust_fan_cpu=$CAPTURED_CPU rust_fan_rss=$CAPTURED_RSS rust_fan_ctx=$CAPTURED_CTX
 
 record_summary "Fan-out x5" \
@@ -560,12 +571,12 @@ echo "  4. LEAF → HUB (pub on leaf, sub on hub)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_cross_pubsub_capture "Go Leaf → Hub" \
+run_cross_pubsub_capture "Go+Go Leaf → Hub" \
   "nats://127.0.0.1:$GO_LEAF_PORT" "nats://127.0.0.1:$HUB_CLIENT_PORT" "$GO_LEAF_PID"
 go_l2h_rate=$CAPTURED_RATE go_l2h_cpu=$CAPTURED_CPU go_l2h_rss=$CAPTURED_RSS go_l2h_ctx=$CAPTURED_CTX
 
-run_cross_pubsub_capture "Rust Leaf → Hub" \
-  "nats://127.0.0.1:$RUST_LEAF_PORT" "nats://127.0.0.1:$HUB_CLIENT_PORT" "$RUST_LEAF_PID"
+run_cross_pubsub_capture "Rust+Rust Leaf → Hub" \
+  "nats://127.0.0.1:$RUST_LEAF2_PORT" "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" "$RUST_LEAF2_PID"
 rust_l2h_rate=$CAPTURED_RATE rust_l2h_cpu=$CAPTURED_CPU rust_l2h_rss=$CAPTURED_RSS rust_l2h_ctx=$CAPTURED_CTX
 
 record_summary "Leaf→Hub" \
@@ -582,12 +593,12 @@ echo "  5. HUB → LEAF (pub on hub, sub on leaf)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_cross_pubsub_capture "Hub → Go Leaf" \
+run_cross_pubsub_capture "Go Hub → Go Leaf" \
   "nats://127.0.0.1:$HUB_CLIENT_PORT" "nats://127.0.0.1:$GO_LEAF_PORT" "$GO_LEAF_PID"
 go_h2l_rate=$CAPTURED_RATE go_h2l_cpu=$CAPTURED_CPU go_h2l_rss=$CAPTURED_RSS go_h2l_ctx=$CAPTURED_CTX
 
-run_cross_pubsub_capture "Hub → Rust Leaf" \
-  "nats://127.0.0.1:$HUB_CLIENT_PORT" "nats://127.0.0.1:$RUST_LEAF_PORT" "$RUST_LEAF_PID"
+run_cross_pubsub_capture "Rust Hub → Rust Leaf" \
+  "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" "nats://127.0.0.1:$RUST_LEAF2_PORT" "$RUST_LEAF2_PID"
 rust_h2l_rate=$CAPTURED_RATE rust_h2l_cpu=$CAPTURED_CPU rust_h2l_rss=$CAPTURED_RSS rust_h2l_ctx=$CAPTURED_CTX
 
 record_summary "Hub→Leaf" \
@@ -1119,7 +1130,7 @@ echo "================================================================"
 echo ""
 
 # Throughput table
-printf "  %-16s %14s %14s %8s\n" "Scenario" "Rust msg/s" "Go msg/s" "Ratio"
+printf "  %-16s %14s %14s %8s\n" "Scenario" "Rust+Rust" "Go+Go" "Ratio"
 echo "  ─────────────────────────────────────────────────────────────"
 for i in "${!SUMMARY_LABELS[@]}"; do
   local_rust="${SUMMARY_RUST_RATES[$i]}"

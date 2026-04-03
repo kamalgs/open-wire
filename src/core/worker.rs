@@ -1589,9 +1589,36 @@ impl Worker {
 
     fn process_read_buf(&mut self, conn_id: u64) {
         loop {
-            let phase = match self.conns.get(&conn_id) {
-                Some(c) => c.phase,
+            // Single lookup: read phase, kind, and can_skip together to avoid
+            // separate conns.get calls in dispatch_active and can_skip_publishes.
+            let (phase, kind, can_skip) = match self.conns.get(&conn_id) {
                 None => return,
+                Some(c) => {
+                    let phase = c.phase;
+                    let kind = c.ext.kind_tag();
+                    // Only compute can_skip for Client connections — Route/Leaf/Gateway
+                    // never use it, and the check accesses upstream_txs + atomic loads.
+                    let can_skip = matches!(
+                        (phase, &kind),
+                        (ConnPhase::Active | ConnPhase::Draining, ConnKind::Client)
+                    ) && {
+                        #[cfg(feature = "gateway")]
+                        let has_gw = self.state.has_gateway_interest.load(Ordering::Relaxed);
+                        #[cfg(not(feature = "gateway"))]
+                        let has_gw = false;
+                        #[cfg(feature = "leaf")]
+                        {
+                            c.upstream_txs.is_empty()
+                                && !self.state.has_subs.load(Ordering::Relaxed)
+                                && !has_gw
+                        }
+                        #[cfg(not(feature = "leaf"))]
+                        {
+                            !self.state.has_subs.load(Ordering::Relaxed) && !has_gw
+                        }
+                    };
+                    (phase, kind, can_skip)
+                }
             };
             match phase {
                 ConnPhase::SendInfo => return,
@@ -1613,10 +1640,7 @@ impl Worker {
                     }
                 }
                 ConnPhase::Active | ConnPhase::Draining => {
-                    if self.check_max_control_line(conn_id) {
-                        return;
-                    }
-                    if !self.dispatch_active(conn_id) {
+                    if !self.dispatch_active(conn_id, kind, can_skip) {
                         return;
                     }
                 }
@@ -2065,19 +2089,18 @@ impl Worker {
     }
 
     /// Dispatch to the appropriate handler based on connection kind.
-    fn dispatch_active(&mut self, conn_id: u64) -> bool {
-        let conn_kind = match self.conns.get(&conn_id) {
-            Some(c) => c.ext.kind_tag(),
-            None => return false,
-        };
-        match conn_kind {
+    ///
+    /// `kind` and `can_skip` are pre-computed by the caller in the same
+    /// `conns.get` that read the connection phase, avoiding a second lookup.
+    fn dispatch_active(&mut self, conn_id: u64, kind: ConnKind, can_skip: bool) -> bool {
+        match kind {
             #[cfg(feature = "hub")]
             ConnKind::Leaf => self.process_active::<LeafHandler>(conn_id),
             #[cfg(feature = "mesh")]
             ConnKind::Route => self.process_active::<RouteHandler>(conn_id),
             #[cfg(feature = "gateway")]
             ConnKind::Gateway => self.process_active::<GatewayHandler>(conn_id),
-            ConnKind::Client => self.process_active_client(conn_id),
+            ConnKind::Client => self.process_active_client(conn_id, can_skip),
         }
     }
 
@@ -2096,8 +2119,9 @@ impl Worker {
     /// Parse the next protocol operation from a connection's read buffer.
     ///
     /// Returns `Some(op)` on success. On `None` (need more data) shrinks the
-    /// buffer; on error disconnects the connection.
+    /// buffer and checks the max-control-line limit; on error disconnects.
     fn parse_conn_op<H: ConnectionHandler>(&mut self, conn_id: u64) -> Option<H::Op> {
+        let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
         let result = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             H::parse_op(&mut client.read_buf)
@@ -2105,7 +2129,28 @@ impl Worker {
         match result {
             Ok(Some(op)) => Some(op),
             Ok(None) => {
-                if let Some(client) = self.conns.get_mut(&conn_id) {
+                // Check max control line only when incomplete and buffer is large.
+                // In the hot path buf.len() <= max_ctrl so this is a no-op.
+                let exceeded = max_ctrl > 0
+                    && self.conns.get(&conn_id).map_or(false, |c| {
+                        let buf: &[u8] = &c.read_buf;
+                        buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
+                    });
+                if exceeded {
+                    warn!(
+                        conn_id,
+                        max_control_line = max_ctrl,
+                        "maximum control line exceeded"
+                    );
+                    counter!("connections_rejected_total").increment(1);
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client
+                            .write_buf
+                            .extend_from_slice(b"-ERR 'Maximum Control Line Exceeded'\r\n");
+                    }
+                    self.try_flush_conn(conn_id);
+                    self.remove_conn(conn_id);
+                } else if let Some(client) = self.conns.get_mut(&conn_id) {
                     client.read_buf.try_shrink();
                 }
                 None
@@ -2172,8 +2217,10 @@ impl Worker {
     }
 
     /// Client-specific active processing with `can_skip` optimization.
-    fn process_active_client(&mut self, conn_id: u64) -> bool {
-        let can_skip = self.can_skip_publishes(conn_id);
+    ///
+    /// `can_skip` is pre-computed by the caller alongside the phase/kind read,
+    /// avoiding a separate conns.get call here.
+    fn process_active_client(&mut self, conn_id: u64, can_skip: bool) -> bool {
         let op = match self.parse_client_op(conn_id, can_skip) {
             Some(op) => op,
             None => return false,
@@ -2191,28 +2238,9 @@ impl Worker {
         }
     }
 
-    /// Check if publishes can be skipped (no subscribers, no upstream, no gateways).
-    fn can_skip_publishes(&self, conn_id: u64) -> bool {
-        #[cfg(feature = "gateway")]
-        let has_gw = self.state.has_gateway_interest.load(Ordering::Relaxed);
-        #[cfg(not(feature = "gateway"))]
-        let has_gw = false;
-
-        #[cfg(feature = "leaf")]
-        {
-            let client = self.conns.get(&conn_id).unwrap();
-            client.upstream_txs.is_empty()
-                && !self.state.has_subs.load(Ordering::Relaxed)
-                && !has_gw
-        }
-        #[cfg(not(feature = "leaf"))]
-        {
-            !self.state.has_subs.load(Ordering::Relaxed) && !has_gw
-        }
-    }
-
     /// Parse a client op, optionally using the skip-publish fast path.
     fn parse_client_op(&mut self, conn_id: u64, can_skip: bool) -> Option<ClientOp> {
+        let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
         let result = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             if can_skip {
@@ -2224,7 +2252,28 @@ impl Worker {
         match result {
             Ok(Some(op)) => Some(op),
             Ok(None) => {
-                if let Some(client) = self.conns.get_mut(&conn_id) {
+                // Check max control line only when incomplete and buffer is large.
+                // In the hot path buf.len() <= max_ctrl so this is a no-op.
+                let exceeded = max_ctrl > 0
+                    && self.conns.get(&conn_id).map_or(false, |c| {
+                        let buf: &[u8] = &c.read_buf;
+                        buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
+                    });
+                if exceeded {
+                    warn!(
+                        conn_id,
+                        max_control_line = max_ctrl,
+                        "maximum control line exceeded"
+                    );
+                    counter!("connections_rejected_total").increment(1);
+                    if let Some(client) = self.conns.get_mut(&conn_id) {
+                        client
+                            .write_buf
+                            .extend_from_slice(b"-ERR 'Maximum Control Line Exceeded'\r\n");
+                    }
+                    self.try_flush_conn(conn_id);
+                    self.remove_conn(conn_id);
+                } else if let Some(client) = self.conns.get_mut(&conn_id) {
                     client.read_buf.try_shrink();
                 }
                 None

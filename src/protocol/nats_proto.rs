@@ -287,7 +287,7 @@ fn skip_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         return proto_err(buf, "PUB too short");
     }
     let args_bytes = &buf[4..line_end];
-    let size_arg = match args_bytes.iter().rposition(|&b| b == b' ' || b == b'\t') {
+    let size_arg = match memchr::memrchr2(b' ', b'\t', args_bytes) {
         Some(i) => &args_bytes[i + 1..],
         None => return proto_err(buf, "invalid PUB arguments"),
     };
@@ -311,7 +311,7 @@ fn skip_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         return proto_err(buf, "HPUB too short");
     }
     let args_bytes = &buf[5..line_end];
-    let total_size_arg = match args_bytes.iter().rposition(|&b| b == b' ' || b == b'\t') {
+    let total_size_arg = match memchr::memrchr2(b' ', b'\t', args_bytes) {
         Some(i) => &args_bytes[i + 1..],
         None => return proto_err(buf, "invalid HPUB arguments"),
     };
