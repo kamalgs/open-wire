@@ -1596,7 +1596,12 @@ impl Worker {
                 Some(c) => {
                     let phase = c.phase;
                     let kind = c.ext.kind_tag();
-                    let can_skip = if matches!(phase, ConnPhase::Active | ConnPhase::Draining) {
+                    // Only compute can_skip for Client connections — Route/Leaf/Gateway
+                    // never use it, and the check accesses upstream_txs + atomic loads.
+                    let can_skip = matches!(
+                        (phase, &kind),
+                        (ConnPhase::Active | ConnPhase::Draining, ConnKind::Client)
+                    ) && {
                         #[cfg(feature = "gateway")]
                         let has_gw = self.state.has_gateway_interest.load(Ordering::Relaxed);
                         #[cfg(not(feature = "gateway"))]
@@ -1611,8 +1616,6 @@ impl Worker {
                         {
                             !self.state.has_subs.load(Ordering::Relaxed) && !has_gw
                         }
-                    } else {
-                        false
                     };
                     (phase, kind, can_skip)
                 }

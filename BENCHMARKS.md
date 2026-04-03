@@ -5,6 +5,44 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-03 — Dispatch loop reduced to 2 FxHashMap lookups per message (full 10-scenario run)
+
+**Changes since last benchmark:**
+Combined the three separate `conns.get` calls per message (phase check, `kind_tag`,
+`can_skip_publishes`) into a single lookup at the top of `process_read_buf`. The `kind`
+and `can_skip` values are extracted while `ClientState` is already loaded into cache, then
+passed to `dispatch_active` and `process_active_client` directly. Removes the separate
+`can_skip_publishes` call entirely. Guard: `can_skip` computation is skipped for non-Client
+connections (Route/Leaf/Gateway) so they pay no extra cost.
+
+Total: 4 FxHashMap lookups per message → 2 (one `get` for dispatch info + one `get_mut`
+for parse). Profile showed `process_read_buf` self-time 7.80% → 6.70%.
+
+### Throughput (500K msgs × 128B, 3-run average)
+
+| Scenario | Rust+Rust msg/s | Go+Go msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | ~1,525K | ~1,607K | **94%** |
+| Local pub/sub (pub) | ~1,047K | ~674K | **155%** |
+| Fan-out x5 (pub) | ~470K | ~164K | **286%** |
+| Leaf→Hub (pub) | ~1,459K | ~425K | **343%** |
+| Hub→Leaf (pub) | ~1,332K | ~444K | **300%** |
+| Cluster A→B (pub) | ~582K | ~530K | **109%** |
+| Cluster fan x3 (pub) | ~328K | ~210K | **155%** |
+| Cluster B+C (pub) | ~421K | ~268K | **156%** |
+| Gateway A→B (pub) | ~1,329K | ~475K | **279%** |
+| Gateway fan (pub) | ~991K | ~286K | **346%** |
+
+**Takeaways:**
+- **Pub only 94%**: Same ratio as previous run — the lookup reduction improves absolute
+  throughput (~1.24M → ~1.53M) but Go also improved, keeping the ratio flat.
+- **Fan-out, leaf, gateway (3–3.5x)**: Large gains, likely from the reduced per-message
+  overhead propagating through the delivery path. Leaf→Hub improved most (+114pp).
+- **Cluster (109–156%)**: Moderate improvement on fan/B+C. A→B close to parity this run
+  (run-to-run variance — Go happened to score well).
+
+---
+
 ## 2026-04-02 — Per-message hot-path overhead eliminated (full 10-scenario run)
 
 **Changes since last benchmark:**
