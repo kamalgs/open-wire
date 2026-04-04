@@ -393,7 +393,14 @@ fn connect_route(
         })
         .expect("failed to spawn route writer");
 
-    let result = run_route_reader(&tcp, &mut read_buf, conn_id, state, &direct_writer, use_binary);
+    let result = run_route_reader(
+        &tcp,
+        &mut read_buf,
+        conn_id,
+        state,
+        &direct_writer,
+        use_binary,
+    );
 
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();
@@ -615,13 +622,11 @@ fn handle_route_op(
             payload,
             ..
         } => {
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let msg = Msg::new(
-                &subject,
-                subject_str,
-                reply.as_deref(),
+                subject.clone(),
+                reply.clone(),
                 headers.as_ref(),
-                &payload,
+                payload.clone(),
             );
             // One-hop: skip route subs — messages from a route peer are never
             // re-forwarded to other route peers.
@@ -742,13 +747,12 @@ fn handle_bin_frame(
             }
         }
         BinOp::Msg => {
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&frame.subject) };
             let reply = if frame.reply.is_empty() {
                 None
             } else {
-                Some(frame.reply.as_ref())
+                Some(frame.reply.clone())
             };
-            let msg = Msg::new(&frame.subject, subject_str, reply, None, &frame.payload);
+            let msg = Msg::new(frame.subject.clone(), reply, None, frame.payload.clone());
             let (_delivered, expired) = deliver_to_subs_upstream_inner(
                 state,
                 &msg,
@@ -784,19 +788,12 @@ fn handle_bin_frame(
                 Err(_) => return Ok(()),
             };
             let payload = frame.payload.slice(4 + hdr_len..);
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&frame.subject) };
             let reply = if frame.reply.is_empty() {
                 None
             } else {
-                Some(frame.reply.as_ref())
+                Some(frame.reply.clone())
             };
-            let msg = Msg::new(
-                &frame.subject,
-                subject_str,
-                reply,
-                Some(&headers),
-                &payload,
-            );
+            let msg = Msg::new(frame.subject.clone(), reply, Some(&headers), payload);
             let (_delivered, expired) = deliver_to_subs_upstream_inner(
                 state,
                 &msg,

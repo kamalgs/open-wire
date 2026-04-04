@@ -339,10 +339,8 @@ impl ClientHandler {
                     if !has_sub {
                         let mut hdr = crate::types::HeaderMap::new();
                         hdr.set_status(503, None);
-                        let reply_str = bytes_to_str(reply_bytes);
-                        let empty = Bytes::new();
                         let no_resp_msg =
-                            Msg::new(reply_bytes, reply_str, None, Some(&hdr), &empty);
+                            Msg::new(reply_bytes.clone(), None, Some(&hdr), Bytes::new());
                         deliver_to_subs(
                             wctx,
                             &no_resp_msg,
@@ -358,11 +356,10 @@ impl ClientHandler {
         }
 
         let msg = Msg::new(
-            &subject,
-            subject_str,
-            respond.as_deref(),
+            subject.clone(),
+            respond.clone(),
             headers.as_ref(),
-            &payload,
+            payload.clone(),
         );
         let (_delivered, expired) = wctx.publish(
             &msg,

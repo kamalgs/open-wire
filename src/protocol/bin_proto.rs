@@ -30,11 +30,11 @@ pub(crate) const HEADER_LEN: usize = 9;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinOp {
-    Ping  = 0x01,
-    Pong  = 0x02,
-    Msg   = 0x03,
-    HMsg  = 0x04,
-    Sub   = 0x05,
+    Ping = 0x01,
+    Pong = 0x02,
+    Msg = 0x03,
+    HMsg = 0x04,
+    Sub = 0x05,
     Unsub = 0x06,
 }
 
@@ -75,16 +75,21 @@ pub(crate) fn try_decode(buf: &mut BytesMut) -> Option<BinFrame> {
     let op = BinOp::from_u8(buf[0])?;
     let subj_len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
     let repl_len = u16::from_le_bytes([buf[3], buf[4]]) as usize;
-    let pay_len  = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
+    let pay_len = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
     let total = HEADER_LEN + subj_len + repl_len + pay_len;
     if buf.len() < total {
         return None;
     }
     let data = buf.split_to(total).freeze();
     let subject = data.slice(HEADER_LEN..HEADER_LEN + subj_len);
-    let reply   = data.slice(HEADER_LEN + subj_len..HEADER_LEN + subj_len + repl_len);
+    let reply = data.slice(HEADER_LEN + subj_len..HEADER_LEN + subj_len + repl_len);
     let payload = data.slice(HEADER_LEN + subj_len + repl_len..total);
-    Some(BinFrame { op, subject, reply, payload })
+    Some(BinFrame {
+        op,
+        subject,
+        reply,
+        payload,
+    })
 }
 
 // ── Encoders ─────────────────────────────────────────────────────────────────
@@ -110,6 +115,19 @@ pub(crate) fn write_pong(out: &mut BytesMut) {
 
 pub(crate) fn write_msg(subject: &[u8], reply: &[u8], payload: &[u8], out: &mut BytesMut) {
     encode_into(BinOp::Msg, subject, reply, payload, out);
+}
+
+/// Build the 9-byte binary Msg frame header for scatter-gather (zero-copy) writes.
+///
+/// Used by `MsgWriter::write_rmsg` in binary mode to store just the header inline
+/// while keeping subject and payload as `Bytes` refs — no copy of message data.
+pub(crate) fn msg_header(subject: &[u8], reply: &[u8], payload: &[u8]) -> [u8; 9] {
+    let mut h = [0u8; 9];
+    h[0] = BinOp::Msg as u8;
+    h[1..3].copy_from_slice(&(subject.len() as u16).to_le_bytes());
+    h[3..5].copy_from_slice(&(reply.len() as u16).to_le_bytes());
+    h[5..9].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    h
 }
 
 /// Write an HMsg (message with NATS wire-format headers).
@@ -181,8 +199,8 @@ mod tests {
         let f = roundtrip(BinOp::Sub, b"foo.>", b"q1", b"$G");
         assert_eq!(f.op, BinOp::Sub);
         assert_eq!(&f.subject[..], b"foo.>"); // subject
-        assert_eq!(&f.reply[..], b"q1");      // queue
-        assert_eq!(&f.payload[..], b"$G");    // account
+        assert_eq!(&f.reply[..], b"q1"); // queue
+        assert_eq!(&f.payload[..], b"$G"); // account
     }
 
     #[test]

@@ -67,35 +67,46 @@ impl MessageDeliveryHub<'_> {
     }
 }
 
-/// All-borrows message descriptor for zero-alloc delivery.
+/// Message descriptor with owned, ref-counted subject and payload.
 ///
-/// Lifetime is the caller's stack frame. Bundles the 5 separate params
-/// that every delivery function needs.
+/// Using `Bytes` for subject/payload eliminates two memcpy calls per routed
+/// message: the binary route writer path can clone the `Bytes` (O(1) refcount
+/// increment) instead of copying into the shared `direct_buf`.
 pub(crate) struct Msg<'a> {
-    pub subject: &'a [u8],
-    pub subject_str: &'a str,
-    pub reply: Option<&'a [u8]>,
+    pub subject: Bytes,
+    pub reply: Option<Bytes>,
     pub headers: Option<&'a HeaderMap>,
-    pub payload: &'a [u8],
+    pub payload: Bytes,
 }
 
 impl<'a> Msg<'a> {
     /// Create a new message descriptor.
+    ///
+    /// `subject` and `payload` accept anything that converts to `Bytes`
+    /// (e.g. `&[u8]`, `Bytes`, `Vec<u8>`), so existing `b"literal"` call
+    /// sites continue to compile via `Bytes::copy_from_slice`.
     #[inline]
     pub(crate) fn new(
-        subject: &'a [u8],
-        subject_str: &'a str,
-        reply: Option<&'a [u8]>,
+        subject: impl Into<Bytes>,
+        reply: Option<Bytes>,
         headers: Option<&'a HeaderMap>,
-        payload: &'a [u8],
+        payload: impl Into<Bytes>,
     ) -> Self {
         Self {
-            subject,
-            subject_str,
+            subject: subject.into(),
             reply,
             headers,
-            payload,
+            payload: payload.into(),
         }
+    }
+
+    /// Return the subject as a `&str`.
+    ///
+    /// # Safety
+    /// NATS subjects are always valid ASCII (a subset of UTF-8).
+    #[inline]
+    pub(crate) fn subject_str(&self) -> &str {
+        unsafe { std::str::from_utf8_unchecked(&self.subject) }
     }
 }
 
@@ -206,10 +217,10 @@ pub(crate) fn deliver_to_sub_inner(
     #[cfg(feature = "mesh")]
     if sub.is_route {
         sub.writer.write_rmsg(
-            msg.subject,
-            msg.reply,
+            &msg.subject,
+            msg.reply.as_deref(),
             msg.headers,
-            msg.payload,
+            &msg.payload,
             #[cfg(feature = "accounts")]
             account_name,
         );
@@ -220,21 +231,25 @@ pub(crate) fn deliver_to_sub_inner(
         // Check subscribe permissions: don't deliver to leaf if the subject
         // is not in the leaf's allowed subscribe set.
         if let Some(ref perms) = sub.leaf_perms {
-            let subject_str = std::str::from_utf8(msg.subject).unwrap_or("");
+            let subject_str = msg.subject_str();
             if !perms.subscribe.is_allowed(subject_str) {
                 return false;
             }
         }
-        sub.writer
-            .write_lmsg(msg.subject, msg.reply, msg.headers, msg.payload);
+        sub.writer.write_lmsg(
+            &msg.subject,
+            msg.reply.as_deref(),
+            msg.headers,
+            &msg.payload,
+        );
         return true;
     }
     sub.writer.write_msg(
-        msg.subject,
+        &msg.subject,
         &sub.sid_bytes,
-        msg.reply,
+        msg.reply.as_deref(),
         msg.headers,
-        msg.payload,
+        &msg.payload,
     );
     true
 }
@@ -260,7 +275,7 @@ where
 {
     let mut delivered: usize = 0;
     let (_match_count, expired) = subs.for_each_match(
-        msg.subject_str,
+        msg.subject_str(),
         |sub| {
             // Pre-filter: exclude subs that must not participate in queue-group
             // round-robin — if they are picked as the sole group member and then
@@ -279,37 +294,39 @@ where
             true
         },
         |sub| {
-        #[cfg(feature = "gateway")]
-        if sub.is_gateway {
-            let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, state);
-            sub.writer.write_rmsg(
-                msg.subject,
-                gw_reply.as_deref(),
-                msg.headers,
-                msg.payload,
+            #[cfg(feature = "gateway")]
+            if sub.is_gateway {
+                let gw_reply =
+                    crate::handler::propagation::rewrite_gateway_reply(msg.reply.as_deref(), state);
+                sub.writer.write_rmsg(
+                    &msg.subject,
+                    gw_reply.as_deref(),
+                    msg.headers,
+                    &msg.payload,
+                    #[cfg(feature = "accounts")]
+                    acct_name,
+                );
+            } else if !deliver_to_sub_inner(
+                sub,
+                msg,
                 #[cfg(feature = "accounts")]
                 acct_name,
-            );
-        } else if !deliver_to_sub_inner(
-            sub,
-            msg,
-            #[cfg(feature = "accounts")]
-            acct_name,
-        ) {
-            return;
-        }
-        #[cfg(not(feature = "gateway"))]
-        if !deliver_to_sub_inner(
-            sub,
-            msg,
-            #[cfg(feature = "accounts")]
-            acct_name,
-        ) {
-            return;
-        }
-        delivered += 1;
-        on_deliver(sub);
-    });
+            ) {
+                return;
+            }
+            #[cfg(not(feature = "gateway"))]
+            if !deliver_to_sub_inner(
+                sub,
+                msg,
+                #[cfg(feature = "accounts")]
+                acct_name,
+            ) {
+                return;
+            }
+            delivered += 1;
+            on_deliver(sub);
+        },
+    );
     (delivered, expired)
 }
 
@@ -588,17 +605,18 @@ pub(crate) fn forward_to_optimistic_gateways(
             continue;
         }
         // Skip if subject is in the negative interest set.
-        if gis.ni.contains(msg.subject_str) {
+        if gis.ni.contains(msg.subject_str()) {
             continue;
         }
 
         // Rewrite reply with _GR_ prefix before forwarding across gateway.
-        let gw_reply = crate::handler::propagation::rewrite_gateway_reply(msg.reply, wctx.state);
+        let gw_reply =
+            crate::handler::propagation::rewrite_gateway_reply(msg.reply.as_deref(), wctx.state);
         gis.writer.write_rmsg(
-            msg.subject,
+            &msg.subject,
             gw_reply.as_deref(),
             msg.headers,
-            msg.payload,
+            &msg.payload,
             #[cfg(feature = "accounts")]
             account,
         );
@@ -631,20 +649,23 @@ pub(crate) fn deliver_cross_account(
     let mut all_expired = Vec::new();
 
     for route in routes {
-        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
+        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str()) {
             continue;
         }
 
         let (dst_subject_str, dst_subject_bytes);
         match &route.remap {
             Some(r) => {
-                dst_subject_str =
-                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, msg.subject_str);
-                dst_subject_bytes = dst_subject_str.as_bytes();
+                dst_subject_str = crate::sub_list::remap_subject(
+                    &r.from_pattern,
+                    &r.to_pattern,
+                    msg.subject_str(),
+                );
+                dst_subject_bytes = Bytes::copy_from_slice(dst_subject_str.as_bytes());
             }
             None => {
-                dst_subject_str = msg.subject_str.to_string();
-                dst_subject_bytes = msg.subject;
+                dst_subject_str = msg.subject_str().to_string();
+                dst_subject_bytes = msg.subject.clone();
             }
         };
 
@@ -652,21 +673,24 @@ pub(crate) fn deliver_cross_account(
 
         let dst_msg = Msg::new(
             dst_subject_bytes,
-            &dst_subject_str,
-            msg.reply,
+            msg.reply.clone(),
             msg.headers,
-            msg.payload,
+            msg.payload.clone(),
         );
 
         let subs = wctx.state.get_subs(route.dst_account_id).read().unwrap();
-        let (_count, expired) = subs.for_each_match(&dst_subject_str, |_| true, |sub| {
-            let did_deliver = deliver_to_sub_inner(sub, &dst_msg, dst_acct_name);
-            if !did_deliver {
-                return;
-            }
-            wctx.record_delivery(payload_len);
-            wctx.queue_notify(sub.writer.event_raw_fd());
-        });
+        let (_count, expired) = subs.for_each_match(
+            &dst_subject_str,
+            |_| true,
+            |sub| {
+                let did_deliver = deliver_to_sub_inner(sub, &dst_msg, dst_acct_name);
+                if !did_deliver {
+                    return;
+                }
+                wctx.record_delivery(payload_len);
+                wctx.queue_notify(sub.writer.event_raw_fd());
+            },
+        );
         drop(subs);
         all_expired.extend(expired);
     }
@@ -693,42 +717,47 @@ pub(crate) fn deliver_cross_account_upstream(
     let mut all_expired = Vec::new();
 
     for route in routes {
-        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str) {
+        if !crate::sub_list::subject_matches(&route.export_pattern, msg.subject_str()) {
             continue;
         }
 
-        let (dst_subject_str, dst_subject_bytes_owned);
+        let (dst_subject_str, dst_subject_bytes);
         match &route.remap {
             Some(r) => {
-                dst_subject_str =
-                    crate::sub_list::remap_subject(&r.from_pattern, &r.to_pattern, msg.subject_str);
-                dst_subject_bytes_owned = Some(dst_subject_str.as_bytes().to_vec());
+                dst_subject_str = crate::sub_list::remap_subject(
+                    &r.from_pattern,
+                    &r.to_pattern,
+                    msg.subject_str(),
+                );
+                dst_subject_bytes = Bytes::copy_from_slice(dst_subject_str.as_bytes());
             }
             None => {
-                dst_subject_str = msg.subject_str.to_string();
-                dst_subject_bytes_owned = None;
+                dst_subject_str = msg.subject_str().to_string();
+                dst_subject_bytes = msg.subject.clone();
             }
         };
-        let dst_subject_bytes = dst_subject_bytes_owned.as_deref().unwrap_or(msg.subject);
 
         #[allow(unused)]
         let dst_acct_name = state.account_name(route.dst_account_id).as_bytes();
 
         let dst_msg = Msg::new(
             dst_subject_bytes,
-            &dst_subject_str,
-            msg.reply,
+            msg.reply.clone(),
             msg.headers,
-            msg.payload,
+            msg.payload.clone(),
         );
 
         let subs = state.get_subs(route.dst_account_id).read().unwrap();
-        let (_count, expired) = subs.for_each_match(&dst_subject_str, |_| true, |sub| {
-            if !deliver_to_sub_inner(sub, &dst_msg, dst_acct_name) {
-                return;
-            }
-            dirty_writers.push(sub.writer.clone());
-        });
+        let (_count, expired) = subs.for_each_match(
+            &dst_subject_str,
+            |_| true,
+            |sub| {
+                if !deliver_to_sub_inner(sub, &dst_msg, dst_acct_name) {
+                    return;
+                }
+                dirty_writers.push(sub.writer.clone());
+            },
+        );
         drop(subs);
         all_expired.extend(expired);
     }
@@ -868,7 +897,12 @@ mod tests {
         skip_conn_id: u64,
         scope: &DeliveryScope,
     ) -> (usize, Vec<(u64, u64)>) {
-        let msg = Msg::new(subject.as_bytes(), subject, None, None, payload);
+        let msg = Msg::new(
+            Bytes::copy_from_slice(subject.as_bytes()),
+            None,
+            None,
+            Bytes::copy_from_slice(payload),
+        );
         #[cfg(feature = "gateway")]
         let state = test_server_state();
         deliver_to_subs_core(
@@ -890,7 +924,12 @@ mod tests {
         let mut subs = SubList::new();
         subs.insert(sub_with_writer(1, 1, "foo.bar", None, &writer));
 
-        let msg = Msg::new(b"foo.bar", "foo.bar", None, None, b"hello");
+        let msg = Msg::new(
+            Bytes::from_static(b"foo.bar"),
+            None,
+            None,
+            Bytes::from_static(b"hello"),
+        );
         #[cfg(feature = "gateway")]
         let state = test_server_state();
         let (delivered, expired) = deliver_to_subs_core(
@@ -1064,7 +1103,12 @@ mod tests {
         let mut sub = sub_with_writer(1, 1, "foo.bar", None, &writer);
         sub.is_leaf = true;
 
-        let msg = Msg::new(b"foo.bar", "foo.bar", None, None, b"hello");
+        let msg = Msg::new(
+            Bytes::from_static(b"foo.bar"),
+            None,
+            None,
+            Bytes::from_static(b"hello"),
+        );
         let delivered = deliver_to_sub_inner(
             &sub,
             &msg,
@@ -1097,7 +1141,12 @@ mod tests {
             },
         }));
 
-        let msg = Msg::new(b"secret.data", "secret.data", None, None, b"payload");
+        let msg = Msg::new(
+            Bytes::from_static(b"secret.data"),
+            None,
+            None,
+            Bytes::from_static(b"payload"),
+        );
         let delivered = deliver_to_sub_inner(
             &sub,
             &msg,
@@ -1116,7 +1165,12 @@ mod tests {
         let mut sub = sub_with_writer(1, 1, "foo.bar", None, &writer);
         sub.is_route = true;
 
-        let msg = Msg::new(b"foo.bar", "foo.bar", None, None, b"hello");
+        let msg = Msg::new(
+            Bytes::from_static(b"foo.bar"),
+            None,
+            None,
+            Bytes::from_static(b"hello"),
+        );
         let delivered = deliver_to_sub_inner(
             &sub,
             &msg,
@@ -1210,7 +1264,12 @@ mod tests {
             subs.insert(sub_with_writer(2, 1, "foo", None, &w2));
         }
 
-        let msg = Msg::new(b"foo", "foo", None, None, b"data");
+        let msg = Msg::new(
+            Bytes::from_static(b"foo"),
+            None,
+            None,
+            Bytes::from_static(b"data"),
+        );
         let mut dirty_writers = Vec::new();
         let (delivered, _) = deliver_to_subs_upstream_inner(
             &state,
@@ -1260,7 +1319,12 @@ mod tests {
             worker_index: 0,
         };
 
-        let msg = Msg::new(b"foo", "foo", None, None, b"hello");
+        let msg = Msg::new(
+            Bytes::from_static(b"foo"),
+            None,
+            None,
+            Bytes::from_static(b"hello"),
+        );
         let (delivered, expired) = wctx.publish(
             &msg,
             0,

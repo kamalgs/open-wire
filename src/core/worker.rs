@@ -41,7 +41,9 @@ use crate::handler::{
     MessageDeliveryHub,
 };
 use crate::nats_proto;
-use crate::sub_list::{create_eventfd, MsgWriter};
+use crate::sub_list::{create_eventfd, DirectBuf, MsgWriter};
+#[cfg(feature = "mesh")]
+use crate::sub_list::{BinSeg, BinSegBuf};
 use crate::websocket::{self, DecodeStatus, WsCodec};
 
 use rustls::ServerConnection;
@@ -255,7 +257,7 @@ pub(crate) struct ClientState {
     read_buf: AdaptiveBuf,
     write_buf: BytesMut,
     direct_writer: MsgWriter,
-    direct_buf: Arc<Mutex<BytesMut>>,
+    direct_buf: Arc<Mutex<DirectBuf>>,
     has_pending: Arc<AtomicBool>,
     phase: ConnPhase,
     transport: Transport,
@@ -536,7 +538,7 @@ impl Worker {
             return;
         }
 
-        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let direct_buf = Arc::new(Mutex::new(DirectBuf::Text(BytesMut::with_capacity(65536))));
         let has_pending = Arc::new(AtomicBool::new(false));
         let direct_writer = MsgWriter::new(
             Arc::clone(&direct_buf),
@@ -642,7 +644,7 @@ impl Worker {
             return;
         }
 
-        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let direct_buf = Arc::new(Mutex::new(DirectBuf::Text(BytesMut::with_capacity(65536))));
         let has_pending = Arc::new(AtomicBool::new(false));
         let direct_writer = MsgWriter::new(
             Arc::clone(&direct_buf),
@@ -809,29 +811,83 @@ impl Worker {
                 continue;
             }
             client.has_pending.store(false, Ordering::Relaxed);
-            let direct_data = {
+            // Drain the per-connection direct buffer.
+            // For Raw+Text: O(1) split, then writev with write_buf.
+            // For Raw+Binary: take segment list, build scatter-gather iovecs (zero-copy).
+            // For WS/TLS: materialise into write_buf for further encoding.
+            enum DrainResult {
+                Empty,
+                FlatBytes(BytesMut),
+                #[cfg(feature = "mesh")]
+                Segs {
+                    segs: Vec<BinSeg>,
+                    total_len: usize,
+                },
+            }
+            let drained = {
                 let mut dbuf = client.direct_buf.lock().unwrap();
-                if !dbuf.is_empty() {
-                    if matches!(client.transport, Transport::Raw) {
-                        // O(1) take for Raw — we'll use writev to avoid copying
-                        dbuf.split()
-                    } else {
-                        // WS/TLS need the data in write_buf for transformation
-                        client.write_buf.extend_from_slice(&dbuf);
-                        dbuf.clear();
-                        BytesMut::new()
+                if dbuf.is_empty() {
+                    DrainResult::Empty
+                } else if matches!(client.transport, Transport::Raw) {
+                    match &mut *dbuf {
+                        DirectBuf::Text(b) => DrainResult::FlatBytes(b.split()),
+                        #[cfg(feature = "mesh")]
+                        DirectBuf::Binary(seg_buf) => {
+                            let total_len = seg_buf.total_len;
+                            DrainResult::Segs {
+                                segs: seg_buf.take(),
+                                total_len,
+                            }
+                        }
                     }
                 } else {
-                    BytesMut::new()
+                    // WS/TLS: flatten everything into write_buf
+                    match &mut *dbuf {
+                        DirectBuf::Text(b) => {
+                            client.write_buf.extend_from_slice(b);
+                            b.clear();
+                        }
+                        #[cfg(feature = "mesh")]
+                        DirectBuf::Binary(seg_buf) => {
+                            seg_buf.materialize_into(&mut client.write_buf);
+                        }
+                    }
+                    DrainResult::Empty
                 }
             };
+            // Materialise DrainResult: text path uses direct_data; binary uses segs_drain.
+            let direct_data: BytesMut;
+            #[cfg(feature = "mesh")]
+            let segs_drain: Option<(Vec<BinSeg>, usize)>;
+            #[cfg(not(feature = "mesh"))]
+            let segs_drain: Option<(Vec<()>, usize)>;
+            match drained {
+                DrainResult::Empty => {
+                    direct_data = BytesMut::new();
+                    segs_drain = None;
+                }
+                DrainResult::FlatBytes(b) => {
+                    direct_data = b;
+                    segs_drain = None;
+                }
+                #[cfg(feature = "mesh")]
+                DrainResult::Segs { segs, total_len } => {
+                    direct_data = BytesMut::new();
+                    segs_drain = Some((segs, total_len));
+                }
+            }
 
             // Slow consumer detection: if pending data exceeds max_pending,
             // disconnect the client to protect server memory.
             let max_pending = self.state.buf_config.max_pending;
             if max_pending > 0 {
+                let extra = if let Some((_, tl)) = &segs_drain {
+                    *tl
+                } else {
+                    direct_data.len()
+                };
                 let pending = match &client.transport {
-                    Transport::Raw => client.write_buf.len() + direct_data.len(),
+                    Transport::Raw => client.write_buf.len() + extra,
                     Transport::WebSocket { ws_out, .. } => client.write_buf.len() + ws_out.len(),
                     Transport::Tls(ref tls) => client.write_buf.len() + tls.enc_out.len(),
                 };
@@ -889,6 +945,137 @@ impl Worker {
             // Inline flush
             let mut error = false;
             if is_raw {
+                // ── Binary segment path (zero-copy scatter-gather) ──────────
+                #[cfg(feature = "mesh")]
+                if let Some((segs, _total_len)) = segs_drain {
+                    // Build iovec array: write_buf (if any) + per-segment iovecs.
+                    // Each Msg segment contributes up to 4 iovecs; Inline contributes 1.
+                    // IOV_MAX on Linux is 1024 — for very large batches materialise first.
+                    let wb_len = client.write_buf.len();
+                    let max_iovs = (if wb_len > 0 { 1 } else { 0 }) + segs.len() * 4;
+                    if max_iovs > 1024 {
+                        // Safety valve: materialise segs into write_buf and fall through.
+                        for seg in segs {
+                            match seg {
+                                BinSeg::Inline(b) => client.write_buf.extend_from_slice(&b),
+                                BinSeg::Msg(f) => {
+                                    client.write_buf.extend_from_slice(&f.header);
+                                    client.write_buf.extend_from_slice(&f.subject);
+                                    client.write_buf.extend_from_slice(&f.reply);
+                                    client.write_buf.extend_from_slice(&f.payload);
+                                }
+                            }
+                        }
+                        // Fall through to the standard write_buf-only write below.
+                    } else {
+                        // Build iovecs without holding a borrow across the write call.
+                        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(max_iovs);
+                        if wb_len > 0 {
+                            iovecs.push(libc::iovec {
+                                iov_base: client.write_buf.as_ptr() as *mut libc::c_void,
+                                iov_len: wb_len,
+                            });
+                        }
+                        for seg in &segs {
+                            match seg {
+                                BinSeg::Inline(b) if !b.is_empty() => {
+                                    iovecs.push(libc::iovec {
+                                        iov_base: b.as_ptr() as *mut libc::c_void,
+                                        iov_len: b.len(),
+                                    });
+                                }
+                                BinSeg::Msg(f) => {
+                                    iovecs.push(libc::iovec {
+                                        iov_base: f.header.as_ptr() as *mut libc::c_void,
+                                        iov_len: 9,
+                                    });
+                                    if !f.subject.is_empty() {
+                                        iovecs.push(libc::iovec {
+                                            iov_base: f.subject.as_ptr() as *mut libc::c_void,
+                                            iov_len: f.subject.len(),
+                                        });
+                                    }
+                                    if !f.reply.is_empty() {
+                                        iovecs.push(libc::iovec {
+                                            iov_base: f.reply.as_ptr() as *mut libc::c_void,
+                                            iov_len: f.reply.len(),
+                                        });
+                                    }
+                                    if !f.payload.is_empty() {
+                                        iovecs.push(libc::iovec {
+                                            iov_base: f.payload.as_ptr() as *mut libc::c_void,
+                                            iov_len: f.payload.len(),
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let total_bytes: usize = iovecs.iter().map(|v| v.iov_len).sum();
+                        // SAFETY: iovecs point into BytesMut / Bytes buffers that remain
+                        // valid until end of this block; fd is the connection socket.
+                        let n = unsafe {
+                            libc::writev(client.fd, iovecs.as_ptr(), iovecs.len() as i32)
+                        };
+                        if n < 0 {
+                            let err = io::Error::last_os_error();
+                            if err.kind() == io::ErrorKind::WouldBlock {
+                                // Materialise everything into write_buf for later retry.
+                                // (write_buf content is already there; append segs.)
+                                for seg in segs {
+                                    match seg {
+                                        BinSeg::Inline(b) => client.write_buf.extend_from_slice(&b),
+                                        BinSeg::Msg(f) => {
+                                            client.write_buf.extend_from_slice(&f.header);
+                                            client.write_buf.extend_from_slice(&f.subject);
+                                            client.write_buf.extend_from_slice(&f.reply);
+                                            client.write_buf.extend_from_slice(&f.payload);
+                                        }
+                                    }
+                                }
+                                if !client.epoll_has_out {
+                                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                    client.epoll_has_out = true;
+                                }
+                            } else {
+                                error = true;
+                            }
+                        } else {
+                            let written = n as usize;
+                            if written >= total_bytes {
+                                client.write_buf.clear();
+                            } else {
+                                // Partial write: flatten all bytes, skip written, keep rest.
+                                // Rebuild write_buf from scratch = [wb | segs], advance written.
+                                let mut all = BytesMut::with_capacity(total_bytes);
+                                all.extend_from_slice(&client.write_buf);
+                                for seg in segs {
+                                    match seg {
+                                        BinSeg::Inline(b) => all.extend_from_slice(&b),
+                                        BinSeg::Msg(f) => {
+                                            all.extend_from_slice(&f.header);
+                                            all.extend_from_slice(&f.subject);
+                                            all.extend_from_slice(&f.reply);
+                                            all.extend_from_slice(&f.payload);
+                                        }
+                                    }
+                                }
+                                all.advance(written);
+                                client.write_buf = all;
+                                if !client.epoll_has_out {
+                                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                    client.epoll_has_out = true;
+                                }
+                            }
+                        }
+                        if error {
+                            to_remove.push(*conn_id);
+                        }
+                        continue;
+                    }
+                }
+
+                // ── Text / flat-buffer path ─────────────────────────────────
                 // writev path: write_buf and direct_data as two iovecs
                 let wb_len = client.write_buf.len();
                 let dd_len = direct_data.len();
@@ -1177,8 +1364,16 @@ impl Worker {
                 {
                     let mut dbuf = client.direct_buf.lock().unwrap();
                     if !dbuf.is_empty() {
-                        client.write_buf.extend_from_slice(&dbuf);
-                        dbuf.clear();
+                        match &mut *dbuf {
+                            DirectBuf::Text(b) => {
+                                client.write_buf.extend_from_slice(b);
+                                b.clear();
+                            }
+                            #[cfg(feature = "mesh")]
+                            DirectBuf::Binary(seg_buf) => {
+                                seg_buf.materialize_into(&mut client.write_buf);
+                            }
+                        }
                     }
                 }
             }
@@ -1812,8 +2007,8 @@ impl Worker {
                         }
                     }
 
-                    let use_binary = connect_info.open_wire == Some(1)
-                        && self.state.info.open_wire == Some(1);
+                    let use_binary =
+                        connect_info.open_wire == Some(1) && self.state.info.open_wire == Some(1);
 
                     // Peer's CONNECT — go Active, register, exchange subs.
                     let client = self.conns.get_mut(&conn_id).unwrap();
@@ -1840,9 +2035,13 @@ impl Worker {
                         *binary = use_binary;
                     }
 
-                    // If binary mode, replace the direct_writer with a binary-mode writer
-                    // sharing the same direct_buf/has_pending Arcs so flush_pending works.
+                    // If binary mode, switch the direct buffer to segment mode and replace
+                    // the direct_writer with a binary-mode writer sharing the same Arcs.
                     if use_binary {
+                        {
+                            let mut dbuf = client.direct_buf.lock().unwrap();
+                            *dbuf = DirectBuf::Binary(BinSegBuf::new());
+                        }
                         let binary_dw = crate::sub_list::MsgWriter::new_binary_shared(
                             Arc::clone(&client.direct_buf),
                             Arc::clone(&client.has_pending),
@@ -2522,7 +2721,13 @@ mod bin_frame_tests {
     #[test]
     fn msg_no_reply() {
         match bin_frame_to_route_op(frame(BinOp::Msg, b"foo.bar", b"", b"hello")).unwrap() {
-            RouteOp::RouteMsg { subject, reply, payload, headers, .. } => {
+            RouteOp::RouteMsg {
+                subject,
+                reply,
+                payload,
+                headers,
+                ..
+            } => {
                 assert_eq!(&subject[..], b"foo.bar");
                 assert!(reply.is_none());
                 assert_eq!(&payload[..], b"hello");
@@ -2550,7 +2755,13 @@ mod bin_frame_tests {
         bin_proto::write_hmsg(b"events.v1", b"", hdr, body, &mut buf);
         let f = bin_proto::try_decode(&mut buf).unwrap();
         match bin_frame_to_route_op(f).unwrap() {
-            RouteOp::RouteMsg { subject, reply, headers, payload, .. } => {
+            RouteOp::RouteMsg {
+                subject,
+                reply,
+                headers,
+                payload,
+                ..
+            } => {
                 assert_eq!(&subject[..], b"events.v1");
                 assert!(reply.is_none());
                 assert!(headers.is_some(), "headers must be parsed");

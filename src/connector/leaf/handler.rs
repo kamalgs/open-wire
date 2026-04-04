@@ -263,11 +263,10 @@ impl LeafHandler {
         }
 
         let msg = Msg::new(
-            &subject,
-            subject_str,
-            reply.as_deref(),
+            subject.clone(),
+            reply.clone(),
             headers.as_ref(),
-            &payload,
+            payload.clone(),
         );
         let (_delivered, expired) = wctx.publish(
             &msg,

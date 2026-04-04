@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 
-pub(crate) use crate::msg_writer::{create_eventfd, MsgWriter};
+pub(crate) use crate::msg_writer::{create_eventfd, DirectBuf, MsgWriter};
+#[cfg(feature = "mesh")]
+pub(crate) use crate::msg_writer::{BinSeg, BinSegBuf};
 
 /// Backward-compatible alias for `MsgWriter`.
 pub(crate) type DirectWriter = MsgWriter;
@@ -1038,9 +1040,13 @@ mod tests {
         sl.insert(test_queue_sub(3, 1, "foo", "q1"));
 
         let mut delivered = Vec::new();
-        let (count, _expired) = sl.for_each_match("foo", |_| true, |sub| {
-            delivered.push(sub.conn_id);
-        });
+        let (count, _expired) = sl.for_each_match(
+            "foo",
+            |_| true,
+            |sub| {
+                delivered.push(sub.conn_id);
+            },
+        );
         assert_eq!(count, 1);
         assert_eq!(delivered.len(), 1);
     }
@@ -1053,9 +1059,13 @@ mod tests {
 
         let mut counts = [0u32; 3]; // conn_id 1 and 2
         for _ in 0..100 {
-            let _ = sl.for_each_match("foo", |_| true, |sub| {
-                counts[sub.conn_id as usize] += 1;
-            });
+            let _ = sl.for_each_match(
+                "foo",
+                |_| true,
+                |sub| {
+                    counts[sub.conn_id as usize] += 1;
+                },
+            );
         }
         // Both should get roughly half
         assert!(counts[1] > 0);
@@ -1073,9 +1083,13 @@ mod tests {
         sl.insert(test_sub(3, 1, "foo"));
 
         let mut delivered = Vec::new();
-        let (count, _) = sl.for_each_match("foo", |_| true, |sub| {
-            delivered.push(sub.conn_id);
-        });
+        let (count, _) = sl.for_each_match(
+            "foo",
+            |_| true,
+            |sub| {
+                delivered.push(sub.conn_id);
+            },
+        );
         // Non-queue sub always delivered + 1 from queue group
         assert_eq!(count, 2);
         assert!(delivered.contains(&3)); // non-queue always present
@@ -1090,9 +1104,13 @@ mod tests {
         sl.insert(test_queue_sub(4, 1, "foo", "q2"));
 
         let mut delivered = Vec::new();
-        let (count, _) = sl.for_each_match("foo", |_| true, |sub| {
-            delivered.push(sub.conn_id);
-        });
+        let (count, _) = sl.for_each_match(
+            "foo",
+            |_| true,
+            |sub| {
+                delivered.push(sub.conn_id);
+            },
+        );
         // 1 from q1 + 1 from q2
         assert_eq!(count, 2);
         assert_eq!(delivered.len(), 2);
@@ -1105,9 +1123,13 @@ mod tests {
         sl.insert(test_queue_sub(2, 1, "foo.*", "q1"));
 
         let mut delivered = Vec::new();
-        let (count, _) = sl.for_each_match("foo.bar", |_| true, |sub| {
-            delivered.push(sub.conn_id);
-        });
+        let (count, _) = sl.for_each_match(
+            "foo.bar",
+            |_| true,
+            |sub| {
+                delivered.push(sub.conn_id);
+            },
+        );
         assert_eq!(count, 1);
     }
 
@@ -1172,11 +1194,15 @@ mod tests {
         // Deliver enough messages that conn_id=1 gets 2
         let mut conn1_count = 0u32;
         for _ in 0..100 {
-            let (_, expired) = sl.for_each_match("foo", |_| true, |sub| {
-                if sub.conn_id == 1 {
-                    conn1_count += 1;
-                }
-            });
+            let (_, expired) = sl.for_each_match(
+                "foo",
+                |_| true,
+                |sub| {
+                    if sub.conn_id == 1 {
+                        conn1_count += 1;
+                    }
+                },
+            );
             // Remove expired
             for (cid, sid) in expired {
                 sl.remove(cid, sid);
