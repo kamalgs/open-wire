@@ -493,6 +493,8 @@ fn handle_gateway_op(
                 #[cfg(feature = "mesh")]
                 is_route: false,
                 is_gateway: true,
+                #[cfg(feature = "binary-client")]
+                is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
                 #[cfg(feature = "hub")]
@@ -561,16 +563,13 @@ fn handle_gateway_op(
             payload,
             ..
         } => {
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
-
             let unwrapped_reply = reply.as_ref().map(unwrap_gateway_reply_bytes);
 
             let msg = Msg::new(
-                &subject,
-                subject_str,
-                unwrapped_reply.as_deref(),
+                subject.clone(),
+                unwrapped_reply.clone(),
                 headers.as_ref(),
-                &payload,
+                payload.clone(),
             );
             // One-hop: skip route subs and gateway subs — messages from a gateway peer
             // are never re-forwarded.

@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Leaf node benchmark: Rust+Rust (Rust leaf + Rust hub) vs Go+Go (Go leaf + Go hub).
+# Throughput benchmark: open-wire binary protocol vs Go nats-server text protocol.
+#
+# Compares two stacks end-to-end:
+#   Go+NATS    — Go nats-server (leaf+hub) with nats bench clients (NATS text protocol)
+#   Rust+Bin   — open-wire (leaf+hub) with the bench binary client (binary protocol)
+#
+# Scenarios 1-3 use the binary bench client for the Rust side (true end-to-end binary).
+# Scenarios 4-5 (cross-server) still use nats bench for both sides — split pub/sub
+# across two servers is not supported by the binary bench client.
 #
 # Modes:
-#   --quick (default) — 5 core scenarios, 1 run, 100K msgs (~1-2 min)
-#   --full            — all 19 scenarios, 3 runs, 500K msgs (~5-10 min)
+#   --quick (default) — 5 core scenarios, 1 run, 100K msgs / 5s bench (~2-3 min)
+#   --full            — all 19 scenarios, 3 runs, 500K msgs / 10s bench (~10-15 min)
 #
 # Scenarios (quick mode runs 1-5 only, without "Direct Hub" baseline):
 #   1. Publish only        — raw ingest rate (fire-and-forget)
@@ -38,6 +46,7 @@
 #   ./throughput.sh --full --runs 1          # full with fewer runs
 
 set -euo pipefail
+trap 'echo "SCRIPT ERROR at line $LINENO (exit $?)" >&2' ERR
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -63,9 +72,9 @@ done
 
 # Apply mode defaults for unset values
 if [[ "$MODE" == "quick" ]]; then
-  MSGS="${MSGS:-100000}"; SIZE="${SIZE:-128}"; RUNS="${RUNS:-1}"
+  MSGS="${MSGS:-100000}"; SIZE="${SIZE:-128}"; RUNS="${RUNS:-1}"; BIN_DURATION="${BIN_DURATION:-5}"
 else
-  MSGS="${MSGS:-500000}"; SIZE="${SIZE:-128}"; RUNS="${RUNS:-3}"
+  MSGS="${MSGS:-500000}"; SIZE="${SIZE:-128}"; RUNS="${RUNS:-3}"; BIN_DURATION="${BIN_DURATION:-10}"
 fi
 
 # Ports
@@ -77,16 +86,18 @@ RUST_LEAF_PORT=5223
 RUST_LEAF_WS_PORT=5224
 RUST_HUB_CLIENT_PORT=6333
 RUST_HUB_LEAF_PORT=6422
-RUST_LEAF2_PORT=5225      # Rust leaf connected to Rust hub (for Rust+Rust pair)
+RUST_LEAF2_PORT=5225      # Rust leaf connected to Rust hub (for Rust+Binary pair)
+RUST_LEAF2_BIN_PORT=5226  # Binary client port on RUST_LEAF2
+RUST_HUB_BIN_PORT=6334    # Binary client port on Rust hub
 GO_LEAF_TO_RUST_PORT=6225
 
 # 3-node cluster ports (full mode only)
 GO_CLUSTER_A_PORT=7001;   GO_CLUSTER_A_ROUTE=7101
 GO_CLUSTER_B_PORT=7002;   GO_CLUSTER_B_ROUTE=7102
 GO_CLUSTER_C_PORT=7003;   GO_CLUSTER_C_ROUTE=7103
-RUST_CLUSTER_A_PORT=8001; RUST_CLUSTER_A_ROUTE=8101
-RUST_CLUSTER_B_PORT=8002; RUST_CLUSTER_B_ROUTE=8102
-RUST_CLUSTER_C_PORT=8003; RUST_CLUSTER_C_ROUTE=8103
+RUST_CLUSTER_A_PORT=8001; RUST_CLUSTER_A_ROUTE=8101; RUST_CLUSTER_A_BIN_PORT=8201
+RUST_CLUSTER_B_PORT=8002; RUST_CLUSTER_B_ROUTE=8102; RUST_CLUSTER_B_BIN_PORT=8202
+RUST_CLUSTER_C_PORT=8003; RUST_CLUSTER_C_ROUTE=8103; RUST_CLUSTER_C_BIN_PORT=8203
 
 # 2-node gateway ports (full mode only)
 GO_GW_A_PORT=9001; GO_GW_A_GW=9101
@@ -119,13 +130,15 @@ done
 
 # Check ports are free
 PORTS_TO_CHECK="$HUB_CLIENT_PORT $HUB_LEAF_PORT $GO_LEAF_PORT $GO_LEAF_WS_PORT \
-  $RUST_LEAF_PORT $RUST_LEAF_WS_PORT $RUST_HUB_CLIENT_PORT $RUST_HUB_LEAF_PORT $RUST_LEAF2_PORT"
+  $RUST_LEAF_PORT $RUST_LEAF_WS_PORT $RUST_HUB_CLIENT_PORT $RUST_HUB_LEAF_PORT \
+  $RUST_LEAF2_PORT $RUST_LEAF2_BIN_PORT $RUST_HUB_BIN_PORT"
 if [[ "$MODE" == "full" ]]; then
   PORTS_TO_CHECK="$PORTS_TO_CHECK $GO_LEAF_TO_RUST_PORT \
     $GO_CLUSTER_A_PORT $GO_CLUSTER_A_ROUTE $GO_CLUSTER_B_PORT $GO_CLUSTER_B_ROUTE \
     $GO_CLUSTER_C_PORT $GO_CLUSTER_C_ROUTE \
-    $RUST_CLUSTER_A_PORT $RUST_CLUSTER_A_ROUTE $RUST_CLUSTER_B_PORT $RUST_CLUSTER_B_ROUTE \
-    $RUST_CLUSTER_C_PORT $RUST_CLUSTER_C_ROUTE \
+    $RUST_CLUSTER_A_PORT $RUST_CLUSTER_A_ROUTE $RUST_CLUSTER_A_BIN_PORT \
+    $RUST_CLUSTER_B_PORT $RUST_CLUSTER_B_ROUTE $RUST_CLUSTER_B_BIN_PORT \
+    $RUST_CLUSTER_C_PORT $RUST_CLUSTER_C_ROUTE $RUST_CLUSTER_C_BIN_PORT \
     $GO_GW_A_PORT $GO_GW_A_GW $GO_GW_B_PORT $GO_GW_B_GW \
     $RUST_GW_A_PORT $RUST_GW_A_GW $RUST_GW_B_PORT $RUST_GW_B_GW"
 fi
@@ -143,15 +156,16 @@ echo "================================================================"
 echo ""
 
 # --- Build Rust leaf server ---
-echo "Building Rust leaf server (release)..."
+echo "Building open-wire server + bench client (release)..."
 if [[ "$MODE" == "full" ]]; then
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --release --features mesh,gateway 2>&1 | tail -1
+    --release --features mesh,gateway,binary-client 2>&1 | tail -1
 else
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --release 2>&1 | tail -1
+    --release --features binary-client 2>&1 | tail -1
 fi
 RUST_BIN="$REPO_ROOT/target/release/open-wire"
+BENCH_BIN="$REPO_ROOT/target/release/bench"
 echo ""
 
 # --- Start hub ---
@@ -176,15 +190,16 @@ RUST_LEAF_PID=$!
 sleep 2
 
 # --- Start Rust hub (hub mode — accepts inbound leaf connections) ---
-echo "Starting Rust hub (client=$RUST_HUB_CLIENT_PORT, leafnode=$RUST_HUB_LEAF_PORT)..."
-RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_hub.conf" &
+echo "Starting Rust hub (client=$RUST_HUB_CLIENT_PORT, leafnode=$RUST_HUB_LEAF_PORT, binary=$RUST_HUB_BIN_PORT)..."
+RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_hub.conf" \
+  --binary-port "$RUST_HUB_BIN_PORT" &
 PIDS+=($!)
 RUST_HUB_PID=$!
 sleep 1
 
-# --- Start Rust leaf → Rust hub (for Rust+Rust comparison) ---
-echo "Starting Rust leaf → Rust hub (tcp=$RUST_LEAF2_PORT)..."
-RUST_LOG=warn "$RUST_BIN" --port "$RUST_LEAF2_PORT" \
+# --- Start Rust leaf → Rust hub (for open-wire+binary comparison) ---
+echo "Starting Rust leaf → Rust hub (tcp=$RUST_LEAF2_PORT, binary=$RUST_LEAF2_BIN_PORT)..."
+RUST_LOG=warn "$RUST_BIN" --port "$RUST_LEAF2_PORT" --binary-port "$RUST_LEAF2_BIN_PORT" \
   --hub "nats://127.0.0.1:$RUST_HUB_LEAF_PORT" &
 PIDS+=($!)
 RUST_LEAF2_PID=$!
@@ -210,9 +225,9 @@ if [[ "$MODE" == "full" ]]; then
   nats pub _bench.ping pong -s "ws://127.0.0.1:$GO_LEAF_WS_PORT"      >/dev/null 2>&1 || { echo "FAIL: go leaf ws"; exit 1; }
   nats pub _bench.ping pong -s "ws://127.0.0.1:$RUST_LEAF_WS_PORT"    >/dev/null 2>&1 || { echo "FAIL: rust leaf ws"; exit 1; }
   nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_LEAF_TO_RUST_PORT" >/dev/null 2>&1 || { echo "FAIL: go leaf→rust hub"; exit 1; }
-  echo "All servers responding (TCP + WebSocket + Rust+Rust pair)."
+  echo "All servers responding (TCP + WebSocket + Rust+Binary pair)."
 else
-  echo "All servers responding (TCP + Rust+Rust pair)."
+  echo "All servers responding (TCP + Rust+Binary pair)."
 fi
 echo ""
 
@@ -282,6 +297,18 @@ SUMMARY_GO_CTX=()
 # Extract msgs/sec from nats bench output (pub stats line)
 extract_rate() {
   grep -oP '[\d,]+(?= msgs/sec)' | head -1 | tr -d ',' || true
+}
+
+# Extract msgs/sec from bench binary output.
+# Parses "Pub: N msgs  X.XXX Mmsg/s ..." or "Sub: N msgs  X.XXX Mmsg/s ..."
+# and computes integer msgs/sec as (total_msgs / elapsed_secs).
+extract_binary_rate() {
+  local output="$1" direction="${2:-Pub}"
+  local msgs elapsed
+  msgs=$(echo "$output" | grep "^${direction}:" | awk '{gsub(/,/,"",$2); print $2+0}')
+  elapsed=$(echo "$output" | grep "^Elapsed:" | grep -oP '[\d.]+')
+  if [[ -z "$msgs" || -z "$elapsed" || "$elapsed" == "0" ]]; then echo 0; return; fi
+  awk "BEGIN {printf \"%d\", ${msgs} / ${elapsed}}"
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -358,7 +385,7 @@ run_url_pubsub() {
       wait_or_kill "$pid" 30
     done
     for s in $(seq 1 "$subs"); do
-      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] //" || true
+      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_sub_${s}.out"
     done
     BG_PIDS=()
@@ -388,17 +415,19 @@ run_url_pubsub_capture() {
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$url" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    local rate
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do
       wait_or_kill "$pid" 30
     done
+    # Measure delivered rate: average sub rate across all subscriber connections.
+    local sub_rate_sum=0 sr
     for s in $(seq 1 "$subs"); do
-      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] //" || true
+      sr=$(extract_rate < "/tmp/bench_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
+      grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / subs ))
     BG_PIDS=()
   done
   echo ""
@@ -457,15 +486,152 @@ run_cross_pubsub_capture() {
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$pub_url" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    local rate
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do
       wait_or_kill "$pid" 30
     done
+    # Measure delivered rate from the subscriber side.
+    local sr
+    sr=$(extract_rate < /tmp/bench_cross_sub.out 2>/dev/null || echo 0)
+    rate_sum=$(( rate_sum + ${sr:-0} ))
     grep -E "stats:" /tmp/bench_cross_sub.out 2>/dev/null | sed 's/^/  sub  /' || true
     rm -f /tmp/bench_cross_sub.out
+    BG_PIDS=()
+  done
+  echo ""
+
+  CAPTURED_RATE=$(( rate_sum / RUNS ))
+  CAPTURED_CPU=$(( ($(cpu_ticks "$server_pid") - cpu_before) * 1000 / CLK_TCK ))
+  CAPTURED_RSS=$(rss_kb "$server_pid")
+  CAPTURED_CTX=$(( $(ctx_switches "$server_pid") - ctx_before ))
+}
+
+# Binary pub-only benchmark using the bench binary.
+# Measures publisher ingest rate against the open-wire binary port.
+run_binary_pub_only() {
+  local label="$1" bin_addr="$2" server_pid="$3"
+  local cpu_before ctx_before output rate_sum=0
+
+  cpu_before=$(cpu_ticks "$server_pid")
+  ctx_before=$(ctx_switches "$server_pid")
+
+  echo "--- $label ---"
+  for i in $(seq 1 "$RUNS"); do
+    output=$("$BENCH_BIN" --addr "$bin_addr" --pub 1 --sub 0 \
+      --size "$SIZE" --duration "$BIN_DURATION" 2>&1)
+    echo "$output" | grep -E "^Pub:|^Elapsed:" || true
+    local rate
+    rate=$(extract_binary_rate "$output" "Pub")
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+  done
+  echo ""
+
+  CAPTURED_RATE=$(( rate_sum / RUNS ))
+  CAPTURED_CPU=$(( ($(cpu_ticks "$server_pid") - cpu_before) * 1000 / CLK_TCK ))
+  CAPTURED_RSS=$(rss_kb "$server_pid")
+  CAPTURED_CTX=$(( $(ctx_switches "$server_pid") - ctx_before ))
+}
+
+# Binary pub/sub benchmark using the bench binary.
+# `n_sub` binary subscriber connections on the same server as the publisher.
+run_binary_pubsub() {
+  local label="$1" bin_addr="$2" n_sub="$3" server_pid="$4"
+  local cpu_before ctx_before output rate_sum=0
+
+  cpu_before=$(cpu_ticks "$server_pid")
+  ctx_before=$(ctx_switches "$server_pid")
+
+  echo "--- $label ---"
+  for i in $(seq 1 "$RUNS"); do
+    output=$("$BENCH_BIN" --addr "$bin_addr" --pub 1 --sub "$n_sub" \
+      --size "$SIZE" --duration "$BIN_DURATION" 2>&1)
+    echo "$output" | grep -E "^Pub:|^Sub:|^Elapsed:" || true
+    # Measure per-subscriber delivered rate: bench reports total across all sub
+    # connections, so divide by n_sub to get the per-subscriber rate (comparable
+    # to Go's nats bench sub output which is per-process/per-connection).
+    local rate
+    rate=$(( $(extract_binary_rate "$output" "Sub") / n_sub ))
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+  done
+  echo ""
+
+  CAPTURED_RATE=$(( rate_sum / RUNS ))
+  CAPTURED_CPU=$(( ($(cpu_ticks "$server_pid") - cpu_before) * 1000 / CLK_TCK ))
+  CAPTURED_RSS=$(rss_kb "$server_pid")
+  CAPTURED_CTX=$(( $(ctx_switches "$server_pid") - ctx_before ))
+}
+
+# Cross-server binary pub/sub: pub connects to pub_bin_addr, sub connects to sub_bin_addr.
+# Runs both in a single bench invocation using --pub-addr / --sub-addr.
+run_binary_cross_pubsub_capture() {
+  local label="$1" pub_bin_addr="$2" sub_bin_addr="$3" server_pid="$4"
+  local cpu_before ctx_before output rate_sum=0
+
+  cpu_before=$(cpu_ticks "$server_pid")
+  ctx_before=$(ctx_switches "$server_pid")
+
+  echo "--- $label ---"
+  for i in $(seq 1 "$RUNS"); do
+    output=$("$BENCH_BIN" --pub-addr "$pub_bin_addr" --sub-addr "$sub_bin_addr" \
+      --pub 1 --sub 1 --size "$SIZE" --duration "$BIN_DURATION" 2>&1) || true
+    echo "$output" | grep -E "^Pub:|^Sub:|^Elapsed:" || true
+    # Measure delivered rate from the subscriber side.
+    local rate
+    rate=$(extract_binary_rate "$output" "Sub") || true
+    rate_sum=$(( rate_sum + ${rate:-0} ))
+  done
+  echo ""
+
+  CAPTURED_RATE=$(( rate_sum / RUNS ))
+  CAPTURED_CPU=$(( ($(cpu_ticks "$server_pid") - cpu_before) * 1000 / CLK_TCK ))
+  CAPTURED_RSS=$(rss_kb "$server_pid")
+  CAPTURED_CTX=$(( $(ctx_switches "$server_pid") - ctx_before ))
+}
+
+# Multi-node binary fan-out: pub on pub_bin_addr, one sub on each addr in sub_bin_addrs.
+# Runs N sub-only bench instances in background, then pub-only in foreground.
+# Usage: run_binary_multinode_fanout_capture LABEL PUB_BIN_ADDR SERVER_PID SUB_BIN_ADDR...
+run_binary_multinode_fanout_capture() {
+  local label="$1" pub_bin_addr="$2" server_pid="$3"
+  shift 3
+  local sub_bin_addrs=("$@")
+  local cpu_before ctx_before rate_sum=0
+
+  cpu_before=$(cpu_ticks "$server_pid")
+  ctx_before=$(ctx_switches "$server_pid")
+
+  echo "--- $label ---"
+  for i in $(seq 1 "$RUNS"); do
+    local s=1
+    for sub_addr in "${sub_bin_addrs[@]}"; do
+      "$BENCH_BIN" --addr "$sub_addr" --pub 0 --sub 1 \
+        --size "$SIZE" --duration "$BIN_DURATION" \
+        >"/tmp/bench_bin_mn_sub_${s}.out" 2>&1 &
+      BG_PIDS+=($!)
+      s=$(( s + 1 ))
+    done
+    sleep 0.3  # let subscribers connect and register
+
+    local output
+    output=$("$BENCH_BIN" --addr "$pub_bin_addr" --pub 1 --sub 0 \
+      --size "$SIZE" --duration "$BIN_DURATION" 2>&1) || true
+    echo "$output" | grep -E "^Pub:|^Elapsed:" || true
+
+    for pid in "${BG_PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+    # Measure delivered rate: average sub rate across all subscriber processes.
+    local sub_rate_sum=0 sr
+    s=1
+    for sub_addr in "${sub_bin_addrs[@]}"; do
+      sr=$(extract_binary_rate "$(cat "/tmp/bench_bin_mn_sub_${s}.out" 2>/dev/null)" "Sub") || true
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
+      grep -E "^Sub:|^Elapsed:" "/tmp/bench_bin_mn_sub_${s}.out" 2>/dev/null \
+        | sed "s/^/  sub[$s] /" || true
+      rm -f "/tmp/bench_bin_mn_sub_${s}.out" || true
+      s=$(( s + 1 ))
+    done
+    rate_sum=$(( rate_sum + sub_rate_sum / ${#sub_bin_addrs[@]} ))
     BG_PIDS=()
   done
   echo ""
@@ -499,16 +665,16 @@ record_summary() {
 # ──────────────────────────────────────────────────────────────────────
 echo "================================================================"
 echo "  1. PUBLISH ONLY (fire-and-forget, no subscribers)"
-echo "     ${MSGS} msgs × ${SIZE}B"
+echo "     Go: ${MSGS} msgs × ${SIZE}B  |  Rust: ${BIN_DURATION}s × ${SIZE}B"
 echo "================================================================"
 echo ""
 if [[ "$MODE" == "full" ]]; then
   run_pub_only "Direct Hub" "nats://127.0.0.1:$HUB_CLIENT_PORT"
 fi
-run_pub_only_capture "Go+Go Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" "$GO_LEAF_PID"
+run_pub_only_capture "Go+NATS" "nats://127.0.0.1:$GO_LEAF_PORT" "$GO_LEAF_PID"
 go_pub_rate=$CAPTURED_RATE go_pub_cpu=$CAPTURED_CPU go_pub_rss=$CAPTURED_RSS go_pub_ctx=$CAPTURED_CTX
 
-run_pub_only_capture "Rust+Rust Leaf" "nats://127.0.0.1:$RUST_LEAF2_PORT" "$RUST_LEAF2_PID"
+run_binary_pub_only "Rust+Binary" "127.0.0.1:$RUST_LEAF2_BIN_PORT" "$RUST_LEAF2_PID"
 rust_pub_rate=$CAPTURED_RATE rust_pub_cpu=$CAPTURED_CPU rust_pub_rss=$CAPTURED_RSS rust_pub_ctx=$CAPTURED_CTX
 
 record_summary "Pub only" \
@@ -522,16 +688,16 @@ record_summary "Pub only" \
 # ──────────────────────────────────────────────────────────────────────
 echo "================================================================"
 echo "  2. LOCAL PUB/SUB (1 pub + 1 sub, same server)"
-echo "     ${MSGS} msgs × ${SIZE}B"
+echo "     Go: ${MSGS} msgs × ${SIZE}B  |  Rust: ${BIN_DURATION}s × ${SIZE}B"
 echo "================================================================"
 echo ""
 if [[ "$MODE" == "full" ]]; then
   run_url_pubsub "Direct Hub" "nats://127.0.0.1:$HUB_CLIENT_PORT" 1
 fi
-run_url_pubsub_capture "Go+Go Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" 1 "$GO_LEAF_PID"
+run_url_pubsub_capture "Go+NATS" "nats://127.0.0.1:$GO_LEAF_PORT" 1 "$GO_LEAF_PID"
 go_ps_rate=$CAPTURED_RATE go_ps_cpu=$CAPTURED_CPU go_ps_rss=$CAPTURED_RSS go_ps_ctx=$CAPTURED_CTX
 
-run_url_pubsub_capture "Rust+Rust Leaf" "nats://127.0.0.1:$RUST_LEAF2_PORT" 1 "$RUST_LEAF2_PID"
+run_binary_pubsub "Rust+Binary" "127.0.0.1:$RUST_LEAF2_BIN_PORT" 1 "$RUST_LEAF2_PID"
 rust_ps_rate=$CAPTURED_RATE rust_ps_cpu=$CAPTURED_CPU rust_ps_rss=$CAPTURED_RSS rust_ps_ctx=$CAPTURED_CTX
 
 record_summary "Pub/sub" \
@@ -545,16 +711,16 @@ record_summary "Pub/sub" \
 # ──────────────────────────────────────────────────────────────────────
 echo "================================================================"
 echo "  3. FAN-OUT (1 pub + 5 subs, same server)"
-echo "     ${MSGS} msgs × ${SIZE}B"
+echo "     Go: ${MSGS} msgs × ${SIZE}B  |  Rust: ${BIN_DURATION}s × ${SIZE}B"
 echo "================================================================"
 echo ""
 if [[ "$MODE" == "full" ]]; then
   run_url_pubsub "Direct Hub" "nats://127.0.0.1:$HUB_CLIENT_PORT" 5
 fi
-run_url_pubsub_capture "Go+Go Leaf" "nats://127.0.0.1:$GO_LEAF_PORT" 5 "$GO_LEAF_PID"
+run_url_pubsub_capture "Go+NATS" "nats://127.0.0.1:$GO_LEAF_PORT" 5 "$GO_LEAF_PID"
 go_fan_rate=$CAPTURED_RATE go_fan_cpu=$CAPTURED_CPU go_fan_rss=$CAPTURED_RSS go_fan_ctx=$CAPTURED_CTX
 
-run_url_pubsub_capture "Rust+Rust Leaf" "nats://127.0.0.1:$RUST_LEAF2_PORT" 5 "$RUST_LEAF2_PID"
+run_binary_pubsub "Rust+Binary" "127.0.0.1:$RUST_LEAF2_BIN_PORT" 5 "$RUST_LEAF2_PID"
 rust_fan_rate=$CAPTURED_RATE rust_fan_cpu=$CAPTURED_CPU rust_fan_rss=$CAPTURED_RSS rust_fan_ctx=$CAPTURED_CTX
 
 record_summary "Fan-out x5" \
@@ -571,11 +737,11 @@ echo "  4. LEAF → HUB (pub on leaf, sub on hub)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_cross_pubsub_capture "Go+Go Leaf → Hub" \
+run_cross_pubsub_capture "Go+NATS Leaf → Hub" \
   "nats://127.0.0.1:$GO_LEAF_PORT" "nats://127.0.0.1:$HUB_CLIENT_PORT" "$GO_LEAF_PID"
 go_l2h_rate=$CAPTURED_RATE go_l2h_cpu=$CAPTURED_CPU go_l2h_rss=$CAPTURED_RSS go_l2h_ctx=$CAPTURED_CTX
 
-run_cross_pubsub_capture "Rust+Rust Leaf → Hub" \
+run_cross_pubsub_capture "Rust+NATS Leaf → Hub" \
   "nats://127.0.0.1:$RUST_LEAF2_PORT" "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" "$RUST_LEAF2_PID"
 rust_l2h_rate=$CAPTURED_RATE rust_l2h_cpu=$CAPTURED_CPU rust_l2h_rss=$CAPTURED_RSS rust_l2h_ctx=$CAPTURED_CTX
 
@@ -593,11 +759,11 @@ echo "  5. HUB → LEAF (pub on hub, sub on leaf)"
 echo "     ${MSGS} msgs × ${SIZE}B"
 echo "================================================================"
 echo ""
-run_cross_pubsub_capture "Go Hub → Go Leaf" \
+run_cross_pubsub_capture "Go Hub → Go+NATS Leaf" \
   "nats://127.0.0.1:$HUB_CLIENT_PORT" "nats://127.0.0.1:$GO_LEAF_PORT" "$GO_LEAF_PID"
 go_h2l_rate=$CAPTURED_RATE go_h2l_cpu=$CAPTURED_CPU go_h2l_rss=$CAPTURED_RSS go_h2l_ctx=$CAPTURED_CTX
 
-run_cross_pubsub_capture "Rust Hub → Rust Leaf" \
+run_cross_pubsub_capture "Rust Hub → Rust+NATS Leaf" \
   "nats://127.0.0.1:$RUST_HUB_CLIENT_PORT" "nats://127.0.0.1:$RUST_LEAF2_PORT" "$RUST_LEAF2_PID"
 rust_h2l_rate=$CAPTURED_RATE rust_h2l_cpu=$CAPTURED_CPU rust_h2l_rss=$CAPTURED_RSS rust_h2l_ctx=$CAPTURED_CTX
 
@@ -710,14 +876,17 @@ if [[ "$MODE" == "full" ]]; then
   PIDS+=($!)
   sleep 2
 
-  echo "Starting 3-node Rust cluster..."
-  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_a.conf" &
+  echo "Starting 3-node Rust cluster (binary ports: A=$RUST_CLUSTER_A_BIN_PORT B=$RUST_CLUSTER_B_BIN_PORT C=$RUST_CLUSTER_C_BIN_PORT)..."
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_a.conf" \
+    --binary-port "$RUST_CLUSTER_A_BIN_PORT" &
   PIDS+=($!); RUST_CLUSTER_A_PID=$!
   sleep 0.5
-  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_b.conf" &
-  PIDS+=($!)
-  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_c.conf" &
-  PIDS+=($!)
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_b.conf" \
+    --binary-port "$RUST_CLUSTER_B_BIN_PORT" &
+  PIDS+=($!); RUST_CLUSTER_B_PID=$!
+  RUST_LOG=warn "$RUST_BIN" -c "$SCRIPT_DIR/configs/bench_rust_cluster_c.conf" \
+    --binary-port "$RUST_CLUSTER_C_BIN_PORT" &
+  PIDS+=($!); RUST_CLUSTER_C_PID=$!
   sleep 2
 
   # Verify cluster connectivity
@@ -727,6 +896,8 @@ if [[ "$MODE" == "full" ]]; then
   nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" >/dev/null 2>&1 || { echo "FAIL: rust cluster A"; exit 1; }
   nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" >/dev/null 2>&1 || { echo "FAIL: rust cluster B"; exit 1; }
   nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_CLUSTER_C_PORT" >/dev/null 2>&1 || { echo "FAIL: rust cluster C"; exit 1; }
+  # Sanity-check binary ports with a 1-msg pub-only run
+  "$BENCH_BIN" --addr "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" --pub 1 --sub 0 --duration 1 >/dev/null 2>&1 || { echo "FAIL: rust cluster A binary port"; exit 1; }
   echo "All cluster nodes responding."
   echo ""
 
@@ -742,8 +913,8 @@ if [[ "$MODE" == "full" ]]; then
     "nats://127.0.0.1:$GO_CLUSTER_A_PORT" "nats://127.0.0.1:$GO_CLUSTER_B_PORT" "$GO_CLUSTER_A_PID"
   go_cl_ps_rate=$CAPTURED_RATE go_cl_ps_cpu=$CAPTURED_CPU go_cl_ps_rss=$CAPTURED_RSS go_cl_ps_ctx=$CAPTURED_CTX
 
-  run_cross_pubsub_capture "Rust Cluster A→B" \
-    "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" "$RUST_CLUSTER_A_PID"
+  run_binary_cross_pubsub_capture "Rust+Binary Cluster A→B" \
+    "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" "127.0.0.1:$RUST_CLUSTER_B_BIN_PORT" "$RUST_CLUSTER_A_PID"
   rust_cl_ps_rate=$CAPTURED_RATE rust_cl_ps_cpu=$CAPTURED_CPU rust_cl_ps_rss=$CAPTURED_RSS rust_cl_ps_ctx=$CAPTURED_CTX
 
   record_summary "Cluster A→B" \
@@ -781,14 +952,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across all 3 nodes.
+    sub_rate_sum=0
     for s in 1 2 3; do
+      sr=$(extract_rate < "/tmp/bench_cl_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 3 ))
     BG_PIDS=()
   done
   echo ""
@@ -797,41 +971,13 @@ if [[ "$MODE" == "full" ]]; then
   go_cl_fan_rss=$(rss_kb "$GO_CLUSTER_A_PID")
   go_cl_fan_ctx=$(( $(ctx_switches "$GO_CLUSTER_A_PID") - ctx_before ))
 
-  # Rust cluster fan-out x3
-  echo "--- Rust Cluster fan-out x3 ---"
-  cpu_before=$(cpu_ticks "$RUST_CLUSTER_A_PID")
-  ctx_before=$(ctx_switches "$RUST_CLUSTER_A_PID")
-  rate_sum=0
-  for i in $(seq 1 "$RUNS"); do
-    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" >"/tmp/bench_cl_sub_1.out" 2>&1 &
-    BG_PIDS+=($!)
-    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" >"/tmp/bench_cl_sub_2.out" 2>&1 &
-    BG_PIDS+=($!)
-    nats bench sub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$RUST_CLUSTER_C_PORT" >"/tmp/bench_cl_sub_3.out" 2>&1 &
-    BG_PIDS+=($!)
-    sleep 0.5
-
-    output=$(nats bench pub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" 2>&1)
-    echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
-
-    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
-    for s in 1 2 3; do
-      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
-      rm -f "/tmp/bench_cl_sub_${s}.out"
-    done
-    BG_PIDS=()
-  done
-  echo ""
-  rust_cl_fan_rate=$(( rate_sum / RUNS ))
-  rust_cl_fan_cpu=$(( ($(cpu_ticks "$RUST_CLUSTER_A_PID") - cpu_before) * 1000 / CLK_TCK ))
-  rust_cl_fan_rss=$(rss_kb "$RUST_CLUSTER_A_PID")
-  rust_cl_fan_ctx=$(( $(ctx_switches "$RUST_CLUSTER_A_PID") - ctx_before ))
+  # Rust cluster fan-out x3 (binary: pub on A, subs on A, B, C)
+  run_binary_multinode_fanout_capture "Rust+Binary Cluster fan-out x3" \
+    "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" "$RUST_CLUSTER_A_PID" \
+    "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" \
+    "127.0.0.1:$RUST_CLUSTER_B_BIN_PORT" \
+    "127.0.0.1:$RUST_CLUSTER_C_BIN_PORT"
+  rust_cl_fan_rate=$CAPTURED_RATE rust_cl_fan_cpu=$CAPTURED_CPU rust_cl_fan_rss=$CAPTURED_RSS rust_cl_fan_ctx=$CAPTURED_CTX
 
   record_summary "Cluster fan x3" \
     "$rust_cl_fan_rate" "$go_cl_fan_rate" \
@@ -865,14 +1011,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across nodes B and C.
+    sub_rate_sum=0
     for s in 1 2; do
+      sr=$(extract_rate < "/tmp/bench_cl_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 2 ))
     BG_PIDS=()
   done
   echo ""
@@ -881,38 +1030,12 @@ if [[ "$MODE" == "full" ]]; then
   go_cl_rem_rss=$(rss_kb "$GO_CLUSTER_A_PID")
   go_cl_rem_ctx=$(( $(ctx_switches "$GO_CLUSTER_A_PID") - ctx_before ))
 
-  # Rust cluster remote-only
-  echo "--- Rust Cluster remote B+C ---"
-  cpu_before=$(cpu_ticks "$RUST_CLUSTER_A_PID")
-  ctx_before=$(ctx_switches "$RUST_CLUSTER_A_PID")
-  rate_sum=0
-  for i in $(seq 1 "$RUNS"); do
-    nats bench sub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$RUST_CLUSTER_B_PORT" >"/tmp/bench_cl_sub_1.out" 2>&1 &
-    BG_PIDS+=($!)
-    nats bench sub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$RUST_CLUSTER_C_PORT" >"/tmp/bench_cl_sub_2.out" 2>&1 &
-    BG_PIDS+=($!)
-    sleep 0.5
-
-    output=$(nats bench pub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
-      -s "nats://127.0.0.1:$RUST_CLUSTER_A_PORT" 2>&1)
-    echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
-
-    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
-    for s in 1 2; do
-      grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
-      rm -f "/tmp/bench_cl_sub_${s}.out"
-    done
-    BG_PIDS=()
-  done
-  echo ""
-  rust_cl_rem_rate=$(( rate_sum / RUNS ))
-  rust_cl_rem_cpu=$(( ($(cpu_ticks "$RUST_CLUSTER_A_PID") - cpu_before) * 1000 / CLK_TCK ))
-  rust_cl_rem_rss=$(rss_kb "$RUST_CLUSTER_A_PID")
-  rust_cl_rem_ctx=$(( $(ctx_switches "$RUST_CLUSTER_A_PID") - ctx_before ))
+  # Rust cluster remote-only (binary: pub on A, subs on B and C)
+  run_binary_multinode_fanout_capture "Rust+Binary Cluster remote B+C" \
+    "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" "$RUST_CLUSTER_A_PID" \
+    "127.0.0.1:$RUST_CLUSTER_B_BIN_PORT" \
+    "127.0.0.1:$RUST_CLUSTER_C_BIN_PORT"
+  rust_cl_rem_rate=$CAPTURED_RATE rust_cl_rem_cpu=$CAPTURED_CPU rust_cl_rem_rss=$CAPTURED_RSS rust_cl_rem_ctx=$CAPTURED_CTX
 
   record_summary "Cluster B+C" \
     "$rust_cl_rem_rate" "$go_cl_rem_rate" \
@@ -940,10 +1063,10 @@ if [[ "$MODE" == "full" ]]; then
   sleep 2
 
   # Verify gateway connectivity
-  nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_GW_A_PORT"   >/dev/null 2>&1 || { echo "FAIL: go gateway A"; exit 1; }
-  nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_GW_B_PORT"   >/dev/null 2>&1 || { echo "FAIL: go gateway B"; exit 1; }
-  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_GW_A_PORT" >/dev/null 2>&1 || { echo "FAIL: rust gateway A"; exit 1; }
-  nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_GW_B_PORT" >/dev/null 2>&1 || { echo "FAIL: rust gateway B"; exit 1; }
+  timeout 5 nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_GW_A_PORT"   >/dev/null 2>&1 || { echo "FAIL: go gateway A (port $GO_GW_A_PORT)"; exit 1; }
+  timeout 5 nats pub _bench.ping pong -s "nats://127.0.0.1:$GO_GW_B_PORT"   >/dev/null 2>&1 || { echo "FAIL: go gateway B (port $GO_GW_B_PORT)"; exit 1; }
+  timeout 5 nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_GW_A_PORT" >/dev/null 2>&1 || { echo "FAIL: rust gateway A (port $RUST_GW_A_PORT)"; exit 1; }
+  timeout 5 nats pub _bench.ping pong -s "nats://127.0.0.1:$RUST_GW_B_PORT" >/dev/null 2>&1 || { echo "FAIL: rust gateway B (port $RUST_GW_B_PORT)"; exit 1; }
   echo "All gateway nodes responding."
   echo ""
 
@@ -995,14 +1118,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_GW_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across both gateway nodes.
+    sub_rate_sum=0
     for s in 1 2; do
+      sr=$(extract_rate < "/tmp/bench_gw_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_gw_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_gw_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 2 ))
     BG_PIDS=()
   done
   echo ""
@@ -1028,14 +1154,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$RUST_GW_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across both gateway nodes.
+    sub_rate_sum=0
     for s in 1 2; do
+      sr=$(extract_rate < "/tmp/bench_gw_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_gw_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_gw_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 2 ))
     BG_PIDS=()
   done
   echo ""
@@ -1125,12 +1254,15 @@ fi
 echo ""
 echo "================================================================"
 echo "  SUMMARY ($MODE mode)"
-echo "  msgs=$MSGS  size=${SIZE}B  runs=$RUNS"
+echo "  msgs=$MSGS  size=${SIZE}B  runs=$RUNS  bin_duration=${BIN_DURATION}s"
+echo "  Scenarios 1-3, 14-16: Go+NATS text vs open-wire+Binary protocol"
+echo "  Scenarios 4-5: Go+NATS text vs open-wire+NATS text (cross-server leaf)"
+echo "  Rate = subscriber-side msgs/sec (delivered); pub-only scenario uses pub rate"
 echo "================================================================"
 echo ""
 
 # Throughput table
-printf "  %-16s %14s %14s %8s\n" "Scenario" "Rust+Rust" "Go+Go" "Ratio"
+printf "  %-16s %14s %14s %8s\n" "Scenario" "Rust+Binary" "Go+NATS" "Ratio"
 echo "  ─────────────────────────────────────────────────────────────"
 for i in "${!SUMMARY_LABELS[@]}"; do
   local_rust="${SUMMARY_RUST_RATES[$i]}"

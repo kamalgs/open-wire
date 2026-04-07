@@ -13,7 +13,7 @@ use std::ops::{Deref, DerefMut};
 use std::os::fd::RawFd;
 use std::time::Duration;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 
 #[cfg(test)]
 use crate::nats_proto::{self, MsgBuilder};
@@ -44,6 +44,10 @@ pub(crate) struct BufConfig {
     /// Maximum pending write bytes per connection before disconnecting as slow consumer.
     /// 0 means unlimited.
     pub max_pending: usize,
+    /// Maximum pending write bytes for route connections before disconnecting.
+    /// Routes aggregate traffic from many publishers and need more headroom than
+    /// individual client connections.
+    pub max_pending_route: usize,
 }
 
 impl Default for BufConfig {
@@ -52,6 +56,7 @@ impl Default for BufConfig {
             max_read_buf: DEFAULT_MAX_BUF,
             write_buf: DEFAULT_MAX_BUF,
             max_pending: 64 * 1024 * 1024,
+            max_pending_route: 128 * 1024 * 1024,
         }
     }
 }
@@ -59,11 +64,22 @@ impl Default for BufConfig {
 /// A read buffer that starts small and grows/shrinks based on utilization,
 /// matching Go's nats-server strategy: start at 512B, double on full reads,
 /// halve after 2 consecutive short reads, floor at 64B, ceiling at max.
+///
+/// Also maintains an incremental newline-scan cursor so that repeated calls
+/// to [`find_newline`](AdaptiveBuf::find_newline) never rescan bytes that
+/// have already been checked in a previous incomplete-parse attempt.
 pub(crate) struct AdaptiveBuf {
     buf: BytesMut,
     target_cap: usize,
     max_cap: usize,
     shorts: u8,
+    /// Cached index of the next `\n` in `buf`. `None` means not yet located.
+    /// Preserved across parse calls so a partial-payload retry skips the scan.
+    next_nl: Option<usize>,
+    /// First byte position not yet scanned for `\n`.
+    /// Advances to `buf.len()` when the scan comes up empty, then on the next
+    /// `find_newline` call only the newly-arrived bytes are searched.
+    scan_start: usize,
 }
 
 impl AdaptiveBuf {
@@ -74,7 +90,95 @@ impl AdaptiveBuf {
             target_cap: start,
             max_cap,
             shorts: 0,
+            next_nl: None,
+            scan_start: 0,
         }
+    }
+
+    /// Construct from an existing `BytesMut` (e.g. for compatibility wrappers).
+    /// The cursor starts clean — no previously-known newline position.
+    pub(crate) fn from_bytes_mut(buf: BytesMut) -> Self {
+        let cap = buf.capacity();
+        Self {
+            target_cap: DEFAULT_START_BUF.min(cap),
+            max_cap: cap.max(DEFAULT_MAX_BUF),
+            shorts: 0,
+            buf,
+            next_nl: None,
+            scan_start: 0,
+        }
+    }
+
+    /// Unwrap into the inner `BytesMut`, discarding cursor state.
+    pub(crate) fn into_inner(self) -> BytesMut {
+        self.buf
+    }
+
+    /// Return a mutable reference to the inner `BytesMut`, resetting the newline cursor.
+    ///
+    /// Use only for binary protocol parsing which bypasses the newline-cursor state.
+    /// Calling this resets `next_nl` and `scan_start` so that subsequent text-protocol
+    /// parse calls rescan from the beginning.
+    pub(crate) fn bytes_mut(&mut self) -> &mut BytesMut {
+        self.next_nl = None;
+        self.scan_start = 0;
+        &mut self.buf
+    }
+
+    /// Find the next `\n` in the buffer, scanning only bytes that have not
+    /// been examined since the last successful consume.
+    ///
+    /// The result is cached: if the caller returns `Ok(None)` (waiting for
+    /// more payload) without consuming bytes, the next call returns immediately
+    /// without rescanning the header line.
+    #[inline]
+    pub(crate) fn find_newline(&mut self) -> Option<usize> {
+        if let Some(pos) = self.next_nl {
+            return Some(pos);
+        }
+        // Clamp in case a DerefMut path (e.g. buf.clear()) reset the buffer
+        // length without going through our cursor-aware methods.
+        let start = self.scan_start.min(self.buf.len());
+        match memchr::memchr(b'\n', &self.buf[start..]) {
+            Some(rel) => {
+                let pos = start + rel;
+                self.next_nl = Some(pos);
+                Some(pos)
+            }
+            None => {
+                self.scan_start = self.buf.len();
+                None
+            }
+        }
+    }
+
+    /// Consume `n` bytes from the front, keeping the cursor in sync.
+    #[inline]
+    pub(crate) fn consume(&mut self, n: usize) {
+        self.buf.advance(n);
+        if let Some(pos) = self.next_nl {
+            self.next_nl = if pos < n { None } else { Some(pos - n) };
+        }
+        self.scan_start = self.scan_start.saturating_sub(n);
+    }
+
+    /// Split off `n` bytes from the front (like `BytesMut::split_to`),
+    /// keeping the cursor in sync.
+    #[inline]
+    pub(crate) fn split_and_consume(&mut self, n: usize) -> BytesMut {
+        let result = self.buf.split_to(n);
+        if let Some(pos) = self.next_nl {
+            self.next_nl = if pos < n { None } else { Some(pos - n) };
+        }
+        self.scan_start = self.scan_start.saturating_sub(n);
+        result
+    }
+
+    /// Clear all bytes and reset the cursor.
+    pub(crate) fn clear(&mut self) {
+        self.buf.clear();
+        self.next_nl = None;
+        self.scan_start = 0;
     }
 
     /// Called after each successful socket read with the number of bytes read.
@@ -111,13 +215,18 @@ impl AdaptiveBuf {
     }
 
     /// Read from a raw fd into the buffer's spare capacity (non-blocking).
-    /// Uses libc::read directly for non-blocking socket I/O.
-    pub(crate) fn read_from_fd(&mut self, fd: RawFd) -> io::Result<usize> {
+    ///
+    /// `max_read` caps the number of bytes read in a single syscall. When
+    /// `usize::MAX`, the full spare capacity is used (no overhead). A smaller
+    /// value lets the kernel TCP receive buffer fill up, triggering TCP flow
+    /// control that naturally throttles the sender.
+    pub(crate) fn read_from_fd(&mut self, fd: RawFd, max_read: usize) -> io::Result<usize> {
         if self.buf.remaining_mut() == 0 {
             self.buf.reserve(self.target_cap.max(DEFAULT_START_BUF));
         }
         let chunk = self.buf.chunk_mut();
-        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
+        let len = chunk.len().min(max_read);
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, len) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -287,7 +396,7 @@ impl ServerConn {
     pub(crate) fn read_next_non_pub(&mut self) -> io::Result<Option<ClientOp>> {
         loop {
             loop {
-                match nats_proto::try_skip_or_parse_client_op(&mut self.read_buf)? {
+                match nats_proto::try_skip_or_parse_client_op_cursor(&mut self.read_buf)? {
                     Some(ClientOp::Pong) => continue, // skipped PUB/HPUB
                     Some(op) => return Ok(Some(op)),
                     None => break, // need more data
@@ -306,7 +415,7 @@ impl ServerConn {
     }
 
     pub(crate) fn try_parse_client_op(&mut self) -> io::Result<Option<ClientOp>> {
-        let result = nats_proto::try_parse_client_op(&mut self.read_buf);
+        let result = nats_proto::try_parse_client_op_cursor(&mut self.read_buf);
         self.read_buf.try_shrink();
         result
     }
@@ -314,7 +423,7 @@ impl ServerConn {
     /// Parse the next op, but skip PUB/HPUB without creating Bytes objects.
     /// Used when there are no subscribers and no upstream to save CPU.
     pub(crate) fn try_skip_or_parse_client_op(&mut self) -> io::Result<Option<ClientOp>> {
-        let result = nats_proto::try_skip_or_parse_client_op(&mut self.read_buf);
+        let result = nats_proto::try_skip_or_parse_client_op_cursor(&mut self.read_buf);
         self.read_buf.try_shrink();
         result
     }

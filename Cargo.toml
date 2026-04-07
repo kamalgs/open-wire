@@ -18,6 +18,7 @@ mesh = []      # Full mesh route clustering support
 gateway = []   # Gateway inter-cluster traffic support
 worker-affinity = []  # Subject-based worker affinity tracking
 accounts = []  # Multi-tenant per-account subject isolation
+binary-client = []    # Binary-protocol client port + bench tool
 
 [dependencies]
 bytes = "1.4.0"
@@ -44,6 +45,10 @@ async-nats = { version = "0.46", default-features = false }
 criterion = "0.5"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
 
 [[bench]]
 name = "throughput"

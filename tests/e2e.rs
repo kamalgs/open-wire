@@ -10,8 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+#[cfg(feature = "mesh")]
+use open_wire::ClusterConfig;
 #[cfg(feature = "gateway")]
 use open_wire::GatewayRemote;
+#[cfg(feature = "leaf")]
+use open_wire::HubConfig;
+#[cfg(feature = "hub")]
+use open_wire::InboundLeafConfig;
 use open_wire::{Server, ServerConfig};
 use tokio::time::timeout;
 
@@ -73,6 +79,32 @@ impl NatsServer {
         server
     }
 
+    /// Start a nats-server with both a client port and a leafnode listener port.
+    fn start_with_leafnode(client_port: u16, leafnode_port: u16) -> Self {
+        let bin = nats_server_bin();
+        let config_path = format!("/tmp/nats_hub_test_{}.conf", client_port);
+        std::fs::write(
+            &config_path,
+            format!(
+                "listen: 127.0.0.1:{client_port}\n\
+                 leafnodes {{\n  listen: 127.0.0.1:{leafnode_port}\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let child = Command::new(&bin)
+            .args(["-c", &config_path])
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to start nats-server at {}: {}", bin, e));
+
+        let server = NatsServer {
+            child,
+            port: client_port,
+        };
+        server.wait_ready();
+        server
+    }
+
     /// Poll until the server accepts a TCP connection (up to 5s).
     fn wait_ready(&self) {
         let addr = format!("127.0.0.1:{}", self.port);
@@ -104,8 +136,11 @@ fn spawn_leaf(port: u16, hub_url: Option<String>) -> Arc<AtomicBool> {
     let config = ServerConfig {
         host: "127.0.0.1".to_string(),
         port,
-        hub_url,
         server_name: format!("test-leaf-{}", port),
+        hub: HubConfig {
+            url: hub_url,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let server = Server::new(config);
@@ -171,15 +206,16 @@ async fn local_pub_sub() {
 #[tokio::test]
 #[cfg(feature = "leaf")]
 async fn upstream_forward() {
-    // Start upstream nats-server
-    let upstream_port = free_port();
-    let _upstream = NatsServer::start(upstream_port);
+    // Start upstream nats-server with a leafnode listener
+    let upstream_client_port = free_port();
+    let upstream_leaf_port = free_port();
+    let _upstream = NatsServer::start_with_leafnode(upstream_client_port, upstream_leaf_port);
 
-    // Start leaf pointing at upstream
+    // Start leaf pointing at upstream's leafnode port
     let leaf_port = free_port();
     let shutdown_tx = spawn_leaf(
         leaf_port,
-        Some(format!("nats://127.0.0.1:{}", upstream_port)),
+        Some(format!("nats://127.0.0.1:{}", upstream_leaf_port)),
     );
     wait_for_leaf(leaf_port).await;
 
@@ -188,7 +224,7 @@ async fn upstream_forward() {
         .await
         .expect("failed to connect to leaf");
 
-    let upstream_client = async_nats::connect(format!("127.0.0.1:{}", upstream_port))
+    let upstream_client = async_nats::connect(format!("127.0.0.1:{}", upstream_client_port))
         .await
         .expect("failed to connect to upstream");
 
@@ -223,15 +259,16 @@ async fn upstream_forward() {
 #[tokio::test]
 #[cfg(feature = "leaf")]
 async fn leaf_to_upstream() {
-    // Start upstream nats-server
-    let upstream_port = free_port();
-    let _upstream = NatsServer::start(upstream_port);
+    // Start upstream nats-server with a leafnode listener
+    let upstream_client_port = free_port();
+    let upstream_leaf_port = free_port();
+    let _upstream = NatsServer::start_with_leafnode(upstream_client_port, upstream_leaf_port);
 
-    // Start leaf pointing at upstream
+    // Start leaf pointing at upstream's leafnode port
     let leaf_port = free_port();
     let shutdown_tx = spawn_leaf(
         leaf_port,
-        Some(format!("nats://127.0.0.1:{}", upstream_port)),
+        Some(format!("nats://127.0.0.1:{}", upstream_leaf_port)),
     );
     wait_for_leaf(leaf_port).await;
 
@@ -240,7 +277,7 @@ async fn leaf_to_upstream() {
         .await
         .expect("failed to connect to leaf");
 
-    let upstream_client = async_nats::connect(format!("127.0.0.1:{}", upstream_port))
+    let upstream_client = async_nats::connect(format!("127.0.0.1:{}", upstream_client_port))
         .await
         .expect("failed to connect to upstream");
 
@@ -526,7 +563,10 @@ fn spawn_hub(client_port: u16, leafnode_port: u16) -> Arc<AtomicBool> {
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: format!("test-hub-{}", client_port),
-        leafnode_port: Some(leafnode_port),
+        leafnodes: InboundLeafConfig {
+            port: Some(leafnode_port),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let server = Server::new(config);
@@ -885,9 +925,11 @@ fn spawn_cluster_node(
         host: "127.0.0.1".to_string(),
         port: client_port,
         server_name: name.to_string(),
-        cluster_port: Some(cluster_port),
-        cluster_seeds: seeds,
-        cluster_name: Some("test-cluster".to_string()),
+        cluster: ClusterConfig {
+            port: Some(cluster_port),
+            seeds,
+            name: Some("test-cluster".to_string()),
+        },
         ..Default::default()
     };
     let server = Server::new(config);

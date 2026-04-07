@@ -527,13 +527,11 @@ fn handle_hub_op(
             headers,
             payload,
         } => {
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let msg = Msg::new(
-                &subject,
-                subject_str,
-                reply.as_deref(),
+                subject.clone(),
+                reply.clone(),
                 headers.as_ref(),
-                &payload,
+                payload.clone(),
             );
             let (_delivered, expired) = deliver_to_subs_upstream(
                 state,

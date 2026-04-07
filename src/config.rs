@@ -66,6 +66,10 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
     if let Some(v) = args.opt_value_from_str("--ws-port")? {
         config.ws_port = Some(v);
     }
+    #[cfg(feature = "binary-client")]
+    if let Some(v) = args.opt_value_from_str("--binary-port")? {
+        config.binary_port = Some(v);
+    }
     if let Some(v) = args.opt_value_from_str("--read-buf-max")? {
         config.max_read_buf_capacity = v;
     }
@@ -986,6 +990,26 @@ fn build_config(root: &Value) -> Result<ServerConfig, ConfigError> {
             // --- accounts block ---
             #[cfg(feature = "accounts")]
             "accounts" => apply_accounts(&mut config, value)?,
+
+            // --- binary client block ---
+            #[cfg(feature = "binary-client")]
+            "binary" => {
+                if let Some(entries) = value.as_map() {
+                    for (bkey, bval) in entries {
+                        match bkey.as_str() {
+                            "listen" => {
+                                let s = as_string(bval)?;
+                                let (_, port) = parse_listen(&s)?;
+                                if let Some(p) = port {
+                                    config.binary_port = Some(p);
+                                }
+                            }
+                            "port" => config.binary_port = Some(as_u16(bval)?),
+                            _ => tracing::debug!("ignoring binary key: {bkey}"),
+                        }
+                    }
+                }
+            }
 
             // --- websocket block ---
             "websocket" => {

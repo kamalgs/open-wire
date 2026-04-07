@@ -46,6 +46,9 @@ pub struct ServerInfo {
     pub lame_duck_mode: bool,
     #[serde(default)]
     pub jetstream: bool,
+    /// Signals support for open-wire binary inter-node protocol.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_wire: Option<u8>,
     /// Advertised leafnode URLs (present in INFO sent on leafnode listener).
     #[cfg(feature = "hub")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +106,9 @@ pub struct ConnectInfo {
     /// Gateway name sent by gateway peer in CONNECT.
     #[serde(default)]
     pub gateway: Option<String>,
+    /// Signals support for open-wire binary inter-node protocol.
+    #[serde(default)]
+    pub open_wire: Option<u8>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────

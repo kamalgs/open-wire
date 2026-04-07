@@ -115,38 +115,22 @@ pub(crate) fn propagate_route_interest(
     if writers.is_empty() {
         return;
     }
-    let mut builder = nats_proto::MsgBuilder::new();
-    let data = if is_sub {
-        if let Some(q) = queue {
-            builder.build_route_sub_queue(
-                subject,
-                q,
-                #[cfg(feature = "accounts")]
-                account,
-            )
-        } else {
-            builder.build_route_sub(
-                subject,
-                #[cfg(feature = "accounts")]
-                account,
-            )
-        }
-    } else if let Some(q) = queue {
-        builder.build_route_unsub_queue(
-            subject,
-            q,
-            #[cfg(feature = "accounts")]
-            account,
-        )
-    } else {
-        builder.build_route_unsub(
-            subject,
-            #[cfg(feature = "accounts")]
-            account,
-        )
-    };
     for writer in writers.values() {
-        writer.write_raw(data);
+        if is_sub {
+            writer.write_route_sub(
+                subject,
+                queue,
+                #[cfg(feature = "accounts")]
+                account,
+            );
+        } else {
+            writer.write_route_unsub(
+                subject,
+                queue,
+                #[cfg(feature = "accounts")]
+                account,
+            );
+        }
         writer.notify();
     }
 }
@@ -158,8 +142,6 @@ pub(crate) fn propagate_route_interest(
 /// `send_existing_subs_to_gateway`.
 #[cfg(any(feature = "mesh", feature = "gateway"))]
 pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) {
-    let mut builder = nats_proto::MsgBuilder::new();
-
     #[cfg(feature = "accounts")]
     {
         for (idx, account_sub) in state.account_subs.iter().enumerate() {
@@ -168,21 +150,7 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
                 .as_bytes();
             let subs = account_sub.read().unwrap();
             for (subject, queue) in subs.local_interests() {
-                let data = if let Some(q) = queue {
-                    builder.build_route_sub_queue(
-                        subject.as_bytes(),
-                        q.as_bytes(),
-                        #[cfg(feature = "accounts")]
-                        acct,
-                    )
-                } else {
-                    builder.build_route_sub(
-                        subject.as_bytes(),
-                        #[cfg(feature = "accounts")]
-                        acct,
-                    )
-                };
-                writer.write_raw(data);
+                writer.write_route_sub(subject.as_bytes(), queue.map(|q| q.as_bytes()), acct);
             }
         }
     }
@@ -190,12 +158,7 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
     {
         let subs = state.subs.read().unwrap();
         for (subject, queue) in subs.local_interests() {
-            let data = if let Some(q) = queue {
-                builder.build_route_sub_queue(subject.as_bytes(), q.as_bytes())
-            } else {
-                builder.build_route_sub(subject.as_bytes())
-            };
-            writer.write_raw(data);
+            writer.write_route_sub(subject.as_bytes(), queue.map(|q| q.as_bytes()));
         }
     }
     writer.notify();

@@ -164,6 +164,8 @@ impl RouteHandler {
             is_route: true,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id,
             #[cfg(feature = "hub")]
@@ -286,13 +288,11 @@ impl RouteHandler {
         *wctx.msgs_received += 1;
         *wctx.msgs_received_bytes += payload_len;
 
-        let subject_str = bytes_to_str(&subject);
         let msg = Msg::new(
-            &subject,
-            subject_str,
-            reply.as_deref(),
+            subject.clone(),
+            reply.clone(),
             headers.as_ref(),
-            &payload,
+            payload.clone(),
         );
         // One-hop rule: skip_routes = true — messages from routes are never re-forwarded
         // to other routes. Only deliver to local client subs and leaf subs.

@@ -24,6 +24,8 @@ use std::io;
 use crate::types::ServerInfo;
 use crate::types::{ConnectInfo, HeaderMap};
 
+use crate::buf::AdaptiveBuf;
+
 macro_rules! int_to_buf {
     ($name:ident, $ty:ty) => {
         #[inline]
@@ -218,7 +220,41 @@ impl Default for MsgBuilder {
 ///
 /// Returns `Ok(Some(op))` if a complete operation was parsed (bytes consumed),
 /// `Ok(None)` if more data is needed, or `Err` on protocol error.
+///
+/// Compatibility shim for tests and trait impls. Production code calls
+/// [`try_parse_client_op_cursor`] directly for incremental scanning.
 pub fn try_parse_client_op(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
+    let owned = std::mem::take(buf);
+    let mut abuf = AdaptiveBuf::from_bytes_mut(owned);
+    let result = try_parse_client_op_cursor(&mut abuf);
+    *buf = abuf.into_inner();
+    result
+}
+
+/// Try to parse the next client operation, but skip PUB/HPUB entirely
+/// (just advance past the bytes without creating any Bytes objects).
+/// Used when there are no subscribers and no upstream — saves ~8% CPU
+/// by avoiding all Bytes refcount bumps + split_to + freeze.
+///
+/// Returns `Ok(Some(op))` for non-publish ops, `Ok(Some(ClientOp::Pong))`
+/// as a sentinel for skipped publishes (caller checks), `Ok(None)` if
+/// more data is needed, or `Err` on protocol error.
+///
+/// Compatibility shim. Production code calls
+/// [`try_skip_or_parse_client_op_cursor`] directly.
+pub fn try_skip_or_parse_client_op(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
+    let owned = std::mem::take(buf);
+    let mut abuf = AdaptiveBuf::from_bytes_mut(owned);
+    let result = try_skip_or_parse_client_op_cursor(&mut abuf);
+    *buf = abuf.into_inner();
+    result
+}
+
+/// Cursor-aware variant of [`try_parse_client_op`].
+///
+/// Uses `AdaptiveBuf`'s incremental newline scanner so that partial-message
+/// retries never rescan bytes that have already been examined.
+pub(crate) fn try_parse_client_op_cursor(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -243,15 +279,10 @@ pub fn try_parse_client_op(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     }
 }
 
-/// Try to parse the next client operation, but skip PUB/HPUB entirely
-/// (just advance past the bytes without creating any Bytes objects).
-/// Used when there are no subscribers and no upstream — saves ~8% CPU
-/// by avoiding all Bytes refcount bumps + split_to + freeze.
-///
-/// Returns `Ok(Some(op))` for non-publish ops, `Ok(Some(ClientOp::Ping))`
-/// as a sentinel for skipped publishes (caller checks), `Ok(None)` if
-/// more data is needed, or `Err` on protocol error.
-pub fn try_skip_or_parse_client_op(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
+/// Cursor-aware variant of [`try_skip_or_parse_client_op`].
+pub(crate) fn try_skip_or_parse_client_op_cursor(
+    buf: &mut AdaptiveBuf,
+) -> io::Result<Option<ClientOp>> {
     if buf.is_empty() {
         return Ok(None);
     }
@@ -277,12 +308,12 @@ pub fn try_skip_or_parse_client_op(buf: &mut BytesMut) -> io::Result<Option<Clie
 }
 
 /// Skip a PUB message without creating any Bytes objects.
-fn skip_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn skip_pub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
-    let line_end = trim_cr(&buf[..], nl);
+    let line_end = trim_cr(buf, nl);
     if line_end < 4 {
         return proto_err(buf, "PUB too short");
     }
@@ -296,17 +327,17 @@ fn skip_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     if buf.len() < total_needed {
         return Ok(None);
     }
-    buf.advance(total_needed);
+    buf.consume(total_needed);
     Ok(Some(ClientOp::Pong))
 }
 
 /// Skip an HPUB message without creating any Bytes objects.
-fn skip_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn skip_hpub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
-    let line_end = trim_cr(&buf[..], nl);
+    let line_end = trim_cr(buf, nl);
     if line_end < 5 {
         return proto_err(buf, "HPUB too short");
     }
@@ -320,17 +351,17 @@ fn skip_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     if buf.len() < total_needed {
         return Ok(None);
     }
-    buf.advance(total_needed);
+    buf.consume(total_needed);
     Ok(Some(ClientOp::Pong))
 }
 
 #[inline]
-fn parse_ping_pong(buf: &mut BytesMut, is_ping: bool) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn parse_ping_pong(buf: &mut AdaptiveBuf, is_ping: bool) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
-    buf.advance(nl + 1);
+    buf.consume(nl + 1);
     Ok(Some(if is_ping {
         ClientOp::Ping
     } else {
@@ -338,8 +369,8 @@ fn parse_ping_pong(buf: &mut BytesMut, is_ping: bool) -> io::Result<Option<Clien
     }))
 }
 
-fn parse_connect(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn parse_connect(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
@@ -351,17 +382,17 @@ fn parse_connect(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     let json = &line[space + 1..trim_cr(line, nl)];
     let info: ConnectInfo =
         serde_json::from_slice(json).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    buf.advance(nl + 1);
+    buf.consume(nl + 1);
     Ok(Some(ClientOp::Connect(info)))
 }
 
-fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn parse_pub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
 
-    let line_end = trim_cr(&buf[..], nl);
+    let line_end = trim_cr(buf, nl);
     if line_end < 4 {
         return proto_err(buf, "PUB too short");
     }
@@ -391,13 +422,13 @@ fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         off..off + r.len()
     });
 
-    let header_line = buf.split_to(nl + 1).freeze();
+    let header_line = buf.split_and_consume(nl + 1).freeze();
     let subject = header_line.slice(subj_off..subj_off + subj_len);
     let size_bytes = header_line.slice(size_off..size_off + size_len);
     let respond = respond_range.map(|r| header_line.slice(r));
 
-    let payload = buf.split_to(payload_len).freeze();
-    buf.advance(2); // trailing \r\n
+    let payload = buf.split_and_consume(payload_len).freeze();
+    buf.consume(2); // trailing \r\n
 
     Ok(Some(ClientOp::Publish {
         subject,
@@ -408,12 +439,12 @@ fn parse_pub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     }))
 }
 
-fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn parse_hpub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
-    let line_end = trim_cr(&buf[..], nl);
+    let line_end = trim_cr(buf, nl);
     if line_end < 5 {
         return proto_err(buf, "HPUB too short");
     }
@@ -449,14 +480,14 @@ fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         off..off + r.len()
     });
 
-    let header_line = buf.split_to(nl + 1).freeze();
+    let header_line = buf.split_and_consume(nl + 1).freeze();
     let subject = header_line.slice(subj_off..subj_off + subj_len);
     let size_bytes = header_line.slice(size_off..size_off + size_len);
     let respond = respond_range.map(|r| header_line.slice(r));
 
-    let hdr_data = buf.split_to(hdr_len);
-    let payload = buf.split_to(total_len - hdr_len).freeze();
-    buf.advance(2);
+    let hdr_data = buf.split_and_consume(hdr_len);
+    let payload = buf.split_and_consume(total_len - hdr_len).freeze();
+    buf.consume(2);
 
     let headers = parse_headers(&hdr_data)?;
 
@@ -469,12 +500,12 @@ fn parse_hpub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     }))
 }
 
-fn parse_sub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn parse_sub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
-    let line_end = trim_cr(&buf[..], nl);
+    let line_end = trim_cr(buf, nl);
     if line_end < 4 {
         return proto_err(buf, "SUB too short");
     }
@@ -488,7 +519,7 @@ fn parse_sub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
             let sid = parse_u64(args[1])?;
             let subj_off = args[0].as_ptr() as usize - buf_ptr;
             let subj_len = args[0].len();
-            let header_line = buf.split_to(nl + 1).freeze();
+            let header_line = buf.split_and_consume(nl + 1).freeze();
             ClientOp::Subscribe {
                 sid,
                 subject: header_line.slice(subj_off..subj_off + subj_len),
@@ -501,7 +532,7 @@ fn parse_sub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
             let subj_len = args[0].len();
             let queue_off = args[1].as_ptr() as usize - buf_ptr;
             let queue_len = args[1].len();
-            let header_line = buf.split_to(nl + 1).freeze();
+            let header_line = buf.split_and_consume(nl + 1).freeze();
             ClientOp::Subscribe {
                 sid,
                 subject: header_line.slice(subj_off..subj_off + subj_len),
@@ -513,12 +544,12 @@ fn parse_sub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
     Ok(Some(op))
 }
 
-fn parse_unsub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
-    let nl = match find_newline(buf) {
+fn parse_unsub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
+    let nl = match buf.find_newline() {
         Some(i) => i,
         None => return Ok(None),
     };
-    let line_end = trim_cr(&buf[..], nl);
+    let line_end = trim_cr(buf, nl);
     if line_end < 6 {
         return proto_err(buf, "UNSUB too short");
     }
@@ -536,7 +567,7 @@ fn parse_unsub(buf: &mut BytesMut) -> io::Result<Option<ClientOp>> {
         },
         _ => return proto_err(buf, "invalid UNSUB arguments"),
     };
-    buf.advance(nl + 1);
+    buf.consume(nl + 1);
     Ok(Some(op))
 }
 
@@ -550,9 +581,9 @@ fn trim_cr(_buf: &[u8], nl_pos: usize) -> usize {
     }
 }
 
-fn proto_err<T>(buf: &mut BytesMut, msg: &str) -> io::Result<T> {
-    if let Some(nl) = find_newline(buf) {
-        buf.advance(nl + 1);
+fn proto_err<T>(buf: &mut AdaptiveBuf, msg: &str) -> io::Result<T> {
+    if let Some(nl) = buf.find_newline() {
+        buf.consume(nl + 1);
     } else {
         buf.clear();
     }
@@ -1342,7 +1373,7 @@ impl MsgBuilder {
     }
 
     /// Build `RMSG $G subject [reply] [hdr_len] total_len\r\npayload\r\n`.
-    #[cfg(any(feature = "mesh", feature = "gateway"))]
+    #[cfg(any(feature = "mesh", feature = "gateway", feature = "binary-client"))]
     pub fn build_rmsg(
         &mut self,
         subject: &[u8],

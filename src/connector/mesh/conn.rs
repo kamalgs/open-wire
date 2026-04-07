@@ -262,6 +262,7 @@ fn connect_route(
     };
 
     let peer_server_id = peer_info.server_id.clone();
+    let use_binary = peer_info.open_wire == Some(1);
     {
         let peers = state.route_peers.lock().unwrap();
         if peers.connected.contains_key(&peer_server_id) {
@@ -321,7 +322,11 @@ fn connect_route(
         peers.connected.insert(peer_server_id.clone(), addr.clone());
     }
 
-    let direct_writer = MsgWriter::new_dummy();
+    let direct_writer = if use_binary {
+        MsgWriter::new_binary_dummy()
+    } else {
+        MsgWriter::new_dummy()
+    };
 
     {
         let mut writers = state.route_writers.write().unwrap();
@@ -337,25 +342,41 @@ fn connect_route(
             )
             .read()
             .unwrap();
-        let mut builder = MsgBuilder::new();
-        for (subject, queue) in subs.local_interests() {
-            let data = if let Some(q) = queue {
-                builder.build_route_sub_queue(
+        if use_binary {
+            // Binary mode: encode initial sub sync as binary Sub frames.
+            let mut bin_buf = BytesMut::new();
+            for (subject, queue) in subs.local_interests() {
+                let queue_slice: &[u8] = queue.map(|q| q.as_bytes()).unwrap_or(b"");
+                crate::protocol::bin_proto::write_sub(
                     subject.as_bytes(),
-                    q.as_bytes(),
-                    #[cfg(feature = "accounts")]
-                    b"$G".as_slice(),
-                )
-            } else {
-                builder.build_route_sub(
-                    subject.as_bytes(),
-                    #[cfg(feature = "accounts")]
-                    b"$G".as_slice(),
-                )
-            };
-            w.write_all(data)?;
+                    queue_slice,
+                    b"$G",
+                    &mut bin_buf,
+                );
+            }
+            drop(subs);
+            w.write_all(&bin_buf)?;
+        } else {
+            let mut builder = MsgBuilder::new();
+            for (subject, queue) in subs.local_interests() {
+                let data = if let Some(q) = queue {
+                    builder.build_route_sub_queue(
+                        subject.as_bytes(),
+                        q.as_bytes(),
+                        #[cfg(feature = "accounts")]
+                        b"$G".as_slice(),
+                    )
+                } else {
+                    builder.build_route_sub(
+                        subject.as_bytes(),
+                        #[cfg(feature = "accounts")]
+                        b"$G".as_slice(),
+                    )
+                };
+                w.write_all(data)?;
+            }
+            drop(subs);
         }
-        drop(subs);
         w.flush()?;
     }
 
@@ -365,14 +386,22 @@ fn connect_route(
     // RMSG/RS+ data to the TCP socket.
     let writer_dw = direct_writer.clone();
     let writer_shutdown = Arc::clone(shutdown);
+    let max_pending_route = state.buf_config.max_pending_route;
     let writer_handle = std::thread::Builder::new()
         .name(format!("route-writer-{}", conn_id))
         .spawn(move || {
-            run_route_writer(tcp_writer, writer_dw, writer_shutdown);
+            run_route_writer(tcp_writer, writer_dw, writer_shutdown, max_pending_route);
         })
         .expect("failed to spawn route writer");
 
-    let result = run_route_reader(&tcp, &mut read_buf, conn_id, state, &direct_writer);
+    let result = run_route_reader(
+        &tcp,
+        &mut read_buf,
+        conn_id,
+        state,
+        &direct_writer,
+        use_binary,
+    );
 
     tcp_shutdown.shutdown(Shutdown::Both).ok();
     let _ = writer_handle.join();
@@ -415,7 +444,22 @@ fn connect_route(
 }
 
 /// Writer thread: waits on MsgWriter's eventfd and flushes buffered data to TCP.
-fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
+///
+/// Sets the route's congestion level after each drain cycle so publishers on
+/// other workers can reduce their read budget (non-blocking backpressure).
+/// A 2-second write deadline matches Go nats-server's default; on timeout
+/// the congestion level is set to maximum but the route is not disconnected
+/// immediately — only when the buffer exceeds `max_pending_route`.
+fn run_route_writer(
+    tcp: TcpStream,
+    dw: MsgWriter,
+    shutdown: Arc<AtomicBool>,
+    max_pending_route: usize,
+) {
+    // 2-second write deadline, matching Go nats-server.
+    tcp.set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok();
+
     let efd = dw.event_raw_fd();
     let mut pfds = [libc::pollfd {
         fd: efd,
@@ -430,6 +474,7 @@ fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
                 let _ = tcp_out.write_all(&data);
                 let _ = tcp_out.flush();
             }
+            dw.set_congestion(0);
             return;
         }
 
@@ -453,14 +498,45 @@ fn run_route_writer(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<AtomicBool>) {
 
         if let Some(data) = dw.drain() {
             if let Err(e) = tcp_out.write_all(&data) {
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
+                    // Write deadline expired — signal heavy congestion but keep trying.
+                    dw.set_congestion(2);
+                    warn!("route writer stalled (write deadline exceeded)");
+                    continue;
+                }
                 debug!(error = %e, "route writer TCP error");
                 return;
             }
             if let Err(e) = tcp_out.flush() {
+                if e.kind() == io::ErrorKind::TimedOut || e.kind() == io::ErrorKind::WouldBlock {
+                    dw.set_congestion(2);
+                    warn!("route writer flush stalled (write deadline exceeded)");
+                    continue;
+                }
                 debug!(error = %e, "route writer flush error");
                 return;
             }
         }
+
+        // Update congestion level based on remaining buffer after flush.
+        let buf_len = dw.buf_len();
+        if buf_len > max_pending_route {
+            warn!(
+                pending_bytes = buf_len,
+                max = max_pending_route,
+                "route writer slow consumer, disconnecting"
+            );
+            return;
+        }
+        let ratio = buf_len as f64 / max_pending_route as f64;
+        let level = if ratio < 0.25 {
+            0
+        } else if ratio < 0.75 {
+            1
+        } else {
+            2
+        };
+        dw.set_congestion(level);
     }
 }
 
@@ -471,6 +547,7 @@ fn run_route_reader(
     conn_id: u64,
     state: &ServerState,
     direct_writer: &MsgWriter,
+    binary: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut dirty_writers: Vec<MsgWriter> = Vec::new();
     let mut route_sid_counter: u64 = 0;
@@ -478,17 +555,32 @@ fn run_route_reader(
     let mut tmp = [0u8; 65536];
 
     loop {
-        while let Some(op) = nats_proto::try_parse_route_op(read_buf)? {
-            handle_route_op(
-                op,
-                conn_id,
-                state,
-                direct_writer,
-                tcp,
-                &mut dirty_writers,
-                &mut route_sid_counter,
-                &mut route_sids,
-            )?;
+        if binary {
+            while let Some(frame) = crate::protocol::bin_proto::try_decode(read_buf) {
+                handle_bin_frame(
+                    frame,
+                    conn_id,
+                    state,
+                    direct_writer,
+                    tcp,
+                    &mut dirty_writers,
+                    &mut route_sid_counter,
+                    &mut route_sids,
+                )?;
+            }
+        } else {
+            while let Some(op) = nats_proto::try_parse_route_op(read_buf)? {
+                handle_route_op(
+                    op,
+                    conn_id,
+                    state,
+                    direct_writer,
+                    tcp,
+                    &mut dirty_writers,
+                    &mut route_sid_counter,
+                    &mut route_sids,
+                )?;
+            }
         }
 
         for w in dirty_writers.drain(..) {
@@ -539,6 +631,8 @@ fn handle_route_op(
                 is_route: true,
                 #[cfg(feature = "gateway")]
                 is_gateway: false,
+                #[cfg(feature = "binary-client")]
+                is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
                 #[cfg(feature = "hub")]
@@ -578,13 +672,11 @@ fn handle_route_op(
             payload,
             ..
         } => {
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
             let msg = Msg::new(
-                &subject,
-                subject_str,
-                reply.as_deref(),
+                subject.clone(),
+                reply.clone(),
                 headers.as_ref(),
-                &payload,
+                payload.clone(),
             );
             // One-hop: skip route subs — messages from a route peer are never
             // re-forwarded to other route peers.
@@ -622,6 +714,165 @@ fn handle_route_op(
     Ok(())
 }
 
+/// Handle a single binary frame from an outbound route peer.
+///
+/// Maps binary frames to the same logic as `handle_route_op`:
+/// - `Sub`/`Unsub` register/unregister route subscriptions.
+/// - `Msg`/`HMsg` deliver to local subscribers.
+/// - `Ping` replies with a binary PONG.
+/// - `Pong` is a no-op.
+#[allow(clippy::too_many_arguments)]
+fn handle_bin_frame(
+    frame: crate::protocol::bin_proto::BinFrame,
+    conn_id: u64,
+    state: &ServerState,
+    direct_writer: &MsgWriter,
+    tcp: &TcpStream,
+    dirty_writers: &mut Vec<MsgWriter>,
+    route_sid_counter: &mut u64,
+    route_sids: &mut HashMap<(bytes::Bytes, Option<bytes::Bytes>), u64>,
+) -> io::Result<()> {
+    use crate::protocol::bin_proto::BinOp;
+
+    match frame.op {
+        BinOp::Sub => {
+            *route_sid_counter += 1;
+            let sid = *route_sid_counter;
+            let subject_b = frame.subject.clone();
+            let queue_b = if frame.reply.is_empty() {
+                None
+            } else {
+                Some(frame.reply.clone())
+            };
+            route_sids.insert((subject_b.clone(), queue_b.clone()), sid);
+
+            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject_b) };
+            let queue_str = queue_b
+                .as_ref()
+                .map(|q| unsafe { std::str::from_utf8_unchecked(q) }.to_string());
+
+            let sub = Subscription {
+                conn_id,
+                sid,
+                sid_bytes: nats_proto::sid_to_bytes(sid),
+                subject: subject_str.to_string(),
+                queue: queue_str,
+                writer: direct_writer.clone(),
+                max_msgs: AtomicU64::new(0),
+                delivered: AtomicU64::new(0),
+                is_leaf: false,
+                is_route: true,
+                #[cfg(feature = "gateway")]
+                is_gateway: false,
+                #[cfg(feature = "binary-client")]
+                is_binary_client: false,
+                #[cfg(feature = "accounts")]
+                account_id: 0,
+                #[cfg(feature = "hub")]
+                leaf_perms: None,
+            };
+
+            let mut subs = state
+                .get_subs(
+                    #[cfg(feature = "accounts")]
+                    0,
+                )
+                .write()
+                .unwrap();
+            subs.insert(sub);
+            state.has_subs.store(true, Ordering::Relaxed);
+
+            debug!(conn_id, sid, subject = %subject_str, "outbound binary route sub");
+        }
+        BinOp::Unsub => {
+            let key = (frame.subject.clone(), None);
+            if let Some(sid) = route_sids.remove(&key) {
+                let mut subs = state
+                    .get_subs(
+                        #[cfg(feature = "accounts")]
+                        0,
+                    )
+                    .write()
+                    .unwrap();
+                subs.remove(conn_id, sid);
+                state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+            }
+        }
+        BinOp::Msg => {
+            let reply = if frame.reply.is_empty() {
+                None
+            } else {
+                Some(frame.reply.clone())
+            };
+            let msg = Msg::new(frame.subject.clone(), reply, None, frame.payload.clone());
+            let (_delivered, expired) = deliver_to_subs_upstream_inner(
+                state,
+                &msg,
+                dirty_writers,
+                &DeliveryScope::from_route(),
+                #[cfg(feature = "accounts")]
+                0,
+            );
+            handle_expired_subs_upstream(
+                &expired,
+                state,
+                #[cfg(feature = "accounts")]
+                0,
+            );
+        }
+        BinOp::HMsg => {
+            // Payload layout: [4B hdr_len LE][hdr_bytes][body]
+            if frame.payload.len() < 4 {
+                return Ok(());
+            }
+            let hdr_len = u32::from_le_bytes([
+                frame.payload[0],
+                frame.payload[1],
+                frame.payload[2],
+                frame.payload[3],
+            ]) as usize;
+            if frame.payload.len() < 4 + hdr_len {
+                return Ok(());
+            }
+            let hdr_bytes = &frame.payload[4..4 + hdr_len];
+            let headers = match nats_proto::parse_headers(hdr_bytes) {
+                Ok(h) => h,
+                Err(_) => return Ok(()),
+            };
+            let payload = frame.payload.slice(4 + hdr_len..);
+            let reply = if frame.reply.is_empty() {
+                None
+            } else {
+                Some(frame.reply.clone())
+            };
+            let msg = Msg::new(frame.subject.clone(), reply, Some(&headers), payload);
+            let (_delivered, expired) = deliver_to_subs_upstream_inner(
+                state,
+                &msg,
+                dirty_writers,
+                &DeliveryScope::from_route(),
+                #[cfg(feature = "accounts")]
+                0,
+            );
+            handle_expired_subs_upstream(
+                &expired,
+                state,
+                #[cfg(feature = "accounts")]
+                0,
+            );
+        }
+        BinOp::Ping => {
+            let mut w = io::BufWriter::new(tcp);
+            let mut pong_buf = BytesMut::new();
+            crate::protocol::bin_proto::write_pong(&mut pong_buf);
+            w.write_all(&pong_buf)?;
+            w.flush()?;
+        }
+        BinOp::Pong => {}
+    }
+    Ok(())
+}
+
 /// Build INFO JSON for route protocol, including `connect_urls` from known peers.
 pub(crate) fn build_route_info(state: &ServerState) -> String {
     let cluster_name = state.cluster_name.as_deref().unwrap_or("default");
@@ -644,7 +895,7 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
     format!(
         "INFO {{\"server_id\":\"{}\",\"server_name\":\"{}\",\"version\":\"{}\",\
          \"host\":\"{}\",\"port\":{},\"max_payload\":{},\"proto\":1,\
-         \"cluster\":\"{}\",\"cluster_port\":{}{}}}\r\n",
+         \"cluster\":\"{}\",\"cluster_port\":{},\"open_wire\":1{}}}\r\n",
         state.info.server_id,
         state.info.server_name,
         state.info.version,
@@ -661,7 +912,7 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
 fn build_route_connect(state: &ServerState) -> String {
     let cluster_name = state.cluster_name.as_deref().unwrap_or("default");
     format!(
-        "CONNECT {{\"server_id\":\"{}\",\"name\":\"{}\",\"cluster\":\"{}\"}}\r\n",
+        "CONNECT {{\"server_id\":\"{}\",\"name\":\"{}\",\"cluster\":\"{}\",\"open_wire\":1}}\r\n",
         state.info.server_id, state.info.server_name, cluster_name,
     )
 }
@@ -672,6 +923,10 @@ pub(crate) fn broadcast_route_info(state: &ServerState) {
     let info_bytes = info_line.as_bytes();
     let writers = state.route_writers.read().unwrap();
     for writer in writers.values() {
+        // Binary-mode connections don't use text INFO gossip.
+        if writer.is_binary() {
+            continue;
+        }
         writer.write_raw(info_bytes);
         writer.notify();
     }

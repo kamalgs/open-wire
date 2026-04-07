@@ -41,7 +41,9 @@ use crate::handler::{
     MessageDeliveryHub,
 };
 use crate::nats_proto;
-use crate::sub_list::{create_eventfd, MsgWriter};
+use crate::sub_list::{create_eventfd, DirectBuf, MsgWriter};
+#[cfg(any(feature = "mesh", feature = "binary-client"))]
+use crate::sub_list::{BinSeg, BinSegBuf};
 use crate::websocket::{self, DecodeStatus, WsCodec};
 
 use rustls::ServerConnection;
@@ -75,6 +77,13 @@ pub(crate) enum WorkerCmd {
     /// Accept an inbound gateway connection (gateway mode).
     #[cfg(feature = "gateway")]
     NewGatewayConn {
+        id: u64,
+        stream: TcpStream,
+        addr: SocketAddr,
+    },
+    /// Accept an inbound binary-protocol client connection.
+    #[cfg(feature = "binary-client")]
+    NewBinaryConn {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
@@ -123,6 +132,13 @@ impl WorkerHandle {
     #[cfg(feature = "gateway")]
     pub fn send_gateway_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewGatewayConn { id, stream, addr });
+        self.wake();
+    }
+
+    /// Send a new binary-protocol client connection to this worker and wake it.
+    #[cfg(feature = "binary-client")]
+    pub fn send_binary_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        let _ = self.tx.send(WorkerCmd::NewBinaryConn { id, stream, addr });
         self.wake();
     }
 
@@ -255,7 +271,7 @@ pub(crate) struct ClientState {
     read_buf: AdaptiveBuf,
     write_buf: BytesMut,
     direct_writer: MsgWriter,
-    direct_buf: Arc<Mutex<BytesMut>>,
+    direct_buf: Arc<Mutex<DirectBuf>>,
     has_pending: Arc<AtomicBool>,
     phase: ConnPhase,
     transport: Transport,
@@ -281,6 +297,10 @@ pub(crate) struct ClientState {
     /// Account this connection belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     account_id: crate::core::server::AccountId,
+    /// Maximum bytes to read per EPOLLIN event. Shrinks when this client publishes
+    /// to a congested route (TCP flow control throttles the publisher naturally).
+    /// `usize::MAX` means unlimited (default).
+    read_budget: usize,
 }
 
 impl ClientState {
@@ -504,6 +524,10 @@ impl Worker {
                 WorkerCmd::NewGatewayConn { id, stream, addr } => {
                     self.add_gateway_conn(id, stream, addr);
                 }
+                #[cfg(feature = "binary-client")]
+                WorkerCmd::NewBinaryConn { id, stream, addr } => {
+                    self.add_binary_conn(id, stream, addr);
+                }
                 WorkerCmd::LameDuck(info_line) => {
                     self.handle_lame_duck(&info_line);
                 }
@@ -536,7 +560,7 @@ impl Worker {
             return;
         }
 
-        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let direct_buf = Arc::new(Mutex::new(DirectBuf::Text(BytesMut::with_capacity(65536))));
         let has_pending = Arc::new(AtomicBool::new(false));
         let direct_writer = MsgWriter::new(
             Arc::clone(&direct_buf),
@@ -595,6 +619,7 @@ impl Worker {
             permissions: None,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            read_budget: usize::MAX,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -642,7 +667,7 @@ impl Worker {
             return;
         }
 
-        let direct_buf = Arc::new(Mutex::new(BytesMut::with_capacity(65536)));
+        let direct_buf = Arc::new(Mutex::new(DirectBuf::Text(BytesMut::with_capacity(65536))));
         let has_pending = Arc::new(AtomicBool::new(false));
         let direct_writer = MsgWriter::new(
             Arc::clone(&direct_buf),
@@ -676,6 +701,7 @@ impl Worker {
             permissions: None,
             #[cfg(feature = "accounts")]
             account_id: 0,
+            read_budget: usize::MAX,
         };
 
         self.fd_to_conn.insert(fd, id);
@@ -717,6 +743,7 @@ impl Worker {
                 route_sid_counter: 0,
                 route_sids: HashMap::new(),
                 peer_server_id: None,
+                binary: false,
             },
         );
     }
@@ -736,6 +763,68 @@ impl Worker {
                 peer_gateway_name: None,
             },
         );
+    }
+
+    /// Create a binary-protocol client connection — no handshake, active immediately.
+    #[cfg(feature = "binary-client")]
+    fn add_binary_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
+        stream.set_nonblocking(true).ok();
+        stream.set_nodelay(true).ok();
+        let fd = stream.as_raw_fd();
+
+        let mut ev = libc::epoll_event {
+            events: libc::EPOLLIN as u32,
+            u64: id,
+        };
+        let ret =
+            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
+        if ret != 0 {
+            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for binary client");
+            return;
+        }
+
+        // Binary clients share the same zero-copy segment buffer path as route connections.
+        let direct_buf = Arc::new(Mutex::new(DirectBuf::Binary(BinSegBuf::new())));
+        let has_pending = Arc::new(AtomicBool::new(false));
+        let direct_writer = MsgWriter::new_binary_shared(
+            Arc::clone(&direct_buf),
+            Arc::clone(&has_pending),
+            Arc::clone(&self.event_fd),
+        );
+
+        let client = ClientState {
+            fd,
+            _stream: stream,
+            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
+            write_buf: BytesMut::new(),
+            direct_writer,
+            direct_buf,
+            has_pending,
+            phase: ConnPhase::Active,
+            transport: Transport::Raw,
+            ext: ConnExt::BinaryClient,
+            #[cfg(feature = "leaf")]
+            upstream_txs: Vec::new(),
+            epoll_has_out: false,
+            echo: false,
+            no_responders: false,
+            accepted_at: Instant::now(),
+            last_activity: Instant::now(),
+            pings_outstanding: 0,
+            sub_count: 0,
+            permissions: None,
+            #[cfg(feature = "accounts")]
+            account_id: 0,
+            read_budget: usize::MAX,
+        };
+
+        self.fd_to_conn.insert(fd, id);
+        self.conns.insert(id, client);
+
+        counter!("binary_connections_total", "worker" => self.worker_label.clone()).increment(1);
+        gauge!("connections_active", "worker" => self.worker_label.clone())
+            .set(self.conns.len() as f64);
+        debug!(id, addr = %addr, "accepted binary client connection");
     }
 
     fn remove_conn(&mut self, conn_id: u64) {
@@ -802,43 +891,110 @@ impl Worker {
     fn flush_pending(&mut self) {
         let epoll_fd = self.epoll_fd.as_raw_fd();
         let mut to_remove: Vec<u64> = Vec::new();
+        // Tracks the highest congestion level seen this pass (0.0 = at HWM, 1.0 = at max_pending).
+        // Used to apply graduated backpressure after the scan loop.
+        let mut max_congestion: f64 = 0.0;
 
         for (conn_id, client) in &mut self.conns {
             if !client.has_pending.load(Ordering::Acquire) {
                 continue;
             }
             client.has_pending.store(false, Ordering::Relaxed);
-            let direct_data = {
+            // Drain the per-connection direct buffer.
+            // For Raw+Text: O(1) split, then writev with write_buf.
+            // For Raw+Binary: take segment list, build scatter-gather iovecs (zero-copy).
+            // For WS/TLS: materialise into write_buf for further encoding.
+            enum DrainResult {
+                Empty,
+                FlatBytes(BytesMut),
+                #[cfg(any(feature = "mesh", feature = "binary-client"))]
+                Segs {
+                    segs: Vec<BinSeg>,
+                    total_len: usize,
+                },
+            }
+            let drained = {
                 let mut dbuf = client.direct_buf.lock().unwrap();
-                if !dbuf.is_empty() {
-                    if matches!(client.transport, Transport::Raw) {
-                        // O(1) take for Raw — we'll use writev to avoid copying
-                        dbuf.split()
-                    } else {
-                        // WS/TLS need the data in write_buf for transformation
-                        client.write_buf.extend_from_slice(&dbuf);
-                        dbuf.clear();
-                        BytesMut::new()
+                if dbuf.is_empty() {
+                    DrainResult::Empty
+                } else if matches!(client.transport, Transport::Raw) {
+                    match &mut *dbuf {
+                        DirectBuf::Text(b) => DrainResult::FlatBytes(b.split()),
+                        #[cfg(any(feature = "mesh", feature = "binary-client"))]
+                        DirectBuf::Binary(seg_buf) => {
+                            let total_len = seg_buf.total_len;
+                            DrainResult::Segs {
+                                segs: seg_buf.take(),
+                                total_len,
+                            }
+                        }
                     }
                 } else {
-                    BytesMut::new()
+                    // WS/TLS: flatten everything into write_buf
+                    match &mut *dbuf {
+                        DirectBuf::Text(b) => {
+                            client.write_buf.extend_from_slice(b);
+                            b.clear();
+                        }
+                        #[cfg(any(feature = "mesh", feature = "binary-client"))]
+                        DirectBuf::Binary(seg_buf) => {
+                            seg_buf.materialize_into(&mut client.write_buf);
+                        }
+                    }
+                    DrainResult::Empty
                 }
             };
+            // Materialise DrainResult: text path uses direct_data; binary uses segs_drain.
+            let direct_data: BytesMut;
+            #[cfg(any(feature = "mesh", feature = "binary-client"))]
+            let segs_drain: Option<(Vec<BinSeg>, usize)>;
+            #[cfg(not(any(feature = "mesh", feature = "binary-client")))]
+            let segs_drain: Option<(Vec<()>, usize)>;
+            match drained {
+                DrainResult::Empty => {
+                    direct_data = BytesMut::new();
+                    segs_drain = None;
+                }
+                DrainResult::FlatBytes(b) => {
+                    direct_data = b;
+                    segs_drain = None;
+                }
+                #[cfg(any(feature = "mesh", feature = "binary-client"))]
+                DrainResult::Segs { segs, total_len } => {
+                    direct_data = BytesMut::new();
+                    segs_drain = Some((segs, total_len));
+                }
+            }
 
-            // Slow consumer detection: if pending data exceeds max_pending,
-            // disconnect the client to protect server memory.
-            let max_pending = self.state.buf_config.max_pending;
-            if max_pending > 0 {
+            // Slow consumer detection and graduated backpressure.
+            //
+            // Hard limit (max_pending): disconnect the connection to protect server memory.
+            // Soft limit (max_pending / 2): start applying a proportional sleep after the
+            // scan loop so the worker stops reading client data, letting kernel TCP flow
+            // control propagate backpressure to the publisher naturally.
+            let is_route = client.ext.is_route();
+            let max_pend = if is_route {
+                self.state.buf_config.max_pending_route
+            } else {
+                self.state.buf_config.max_pending
+            };
+            if max_pend > 0 {
+                let extra = if let Some((_, tl)) = &segs_drain {
+                    *tl
+                } else {
+                    direct_data.len()
+                };
                 let pending = match &client.transport {
-                    Transport::Raw => client.write_buf.len() + direct_data.len(),
+                    Transport::Raw => client.write_buf.len() + extra,
                     Transport::WebSocket { ws_out, .. } => client.write_buf.len() + ws_out.len(),
                     Transport::Tls(ref tls) => client.write_buf.len() + tls.enc_out.len(),
                 };
-                if pending > max_pending {
+                if pending > max_pend {
                     warn!(
                         conn_id = *conn_id,
+                        conn_type = client.ext.kind(),
                         pending_bytes = pending,
-                        max = max_pending,
+                        max = max_pend,
                         "slow consumer, disconnecting"
                     );
                     counter!("slow_consumers_total", "worker" => self.worker_label.clone())
@@ -849,6 +1005,26 @@ impl Worker {
                         .fetch_add(1, Ordering::Relaxed);
                     to_remove.push(*conn_id);
                     continue;
+                }
+                // Update route congestion level for cross-worker backpressure.
+                if is_route {
+                    let ratio = pending as f64 / max_pend as f64;
+                    let level = if ratio < 0.25 {
+                        0
+                    } else if ratio < 0.75 {
+                        1
+                    } else {
+                        2
+                    };
+                    client.direct_writer.set_congestion(level);
+                }
+                // Track max congestion across all connections (for metrics).
+                let hwm = max_pend / 2;
+                if pending > hwm {
+                    let congestion = (pending - hwm) as f64 / (max_pend - hwm) as f64;
+                    if congestion > max_congestion {
+                        max_congestion = congestion;
+                    }
                 }
             }
 
@@ -888,6 +1064,137 @@ impl Worker {
             // Inline flush
             let mut error = false;
             if is_raw {
+                // ── Binary segment path (zero-copy scatter-gather) ──────────
+                #[cfg(any(feature = "mesh", feature = "binary-client"))]
+                if let Some((segs, _total_len)) = segs_drain {
+                    // Build iovec array: write_buf (if any) + per-segment iovecs.
+                    // Each Msg segment contributes up to 4 iovecs; Inline contributes 1.
+                    // IOV_MAX on Linux is 1024 — for very large batches materialise first.
+                    let wb_len = client.write_buf.len();
+                    let max_iovs = (if wb_len > 0 { 1 } else { 0 }) + segs.len() * 4;
+                    if max_iovs > 1024 {
+                        // Safety valve: materialise segs into write_buf and fall through.
+                        for seg in segs {
+                            match seg {
+                                BinSeg::Inline(b) => client.write_buf.extend_from_slice(&b),
+                                BinSeg::Msg(f) => {
+                                    client.write_buf.extend_from_slice(&f.header);
+                                    client.write_buf.extend_from_slice(&f.subject);
+                                    client.write_buf.extend_from_slice(&f.reply);
+                                    client.write_buf.extend_from_slice(&f.payload);
+                                }
+                            }
+                        }
+                        // Fall through to the standard write_buf-only write below.
+                    } else {
+                        // Build iovecs without holding a borrow across the write call.
+                        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(max_iovs);
+                        if wb_len > 0 {
+                            iovecs.push(libc::iovec {
+                                iov_base: client.write_buf.as_ptr() as *mut libc::c_void,
+                                iov_len: wb_len,
+                            });
+                        }
+                        for seg in &segs {
+                            match seg {
+                                BinSeg::Inline(b) if !b.is_empty() => {
+                                    iovecs.push(libc::iovec {
+                                        iov_base: b.as_ptr() as *mut libc::c_void,
+                                        iov_len: b.len(),
+                                    });
+                                }
+                                BinSeg::Msg(f) => {
+                                    iovecs.push(libc::iovec {
+                                        iov_base: f.header.as_ptr() as *mut libc::c_void,
+                                        iov_len: 9,
+                                    });
+                                    if !f.subject.is_empty() {
+                                        iovecs.push(libc::iovec {
+                                            iov_base: f.subject.as_ptr() as *mut libc::c_void,
+                                            iov_len: f.subject.len(),
+                                        });
+                                    }
+                                    if !f.reply.is_empty() {
+                                        iovecs.push(libc::iovec {
+                                            iov_base: f.reply.as_ptr() as *mut libc::c_void,
+                                            iov_len: f.reply.len(),
+                                        });
+                                    }
+                                    if !f.payload.is_empty() {
+                                        iovecs.push(libc::iovec {
+                                            iov_base: f.payload.as_ptr() as *mut libc::c_void,
+                                            iov_len: f.payload.len(),
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let total_bytes: usize = iovecs.iter().map(|v| v.iov_len).sum();
+                        // SAFETY: iovecs point into BytesMut / Bytes buffers that remain
+                        // valid until end of this block; fd is the connection socket.
+                        let n = unsafe {
+                            libc::writev(client.fd, iovecs.as_ptr(), iovecs.len() as i32)
+                        };
+                        if n < 0 {
+                            let err = io::Error::last_os_error();
+                            if err.kind() == io::ErrorKind::WouldBlock {
+                                // Materialise everything into write_buf for later retry.
+                                // (write_buf content is already there; append segs.)
+                                for seg in segs {
+                                    match seg {
+                                        BinSeg::Inline(b) => client.write_buf.extend_from_slice(&b),
+                                        BinSeg::Msg(f) => {
+                                            client.write_buf.extend_from_slice(&f.header);
+                                            client.write_buf.extend_from_slice(&f.subject);
+                                            client.write_buf.extend_from_slice(&f.reply);
+                                            client.write_buf.extend_from_slice(&f.payload);
+                                        }
+                                    }
+                                }
+                                if !client.epoll_has_out {
+                                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                    client.epoll_has_out = true;
+                                }
+                            } else {
+                                error = true;
+                            }
+                        } else {
+                            let written = n as usize;
+                            if written >= total_bytes {
+                                client.write_buf.clear();
+                            } else {
+                                // Partial write: flatten all bytes, skip written, keep rest.
+                                // Rebuild write_buf from scratch = [wb | segs], advance written.
+                                let mut all = BytesMut::with_capacity(total_bytes);
+                                all.extend_from_slice(&client.write_buf);
+                                for seg in segs {
+                                    match seg {
+                                        BinSeg::Inline(b) => all.extend_from_slice(&b),
+                                        BinSeg::Msg(f) => {
+                                            all.extend_from_slice(&f.header);
+                                            all.extend_from_slice(&f.subject);
+                                            all.extend_from_slice(&f.reply);
+                                            all.extend_from_slice(&f.payload);
+                                        }
+                                    }
+                                }
+                                all.advance(written);
+                                client.write_buf = all;
+                                if !client.epoll_has_out {
+                                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                    client.epoll_has_out = true;
+                                }
+                            }
+                        }
+                        if error {
+                            to_remove.push(*conn_id);
+                        }
+                        continue;
+                    }
+                }
+
+                // ── Text / flat-buffer path ─────────────────────────────────
                 // writev path: write_buf and direct_data as two iovecs
                 let wb_len = client.write_buf.len();
                 let dd_len = direct_data.len();
@@ -1176,8 +1483,16 @@ impl Worker {
                 {
                     let mut dbuf = client.direct_buf.lock().unwrap();
                     if !dbuf.is_empty() {
-                        client.write_buf.extend_from_slice(&dbuf);
-                        dbuf.clear();
+                        match &mut *dbuf {
+                            DirectBuf::Text(b) => {
+                                client.write_buf.extend_from_slice(b);
+                                b.clear();
+                            }
+                            #[cfg(any(feature = "mesh", feature = "binary-client"))]
+                            DirectBuf::Binary(seg_buf) => {
+                                seg_buf.materialize_into(&mut client.write_buf);
+                            }
+                        }
                     }
                 }
             }
@@ -1288,18 +1603,26 @@ impl Worker {
 
     fn handle_read_raw(&mut self, conn_id: u64) {
         let mut got_eof = false;
+        let mut total_read = 0usize;
         loop {
             let client = match self.conns.get_mut(&conn_id) {
                 Some(c) => c,
                 None => return,
             };
-            match client.read_buf.read_from_fd(client.fd) {
+            let budget = client.read_budget;
+            // Cap total bytes read across all iterations of this loop.
+            let remaining = budget.saturating_sub(total_read);
+            if remaining == 0 {
+                break;
+            }
+            match client.read_buf.read_from_fd(client.fd, remaining) {
                 Ok(0) => {
                     got_eof = true;
                     break;
                 }
                 Ok(n) => {
                     client.read_buf.after_read(n);
+                    total_read += n;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => {
@@ -1332,7 +1655,7 @@ impl Worker {
                     Some(c) => c,
                     None => return,
                 };
-                match client.read_buf.read_from_fd(client.fd) {
+                match client.read_buf.read_from_fd(client.fd, usize::MAX) {
                     Ok(0) => {
                         self.remove_conn(conn_id);
                         return;
@@ -1809,7 +2132,34 @@ impl Worker {
                             self.remove_conn(conn_id);
                             return false;
                         }
+                        // Dedup: if an outbound (or earlier inbound) route to this peer
+                        // is already active, drop this connection.  Whichever direction
+                        // arrives first wins; the other is silently closed.  This prevents
+                        // bidirectional seed configs from creating two route connections
+                        // per pair, which would double-deliver every routed message.
+                        let is_duplicate = {
+                            let mut peers = self.state.route_peers.lock().unwrap();
+                            if peers.connected.contains_key(sid.as_str()) {
+                                true
+                            } else {
+                                // Register so subsequent connections from this peer are dropped.
+                                peers.connected.insert(sid.clone(), "inbound".to_string());
+                                false
+                            }
+                        };
+                        if is_duplicate {
+                            debug!(
+                                conn_id,
+                                peer_id = %sid,
+                                "duplicate inbound route, dropping"
+                            );
+                            self.remove_conn(conn_id);
+                            return false;
+                        }
                     }
+
+                    let use_binary =
+                        connect_info.open_wire == Some(1) && self.state.info.open_wire == Some(1);
 
                     // Peer's CONNECT — go Active, register, exchange subs.
                     let client = self.conns.get_mut(&conn_id).unwrap();
@@ -1819,22 +2169,37 @@ impl Worker {
                     {
                         client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
                     }
+                    // Always respond with text PONG — the handshake stays in text.
+                    // Binary framing only activates for Active-phase data frames.
                     client.write_buf.extend_from_slice(b"PONG\r\n");
+                    // Ensure flush_pending sends PONG even when there are no existing
+                    // subs to sync (send_existing_route_subs wouldn't set has_pending).
+                    client.has_pending.store(true, Ordering::Release);
 
                     if let ConnExt::Route {
                         ref mut peer_server_id,
+                        ref mut binary,
                         ..
                     } = client.ext
                     {
                         *peer_server_id = peer_sid.clone();
+                        *binary = use_binary;
                     }
 
-                    // Note: we intentionally do NOT register inbound peers
-                    // in route_peers.connected here. The outbound side handles
-                    // its own registration in connect_route(). Having both an
-                    // inbound and outbound route to the same peer is harmless
-                    // (one-hop enforcement prevents message loops) and avoids
-                    // a retry storm when outbound dedup rejects connections.
+                    // If binary mode, switch the direct buffer to segment mode and replace
+                    // the direct_writer with a binary-mode writer sharing the same Arcs.
+                    if use_binary {
+                        {
+                            let mut dbuf = client.direct_buf.lock().unwrap();
+                            *dbuf = DirectBuf::Binary(BinSegBuf::new());
+                        }
+                        let binary_dw = crate::sub_list::MsgWriter::new_binary_shared(
+                            Arc::clone(&client.direct_buf),
+                            Arc::clone(&client.has_pending),
+                            Arc::clone(&self.event_fd),
+                        );
+                        client.direct_writer = binary_dw;
+                    }
 
                     let dw = client.direct_writer.clone();
                     self.state
@@ -1847,7 +2212,7 @@ impl Worker {
 
                     crate::connector::mesh::broadcast_route_info(&self.state);
 
-                    info!(conn_id, "inbound route connected");
+                    info!(conn_id, use_binary, "inbound route connected");
                 }
                 Some(RouteOp::Ping) => {
                     if let Some(client) = self.conns.get_mut(&conn_id) {
@@ -1968,7 +2333,7 @@ impl Worker {
 
         let op = {
             let client = self.conns.get_mut(&conn_id).unwrap();
-            match nats_proto::try_parse_client_op(&mut client.read_buf) {
+            match nats_proto::try_parse_client_op_cursor(&mut client.read_buf) {
                 Ok(op) => op,
                 Err(_) => {
                     self.remove_conn(conn_id);
@@ -2097,9 +2462,22 @@ impl Worker {
             #[cfg(feature = "hub")]
             ConnKind::Leaf => self.process_active::<LeafHandler>(conn_id),
             #[cfg(feature = "mesh")]
-            ConnKind::Route => self.process_active::<RouteHandler>(conn_id),
+            ConnKind::Route => {
+                let is_binary = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| matches!(&c.ext, ConnExt::Route { binary: true, .. }))
+                    .unwrap_or(false);
+                if is_binary {
+                    self.process_active_route_binary(conn_id)
+                } else {
+                    self.process_active::<RouteHandler>(conn_id)
+                }
+            }
             #[cfg(feature = "gateway")]
             ConnKind::Gateway => self.process_active::<GatewayHandler>(conn_id),
+            #[cfg(feature = "binary-client")]
+            ConnKind::BinaryClient => self.process_active_binary_client(conn_id),
             ConnKind::Client => self.process_active_client(conn_id, can_skip),
         }
     }
@@ -2132,7 +2510,7 @@ impl Worker {
                 // Check max control line only when incomplete and buffer is large.
                 // In the hot path buf.len() <= max_ctrl so this is a no-op.
                 let exceeded = max_ctrl > 0
-                    && self.conns.get(&conn_id).map_or(false, |c| {
+                    && self.conns.get(&conn_id).is_some_and(|c| {
                         let buf: &[u8] = &c.read_buf;
                         buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
                     });
@@ -2164,7 +2542,7 @@ impl Worker {
 
     /// Dispatch a parsed op through its handler, then apply the result.
     fn dispatch_and_apply<H: ConnectionHandler>(&mut self, conn_id: u64, op: H::Op) -> bool {
-        let (result, expired) = {
+        let (result, expired, congested) = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             let mut conn_ctx = client.conn_ctx(conn_id);
             let mut worker_ctx = MessageDeliveryHub {
@@ -2179,10 +2557,44 @@ impl Worker {
                 worker_label: &self.worker_label,
                 #[cfg(feature = "worker-affinity")]
                 worker_index: self.worker_index,
+                route_congested: false,
             };
-            H::handle_op(&mut conn_ctx, &mut worker_ctx, op)
+            let (result, expired) = H::handle_op(&mut conn_ctx, &mut worker_ctx, op);
+            (result, expired, worker_ctx.route_congested)
         };
-        self.apply_result(conn_id, result, expired)
+        self.adjust_read_budget(conn_id, congested);
+        let cont = self.apply_result(conn_id, result, expired);
+        // Stop processing more ops from this client when a route is congested.
+        // Remaining data stays in the read buffer; the next event loop iteration
+        // will resume parsing with the reduced read budget in effect.
+        if congested {
+            return false;
+        }
+        cont
+    }
+
+    /// Adjust a connection's read budget based on route congestion.
+    ///
+    /// When a publish hits a congested route, shrink the budget so less data
+    /// is read from this client on the next EPOLLIN. The kernel TCP receive
+    /// buffer fills up, TCP flow control kicks in, and the publisher slows
+    /// down — all without blocking the worker event loop.
+    #[inline]
+    fn adjust_read_budget(&mut self, conn_id: u64, route_congested: bool) {
+        if let Some(client) = self.conns.get_mut(&conn_id) {
+            if route_congested {
+                // On first congestion, snap from unlimited to a concrete cap.
+                // Then halve on each subsequent congestion signal.
+                if client.read_budget > 65536 {
+                    client.read_budget = 65536;
+                } else {
+                    client.read_budget = (client.read_budget / 2).max(256);
+                }
+            } else if client.read_budget < usize::MAX {
+                // Double toward unlimited when congestion clears.
+                client.read_budget = client.read_budget.saturating_mul(2);
+            }
+        }
     }
 
     /// Handle expired subs cleanup and flush/disconnect from a `HandleResult`.
@@ -2244,9 +2656,9 @@ impl Worker {
         let result = {
             let client = self.conns.get_mut(&conn_id).unwrap();
             if can_skip {
-                nats_proto::try_skip_or_parse_client_op(&mut client.read_buf)
+                nats_proto::try_skip_or_parse_client_op_cursor(&mut client.read_buf)
             } else {
-                nats_proto::try_parse_client_op(&mut client.read_buf)
+                nats_proto::try_parse_client_op_cursor(&mut client.read_buf)
             }
         };
         match result {
@@ -2255,7 +2667,7 @@ impl Worker {
                 // Check max control line only when incomplete and buffer is large.
                 // In the hot path buf.len() <= max_ctrl so this is a no-op.
                 let exceeded = max_ctrl > 0
-                    && self.conns.get(&conn_id).map_or(false, |c| {
+                    && self.conns.get(&conn_id).is_some_and(|c| {
                         let buf: &[u8] = &c.read_buf;
                         buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
                     });
@@ -2287,6 +2699,309 @@ impl Worker {
 
     fn handle_write(&mut self, conn_id: u64) {
         self.try_flush_conn(conn_id);
+    }
+
+    /// Parse and dispatch a single binary frame from an inbound binary-mode route connection.
+    ///
+    /// Maps `BinOp::Ping/Pong` in-place, converts `Msg/HMsg/Sub/Unsub` to `RouteOp`
+    /// and delegates to `RouteHandler` via `dispatch_and_apply`.
+    #[cfg(feature = "mesh")]
+    fn process_active_route_binary(&mut self, conn_id: u64) -> bool {
+        use crate::protocol::bin_proto::{self, BinOp};
+
+        // The outbound side sends INFO+CONNECT+PING as text in one batch.
+        // After we transition to binary Active, the text PING\r\n may still
+        // be sitting at the front of the read buffer. Consume it silently —
+        // we already sent PONG when processing CONNECT, so a second PONG
+        // would arrive as invalid bytes in the peer's binary parser.
+        {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            let buf = client.read_buf.bytes_mut();
+            if buf.starts_with(b"PING\r\n") {
+                buf.advance(6);
+                return true;
+            }
+        }
+
+        let frame = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            bin_proto::try_decode(client.read_buf.bytes_mut())
+        };
+        let frame = match frame {
+            Some(f) => f,
+            None => return false,
+        };
+
+        match frame.op {
+            BinOp::Ping => {
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                bin_proto::write_pong(&mut client.write_buf);
+                return true;
+            }
+            BinOp::Pong => return true,
+            _ => {}
+        }
+
+        let route_op = bin_frame_to_route_op(frame);
+        match route_op {
+            Some(op) => self.dispatch_and_apply::<RouteHandler>(conn_id, op),
+            None => true,
+        }
+    }
+
+    /// Parse and dispatch frames from a binary-protocol client connection.
+    ///
+    /// - `Msg`: publish to local subscribers (and propagate via routes/gateways/leaf).
+    /// - `Sub`: register a subscription; subject=pattern, reply=queue, payload=SID (u32 LE).
+    /// - `Unsub`: remove a subscription; subject=SID (u32 LE).
+    /// - `Ping`/`Pong`: keepalive.
+    #[cfg(feature = "binary-client")]
+    fn process_active_binary_client(&mut self, conn_id: u64) -> bool {
+        use crate::handler::propagation::propagate_all_interest;
+        use crate::handler::{DeliveryScope, Msg};
+        use crate::nats_proto::sid_to_bytes;
+        use crate::protocol::bin_proto::{self, BinOp};
+        use crate::sub_list::Subscription;
+
+        let frame = {
+            let client = self.conns.get_mut(&conn_id).unwrap();
+            bin_proto::try_decode(client.read_buf.bytes_mut())
+        };
+        let frame = match frame {
+            Some(f) => f,
+            None => return false,
+        };
+
+        match frame.op {
+            BinOp::Ping => {
+                let client = self.conns.get_mut(&conn_id).unwrap();
+                bin_proto::write_pong(&mut client.write_buf);
+                return true;
+            }
+            BinOp::Pong => return true,
+            BinOp::Msg | BinOp::HMsg => {
+                let reply = if frame.reply.is_empty() {
+                    None
+                } else {
+                    Some(frame.reply)
+                };
+                let msg = Msg::new(frame.subject, reply, None, frame.payload);
+                let (expired, congested) = {
+                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    let conn_ctx = client.conn_ctx(conn_id);
+                    let mut wctx = MessageDeliveryHub {
+                        state: &self.state,
+                        event_fd: self.event_fd.as_raw_fd(),
+                        pending_notify: &mut self.pending_notify,
+                        pending_notify_count: &mut self.pending_notify_count,
+                        msgs_received: &mut self.msgs_received,
+                        msgs_received_bytes: &mut self.msgs_received_bytes,
+                        msgs_delivered: &mut self.msgs_delivered,
+                        msgs_delivered_bytes: &mut self.msgs_delivered_bytes,
+                        worker_label: &self.worker_label,
+                        #[cfg(feature = "worker-affinity")]
+                        worker_index: self.worker_index,
+                        route_congested: false,
+                    };
+                    *wctx.msgs_received += 1;
+                    *wctx.msgs_received_bytes += msg.payload.len() as u64;
+                    let (_, expired) = wctx.publish(
+                        &msg,
+                        conn_ctx.conn_id,
+                        &DeliveryScope::local(false),
+                        #[cfg(feature = "accounts")]
+                        conn_ctx.account_id,
+                    );
+                    let congested = wctx.route_congested;
+                    (expired, congested)
+                };
+                self.adjust_read_budget(conn_id, congested);
+                self.apply_result(conn_id, crate::handler::HandleResult::Ok, expired);
+                // Stop processing more frames from this client when a route is
+                // congested — remaining data stays in the read buffer and will be
+                // processed on the next event loop iteration, giving the route
+                // writer time to drain.
+                if congested {
+                    return false;
+                }
+            }
+            BinOp::Sub => {
+                // subject=pattern, reply=queue, payload=SID as u32 LE (4 bytes)
+                let sid = if frame.payload.len() >= 4 {
+                    u32::from_le_bytes([
+                        frame.payload[0],
+                        frame.payload[1],
+                        frame.payload[2],
+                        frame.payload[3],
+                    ]) as u64
+                } else {
+                    return true; // malformed, ignore
+                };
+                let subject_str = unsafe { std::str::from_utf8_unchecked(&frame.subject) };
+                let queue_str = if frame.reply.is_empty() {
+                    None
+                } else {
+                    Some(unsafe { std::str::from_utf8_unchecked(&frame.reply) }.to_string())
+                };
+
+                let writer = self
+                    .conns
+                    .get(&conn_id)
+                    .map(|c| c.direct_writer.clone())
+                    .unwrap();
+                let sub = Subscription {
+                    conn_id,
+                    sid,
+                    sid_bytes: sid_to_bytes(sid),
+                    subject: subject_str.to_string(),
+                    queue: queue_str,
+                    writer,
+                    max_msgs: std::sync::atomic::AtomicU64::new(0),
+                    delivered: std::sync::atomic::AtomicU64::new(0),
+                    is_leaf: false,
+                    #[cfg(feature = "mesh")]
+                    is_route: false,
+                    #[cfg(feature = "gateway")]
+                    is_gateway: false,
+                    #[cfg(feature = "binary-client")]
+                    is_binary_client: true,
+                    #[cfg(feature = "accounts")]
+                    account_id: 0,
+                    #[cfg(feature = "hub")]
+                    leaf_perms: None,
+                };
+                {
+                    let mut subs = self
+                        .state
+                        .get_subs(
+                            #[cfg(feature = "accounts")]
+                            0,
+                        )
+                        .write()
+                        .unwrap();
+                    subs.insert(sub);
+                    self.state.has_subs.store(true, Ordering::Relaxed);
+                }
+                if let Some(c) = self.conns.get_mut(&conn_id) {
+                    c.sub_count += 1;
+                }
+                propagate_all_interest(
+                    &self.state,
+                    frame.subject.as_ref(),
+                    if frame.reply.is_empty() {
+                        None
+                    } else {
+                        Some(frame.reply.as_ref())
+                    },
+                    true,
+                    #[cfg(feature = "accounts")]
+                    b"$G",
+                );
+            }
+            BinOp::Unsub => {
+                // subject=SID as u32 LE (4 bytes)
+                let sid = if frame.subject.len() >= 4 {
+                    u32::from_le_bytes([
+                        frame.subject[0],
+                        frame.subject[1],
+                        frame.subject[2],
+                        frame.subject[3],
+                    ]) as u64
+                } else {
+                    return true;
+                };
+                let removed = {
+                    let mut subs = self
+                        .state
+                        .get_subs(
+                            #[cfg(feature = "accounts")]
+                            0,
+                        )
+                        .write()
+                        .unwrap();
+                    let r = subs.remove(conn_id, sid);
+                    self.state
+                        .has_subs
+                        .store(!subs.is_empty(), Ordering::Relaxed);
+                    r
+                };
+                if removed.is_some() {
+                    if let Some(c) = self.conns.get_mut(&conn_id) {
+                        c.sub_count = c.sub_count.saturating_sub(1);
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Convert a decoded `BinFrame` to a `RouteOp` for dispatch via `RouteHandler`.
+///
+/// `Ping` and `Pong` are handled in-place by `process_active_route_binary` and
+/// must not be passed to this function.
+#[cfg(feature = "mesh")]
+fn bin_frame_to_route_op(frame: crate::protocol::bin_proto::BinFrame) -> Option<RouteOp> {
+    use crate::protocol::bin_proto::BinOp;
+    match frame.op {
+        BinOp::Msg => Some(RouteOp::RouteMsg {
+            #[cfg(feature = "accounts")]
+            account: bytes::Bytes::from_static(b"$G"),
+            subject: frame.subject,
+            reply: if frame.reply.is_empty() {
+                None
+            } else {
+                Some(frame.reply)
+            },
+            headers: None,
+            payload: frame.payload,
+        }),
+        BinOp::HMsg => {
+            // Payload layout: [4B hdr_len LE][hdr_bytes][body]
+            if frame.payload.len() < 4 {
+                return None;
+            }
+            let hdr_len = u32::from_le_bytes([
+                frame.payload[0],
+                frame.payload[1],
+                frame.payload[2],
+                frame.payload[3],
+            ]) as usize;
+            if frame.payload.len() < 4 + hdr_len {
+                return None;
+            }
+            let hdr_bytes = &frame.payload[4..4 + hdr_len];
+            let headers = crate::nats_proto::parse_headers(hdr_bytes).ok()?;
+            let payload = frame.payload.slice(4 + hdr_len..);
+            Some(RouteOp::RouteMsg {
+                #[cfg(feature = "accounts")]
+                account: bytes::Bytes::from_static(b"$G"),
+                subject: frame.subject,
+                reply: if frame.reply.is_empty() {
+                    None
+                } else {
+                    Some(frame.reply)
+                },
+                headers: Some(headers),
+                payload,
+            })
+        }
+        BinOp::Sub => Some(RouteOp::RouteSub {
+            #[cfg(feature = "accounts")]
+            account: frame.payload,
+            subject: frame.subject,
+            queue: if frame.reply.is_empty() {
+                None
+            } else {
+                Some(frame.reply)
+            },
+        }),
+        BinOp::Unsub => Some(RouteOp::RouteUnsub {
+            #[cfg(feature = "accounts")]
+            account: frame.payload,
+            subject: frame.subject,
+        }),
+        BinOp::Ping | BinOp::Pong => None, // handled in-place
     }
 }
 
@@ -2346,4 +3061,148 @@ fn cleanup_conn(id: u64, state: &ServerState) {
     let _ = &removed;
 
     info!(id, "client cleaned up");
+}
+
+/// Tests for `bin_frame_to_route_op`: binary frame → RouteOp conversion.
+#[cfg(all(test, feature = "mesh"))]
+mod bin_frame_tests {
+    use super::*;
+    use crate::protocol::bin_proto::{self, BinOp};
+    use bytes::{Bytes, BytesMut};
+
+    /// Encode a frame with the given fields and decode it back.
+    fn frame(op: BinOp, subject: &[u8], reply: &[u8], payload: &[u8]) -> bin_proto::BinFrame {
+        let mut buf = BytesMut::new();
+        match op {
+            BinOp::Msg => bin_proto::write_msg(subject, reply, payload, &mut buf),
+            BinOp::Sub => bin_proto::write_sub(subject, reply, payload, &mut buf),
+            BinOp::Unsub => bin_proto::write_unsub(subject, payload, &mut buf),
+            BinOp::Ping => bin_proto::write_ping(&mut buf),
+            BinOp::Pong => bin_proto::write_pong(&mut buf),
+            BinOp::HMsg => panic!("use write_hmsg directly"),
+        }
+        bin_proto::try_decode(&mut buf).expect("decode failed")
+    }
+
+    #[test]
+    fn msg_no_reply() {
+        match bin_frame_to_route_op(frame(BinOp::Msg, b"foo.bar", b"", b"hello")).unwrap() {
+            RouteOp::RouteMsg {
+                subject,
+                reply,
+                payload,
+                headers,
+                ..
+            } => {
+                assert_eq!(&subject[..], b"foo.bar");
+                assert!(reply.is_none());
+                assert_eq!(&payload[..], b"hello");
+                assert!(headers.is_none());
+            }
+            other => panic!("expected RouteMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn msg_with_reply() {
+        match bin_frame_to_route_op(frame(BinOp::Msg, b"foo", b"_INBOX.1", b"")).unwrap() {
+            RouteOp::RouteMsg { reply, .. } => {
+                assert_eq!(reply.unwrap().as_ref(), b"_INBOX.1");
+            }
+            other => panic!("expected RouteMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmsg_round_trip() {
+        let hdr = b"NATS/1.0\r\nX-Src: node-a\r\n\r\n";
+        let body = b"payload";
+        let mut buf = BytesMut::new();
+        bin_proto::write_hmsg(b"events.v1", b"", hdr, body, &mut buf);
+        let f = bin_proto::try_decode(&mut buf).unwrap();
+        match bin_frame_to_route_op(f).unwrap() {
+            RouteOp::RouteMsg {
+                subject,
+                reply,
+                headers,
+                payload,
+                ..
+            } => {
+                assert_eq!(&subject[..], b"events.v1");
+                assert!(reply.is_none());
+                assert!(headers.is_some(), "headers must be parsed");
+                assert_eq!(&payload[..], body);
+            }
+            other => panic!("expected RouteMsg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hmsg_payload_too_short_returns_none() {
+        // Craft an HMsg where the embedded hdr_len field claims more bytes than exist.
+        let f = bin_proto::BinFrame {
+            op: BinOp::HMsg,
+            subject: Bytes::from_static(b"sub"),
+            reply: Bytes::new(),
+            // [4B hdr_len=50][only 3 bytes] — truncated header
+            payload: Bytes::from_static(b"\x32\x00\x00\x00abc"),
+        };
+        assert!(
+            bin_frame_to_route_op(f).is_none(),
+            "truncated HMsg payload must return None"
+        );
+    }
+
+    #[test]
+    fn hmsg_payload_empty_returns_none() {
+        let f = bin_proto::BinFrame {
+            op: BinOp::HMsg,
+            subject: Bytes::from_static(b"sub"),
+            reply: Bytes::new(),
+            payload: Bytes::new(), // no hdr_len bytes at all
+        };
+        assert!(bin_frame_to_route_op(f).is_none());
+    }
+
+    #[test]
+    fn sub_no_queue() {
+        match bin_frame_to_route_op(frame(BinOp::Sub, b"foo.>", b"", b"$G")).unwrap() {
+            RouteOp::RouteSub { subject, queue, .. } => {
+                assert_eq!(&subject[..], b"foo.>");
+                assert!(queue.is_none());
+            }
+            other => panic!("expected RouteSub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sub_with_queue() {
+        match bin_frame_to_route_op(frame(BinOp::Sub, b"events.>", b"workers", b"$G")).unwrap() {
+            RouteOp::RouteSub { subject, queue, .. } => {
+                assert_eq!(&subject[..], b"events.>");
+                assert_eq!(queue.unwrap().as_ref(), b"workers");
+            }
+            other => panic!("expected RouteSub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsub() {
+        match bin_frame_to_route_op(frame(BinOp::Unsub, b"foo.>", b"", b"$G")).unwrap() {
+            RouteOp::RouteUnsub { subject, .. } => {
+                assert_eq!(&subject[..], b"foo.>");
+            }
+            other => panic!("expected RouteUnsub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ping_returns_none() {
+        assert!(bin_frame_to_route_op(frame(BinOp::Ping, b"", b"", b"")).is_none());
+    }
+
+    #[test]
+    fn pong_returns_none() {
+        assert!(bin_frame_to_route_op(frame(BinOp::Pong, b"", b"", b"")).is_none());
+    }
 }

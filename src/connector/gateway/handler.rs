@@ -133,6 +133,8 @@ impl GatewayHandler {
             #[cfg(feature = "mesh")]
             is_route: false,
             is_gateway: true,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
             #[cfg(feature = "hub")]
@@ -240,14 +242,16 @@ impl GatewayHandler {
         *wctx.msgs_received += 1;
         *wctx.msgs_received_bytes += payload_len;
 
-        let subject_str = bytes_to_str(&subject);
-
         // Unwrap _GR_ reply prefix if present (cross-cluster reply rewriting).
         // Uses Bytes::slice() for zero-copy sub-slicing.
         let unwrapped_reply = reply.as_ref().map(unwrap_gateway_reply_bytes);
-        let reply_ref = unwrapped_reply.as_deref();
 
-        let msg = Msg::new(&subject, subject_str, reply_ref, headers.as_ref(), &payload);
+        let msg = Msg::new(
+            subject.clone(),
+            unwrapped_reply.clone(),
+            headers.as_ref(),
+            payload.clone(),
+        );
         // One-hop: skip_routes = true and skip_gateways = true — messages from a gateway
         // are never re-forwarded to other routes or gateways.
         let (delivered, expired) = wctx.publish(

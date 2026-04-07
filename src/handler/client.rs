@@ -121,6 +121,8 @@ impl ClientHandler {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: conn.account_id,
             #[cfg(feature = "hub")]
@@ -336,13 +338,16 @@ impl ClientHandler {
                     let has_sub = subs.has_any_subscriber(subject_str);
                     drop(subs);
 
-                    if !has_sub {
+                    #[cfg(feature = "gateway")]
+                    let has_gw = wctx.state.has_gateway_interest.load(Ordering::Relaxed);
+                    #[cfg(not(feature = "gateway"))]
+                    let has_gw = false;
+
+                    if !has_sub && !has_gw {
                         let mut hdr = crate::types::HeaderMap::new();
                         hdr.set_status(503, None);
-                        let reply_str = bytes_to_str(reply_bytes);
-                        let empty = Bytes::new();
                         let no_resp_msg =
-                            Msg::new(reply_bytes, reply_str, None, Some(&hdr), &empty);
+                            Msg::new(reply_bytes.clone(), None, Some(&hdr), Bytes::new());
                         deliver_to_subs(
                             wctx,
                             &no_resp_msg,
@@ -358,11 +363,10 @@ impl ClientHandler {
         }
 
         let msg = Msg::new(
-            &subject,
-            subject_str,
-            respond.as_deref(),
+            subject.clone(),
+            respond.clone(),
             headers.as_ref(),
-            &payload,
+            payload.clone(),
         );
         let (_delivered, expired) = wctx.publish(
             &msg,

@@ -103,6 +103,8 @@ impl LeafHandler {
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
             #[cfg(feature = "gateway")]
             ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
+            #[cfg(feature = "binary-client")]
+            ConnExt::BinaryClient => unreachable!("leaf op on binary client connection"),
         };
 
         #[cfg(feature = "leaf")]
@@ -122,6 +124,8 @@ impl LeafHandler {
             is_route: false,
             #[cfg(feature = "gateway")]
             is_gateway: false,
+            #[cfg(feature = "binary-client")]
+            is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
             leaf_perms: leaf_perms_arc,
@@ -189,6 +193,8 @@ impl LeafHandler {
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
             #[cfg(feature = "gateway")]
             ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
+            #[cfg(feature = "binary-client")]
+            ConnExt::BinaryClient => unreachable!("leaf op on binary client connection"),
         };
 
         let removed = {
@@ -263,11 +269,10 @@ impl LeafHandler {
         }
 
         let msg = Msg::new(
-            &subject,
-            subject_str,
-            reply.as_deref(),
+            subject.clone(),
+            reply.clone(),
             headers.as_ref(),
-            &payload,
+            payload.clone(),
         );
         let (_delivered, expired) = wctx.publish(
             &msg,
