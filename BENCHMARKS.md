@@ -5,6 +5,54 @@ Hardware: same machine for all runs. Units: msgs/sec (K = thousands, M = million
 
 ---
 
+## 2026-04-07 — Route dedup + backpressure + binary-client protocol (full 11-scenario run)
+
+**Changes since last benchmark:**
+- **Route deduplication**: bidirectional seeds (A→B and B→A) created two TCP connections per
+  pair, both registered as route_writers — every publish was delivered twice. Fixed by tracking
+  inbound routes in `route_peers.connected` keyed by server_id; first connection wins, duplicate
+  dropped in worker.
+- **Backpressure**: `backpressure_check()` added to `write_msg`/`write_lmsg`/`write_rmsg` (1µs
+  at HWM=32MB, up to 500µs at MAX=64MB). Per-worker `backpressure_active` flag suppresses EPOLLIN
+  and sleeps 1ms when write buffers are congested.
+- **Binary client protocol** (`binary-client` feature): 9-byte fixed header, ops Ping/Pong/Msg/Sub.
+  Dedicated binary port. Scenarios 1–3, 14–16 now use `bench` binary instead of `nats bench`.
+- **Client-side rate limiting removed**: previous bench runs used `--rate` cap on cluster scenarios
+  to avoid slow-consumer disconnects; now running unlimited.
+
+Scenarios 1–3, 14–16: open-wire+Binary vs Go+NATS text on same server.
+Scenarios 4–5: open-wire+NATS text vs Go+NATS text (cross-server leaf).
+Scenarios 6–13: cluster and gateway (open-wire+Binary vs Go+NATS text).
+
+### Throughput (3-run average, 128B msgs; binary scenarios: 10s duration)
+
+| Scenario | Rust+Binary msg/s | Go+NATS msg/s | Rust/Go % |
+|---|---|---|---|
+| Pub only | 2,376,994 | 1,305,123 | **182%** |
+| Pub/sub | 1,216,475 | 402,390 | **302%** |
+| Fan-out x5 | 641,755 | 155,569 | **412%** |
+| Leaf→Hub | 794,108 | 431,228 | **184%** |
+| Hub→Leaf | 867,583 | 353,520 | **245%** |
+| Cluster A→B | 2,995,422 | 288,747 | **1037%** |
+| Cluster fan x3 | 1,606,277 | 162,724 | **987%** |
+| Cluster B+C | 2,534,490 | 221,176 | **1145%** |
+| Gateway A→B | 905,021 | 365,025 | **247%** |
+| Gateway fan | 782,969 | 249,311 | **314%** |
+| GW req-reply | 268 | 444 | **60%** |
+
+**Takeaways:**
+- **Cluster 10–11×**: Route dedup fix eliminated the double-delivery bug. With no rate limiting,
+  the binary protocol can saturate the route at ~3M msg/s A→B. Go nats bench is still limited
+  by its text protocol overhead.
+- **Pub-only 182%**, **pub/sub 302%**, **fan-out 412%**: Binary protocol removes text parsing
+  overhead on both sides; all three are solid improvements over the previous binary-less baseline.
+- **Leaf→Hub/Hub→Leaf (184–245%)**: Uses NATS text protocol on both sides (cross-server leaf);
+  improvement reflects the general server-side gains from prior sessions.
+- **GW req-reply 60%**: Known regression — gateway reply rewriting path is slower under load.
+  Needs investigation.
+
+---
+
 ## 2026-04-03 — Dispatch loop reduced to 2 FxHashMap lookups per message (full 10-scenario run)
 
 **Changes since last benchmark:**

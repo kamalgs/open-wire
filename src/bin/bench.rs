@@ -16,7 +16,6 @@
 //!   --size BYTES          Payload size                   [default: 128]
 //!   --duration SECS       Benchmark duration             [default: 5]
 //!   --subject SUBJECT     Subject to publish/subscribe   [default: bench.test]
-//!   --rate N              Max publish rate in msgs/sec   [default: unlimited]
 //! ```
 //!
 //! Example — pub/sub throughput with 2 publishers and 1 subscriber:
@@ -143,7 +142,6 @@ fn run_publisher(
     addr: &str,
     subject: Arc<String>,
     payload_size: usize,
-    rate_limit: Option<u64>,
     stop: Arc<AtomicBool>,
     msgs_sent: Arc<AtomicU64>,
     bytes_sent: Arc<AtomicU64>,
@@ -165,8 +163,6 @@ fn run_publisher(
 
     let mut local_msgs = 0u64;
     let mut local_bytes = 0u64;
-    let mut total_msgs = 0u64;
-    let loop_start = Instant::now();
 
     while !stop.load(Ordering::Relaxed) {
         batch_buf.clear();
@@ -177,8 +173,7 @@ fn run_publisher(
             break;
         }
         local_msgs += BATCH as u64;
-        local_bytes += (batch_buf.len()) as u64;
-        total_msgs += BATCH as u64;
+        local_bytes += batch_buf.len() as u64;
 
         // Periodically flush counters to shared atomics.
         if local_msgs % (BATCH as u64 * 16) == 0 {
@@ -186,15 +181,6 @@ fn run_publisher(
             bytes_sent.fetch_add(local_bytes, Ordering::Relaxed);
             local_msgs = 0;
             local_bytes = 0;
-        }
-
-        // Credit-based rate limiter: sleep until we are on schedule.
-        if let Some(rate) = rate_limit {
-            let expected = Duration::from_nanos(total_msgs * 1_000_000_000 / rate);
-            let elapsed = loop_start.elapsed();
-            if expected > elapsed {
-                std::thread::sleep(expected - elapsed);
-            }
         }
     }
     msgs_sent.fetch_add(local_msgs, Ordering::Relaxed);
@@ -278,8 +264,6 @@ struct Args {
     size: usize,
     duration: u64,
     subject: String,
-    /// Optional publish rate cap in messages/second (across all publisher connections combined).
-    rate: Option<u64>,
 }
 
 impl Args {
@@ -293,7 +277,6 @@ impl Args {
         let mut size = 128usize;
         let mut duration = 5u64;
         let mut subject = "bench.test".to_string();
-        let mut rate: Option<u64> = None;
 
         while let Some(key) = args.next() {
             match key.as_str() {
@@ -307,9 +290,6 @@ impl Args {
                     duration = args.next().expect("--duration requires a value").parse().unwrap()
                 }
                 "--subject" => subject = args.next().expect("--subject requires a value"),
-                "--rate" => {
-                    rate = Some(args.next().expect("--rate requires a value").parse().unwrap())
-                }
                 other => {
                     eprintln!("unknown option: {other}");
                     std::process::exit(1);
@@ -321,7 +301,7 @@ impl Args {
         if pub_addr.is_empty() { pub_addr = addr.clone(); }
         if sub_addr.is_empty() { sub_addr = addr; }
 
-        Args { pub_addr, sub_addr, n_pub, n_sub, size, duration, subject, rate }
+        Args { pub_addr, sub_addr, n_pub, n_sub, size, duration, subject }
     }
 }
 
@@ -343,13 +323,9 @@ fn main() {
     } else {
         format!("pub={} sub={}", args.pub_addr, args.sub_addr)
     };
-    let rate_desc = match args.rate {
-        Some(r) => format!(" rate={}msg/s", r),
-        None => String::new(),
-    };
     println!(
-        "Connecting to {} | pub={} sub={} size={}B duration={}s subject={}{}",
-        addr_desc, args.n_pub, args.n_sub, args.size, args.duration, args.subject, rate_desc
+        "Connecting to {} | pub={} sub={} size={}B duration={}s subject={}",
+        addr_desc, args.n_pub, args.n_sub, args.size, args.duration, args.subject
     );
 
     let mut handles = Vec::new();
@@ -371,12 +347,6 @@ fn main() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Split rate limit evenly across publisher connections.
-    let per_pub_rate = args.rate.map(|r| {
-        let n = args.n_pub.max(1) as u64;
-        r / n
-    });
-
     for _ in 0..args.n_pub {
         let addr = args.pub_addr.clone();
         let subj = Arc::clone(&subject);
@@ -385,7 +355,7 @@ fn main() {
         let bytes = Arc::clone(&pub_bytes);
         let size = args.size;
         handles.push(std::thread::spawn(move || {
-            run_publisher(&addr, subj, size, per_pub_rate, stop, msgs, bytes);
+            run_publisher(&addr, subj, size, stop, msgs, bytes);
         }));
     }
 

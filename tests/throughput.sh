@@ -77,12 +77,6 @@ else
   MSGS="${MSGS:-500000}"; SIZE="${SIZE:-128}"; RUNS="${RUNS:-3}"; BIN_DURATION="${BIN_DURATION:-10}"
 fi
 
-# Rate limit (msgs/sec) for cluster binary bench scenarios.
-# Prevents slow-consumer disconnects on route connections when A forwards to B+C.
-# A→B single route: 400K/s is safe; fan-out/remote-only (2 routes): 250K/s.
-BIN_CLUSTER_RATE_SINGLE="${BIN_CLUSTER_RATE_SINGLE:-400000}"
-BIN_CLUSTER_RATE_MULTI="${BIN_CLUSTER_RATE_MULTI:-250000}"
-
 # Ports
 HUB_CLIENT_PORT=4333
 HUB_LEAF_PORT=7422
@@ -421,17 +415,19 @@ run_url_pubsub_capture() {
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$url" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    local rate
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do
       wait_or_kill "$pid" 30
     done
+    # Measure delivered rate: average sub rate across all subscriber connections.
+    local sub_rate_sum=0 sr
     for s in $(seq 1 "$subs"); do
+      sr=$(extract_rate < "/tmp/bench_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / subs ))
     BG_PIDS=()
   done
   echo ""
@@ -490,13 +486,14 @@ run_cross_pubsub_capture() {
       --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "$pub_url" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    local rate
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do
       wait_or_kill "$pid" 30
     done
+    # Measure delivered rate from the subscriber side.
+    local sr
+    sr=$(extract_rate < /tmp/bench_cross_sub.out 2>/dev/null || echo 0)
+    rate_sum=$(( rate_sum + ${sr:-0} ))
     grep -E "stats:" /tmp/bench_cross_sub.out 2>/dev/null | sed 's/^/  sub  /' || true
     rm -f /tmp/bench_cross_sub.out
     BG_PIDS=()
@@ -549,8 +546,11 @@ run_binary_pubsub() {
     output=$("$BENCH_BIN" --addr "$bin_addr" --pub 1 --sub "$n_sub" \
       --size "$SIZE" --duration "$BIN_DURATION" 2>&1)
     echo "$output" | grep -E "^Pub:|^Sub:|^Elapsed:" || true
+    # Measure per-subscriber delivered rate: bench reports total across all sub
+    # connections, so divide by n_sub to get the per-subscriber rate (comparable
+    # to Go's nats bench sub output which is per-process/per-connection).
     local rate
-    rate=$(extract_binary_rate "$output" "Pub")
+    rate=$(( $(extract_binary_rate "$output" "Sub") / n_sub ))
     rate_sum=$(( rate_sum + ${rate:-0} ))
   done
   echo ""
@@ -563,12 +563,9 @@ run_binary_pubsub() {
 
 # Cross-server binary pub/sub: pub connects to pub_bin_addr, sub connects to sub_bin_addr.
 # Runs both in a single bench invocation using --pub-addr / --sub-addr.
-# Optional 5th arg: rate limit in msgs/sec (empty = unlimited).
 run_binary_cross_pubsub_capture() {
-  local label="$1" pub_bin_addr="$2" sub_bin_addr="$3" server_pid="$4" rate_limit="${5:-}"
+  local label="$1" pub_bin_addr="$2" sub_bin_addr="$3" server_pid="$4"
   local cpu_before ctx_before output rate_sum=0
-  local rate_flag=()
-  [[ -n "$rate_limit" ]] && rate_flag=(--rate "$rate_limit")
 
   cpu_before=$(cpu_ticks "$server_pid")
   ctx_before=$(ctx_switches "$server_pid")
@@ -576,10 +573,11 @@ run_binary_cross_pubsub_capture() {
   echo "--- $label ---"
   for i in $(seq 1 "$RUNS"); do
     output=$("$BENCH_BIN" --pub-addr "$pub_bin_addr" --sub-addr "$sub_bin_addr" \
-      --pub 1 --sub 1 --size "$SIZE" --duration "$BIN_DURATION" "${rate_flag[@]}" 2>&1) || true
+      --pub 1 --sub 1 --size "$SIZE" --duration "$BIN_DURATION" 2>&1) || true
     echo "$output" | grep -E "^Pub:|^Sub:|^Elapsed:" || true
+    # Measure delivered rate from the subscriber side.
     local rate
-    rate=$(extract_binary_rate "$output" "Pub") || true
+    rate=$(extract_binary_rate "$output" "Sub") || true
     rate_sum=$(( rate_sum + ${rate:-0} ))
   done
   echo ""
@@ -592,15 +590,10 @@ run_binary_cross_pubsub_capture() {
 
 # Multi-node binary fan-out: pub on pub_bin_addr, one sub on each addr in sub_bin_addrs.
 # Runs N sub-only bench instances in background, then pub-only in foreground.
-# Usage: run_binary_multinode_fanout_capture LABEL PUB_BIN_ADDR SERVER_PID [--rate N] SUB_BIN_ADDR...
+# Usage: run_binary_multinode_fanout_capture LABEL PUB_BIN_ADDR SERVER_PID SUB_BIN_ADDR...
 run_binary_multinode_fanout_capture() {
   local label="$1" pub_bin_addr="$2" server_pid="$3"
   shift 3
-  local rate_flag=()
-  if [[ "${1:-}" == "--rate" ]]; then
-    rate_flag=(--rate "$2")
-    shift 2
-  fi
   local sub_bin_addrs=("$@")
   local cpu_before ctx_before rate_sum=0
 
@@ -621,22 +614,24 @@ run_binary_multinode_fanout_capture() {
 
     local output
     output=$("$BENCH_BIN" --addr "$pub_bin_addr" --pub 1 --sub 0 \
-      --size "$SIZE" --duration "$BIN_DURATION" "${rate_flag[@]}" 2>&1) || true
+      --size "$SIZE" --duration "$BIN_DURATION" 2>&1) || true
     echo "$output" | grep -E "^Pub:|^Elapsed:" || true
-    local rate
-    rate=$(extract_binary_rate "$output" "Pub") || true
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
+    # Measure delivered rate: average sub rate across all subscriber processes.
+    local sub_rate_sum=0 sr
     s=1
     for sub_addr in "${sub_bin_addrs[@]}"; do
+      sr=$(extract_binary_rate "$(cat "/tmp/bench_bin_mn_sub_${s}.out" 2>/dev/null)" "Sub") || true
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "^Sub:|^Elapsed:" "/tmp/bench_bin_mn_sub_${s}.out" 2>/dev/null \
         | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_bin_mn_sub_${s}.out" || true
       s=$(( s + 1 ))
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / ${#sub_bin_addrs[@]} ))
     BG_PIDS=()
   done
   echo ""
@@ -919,8 +914,7 @@ if [[ "$MODE" == "full" ]]; then
   go_cl_ps_rate=$CAPTURED_RATE go_cl_ps_cpu=$CAPTURED_CPU go_cl_ps_rss=$CAPTURED_RSS go_cl_ps_ctx=$CAPTURED_CTX
 
   run_binary_cross_pubsub_capture "Rust+Binary Cluster A→B" \
-    "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" "127.0.0.1:$RUST_CLUSTER_B_BIN_PORT" "$RUST_CLUSTER_A_PID" \
-    "$BIN_CLUSTER_RATE_SINGLE"
+    "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" "127.0.0.1:$RUST_CLUSTER_B_BIN_PORT" "$RUST_CLUSTER_A_PID"
   rust_cl_ps_rate=$CAPTURED_RATE rust_cl_ps_cpu=$CAPTURED_CPU rust_cl_ps_rss=$CAPTURED_RSS rust_cl_ps_ctx=$CAPTURED_CTX
 
   record_summary "Cluster A→B" \
@@ -958,14 +952,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.cl.fan3" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across all 3 nodes.
+    sub_rate_sum=0
     for s in 1 2 3; do
+      sr=$(extract_rate < "/tmp/bench_cl_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 3 ))
     BG_PIDS=()
   done
   echo ""
@@ -977,7 +974,6 @@ if [[ "$MODE" == "full" ]]; then
   # Rust cluster fan-out x3 (binary: pub on A, subs on A, B, C)
   run_binary_multinode_fanout_capture "Rust+Binary Cluster fan-out x3" \
     "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" "$RUST_CLUSTER_A_PID" \
-    --rate "$BIN_CLUSTER_RATE_MULTI" \
     "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" \
     "127.0.0.1:$RUST_CLUSTER_B_BIN_PORT" \
     "127.0.0.1:$RUST_CLUSTER_C_BIN_PORT"
@@ -1015,14 +1011,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.cl.remote" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_CLUSTER_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across nodes B and C.
+    sub_rate_sum=0
     for s in 1 2; do
+      sr=$(extract_rate < "/tmp/bench_cl_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_cl_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_cl_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 2 ))
     BG_PIDS=()
   done
   echo ""
@@ -1034,7 +1033,6 @@ if [[ "$MODE" == "full" ]]; then
   # Rust cluster remote-only (binary: pub on A, subs on B and C)
   run_binary_multinode_fanout_capture "Rust+Binary Cluster remote B+C" \
     "127.0.0.1:$RUST_CLUSTER_A_BIN_PORT" "$RUST_CLUSTER_A_PID" \
-    --rate "$BIN_CLUSTER_RATE_MULTI" \
     "127.0.0.1:$RUST_CLUSTER_B_BIN_PORT" \
     "127.0.0.1:$RUST_CLUSTER_C_BIN_PORT"
   rust_cl_rem_rate=$CAPTURED_RATE rust_cl_rem_cpu=$CAPTURED_CPU rust_cl_rem_rss=$CAPTURED_RSS rust_cl_rem_ctx=$CAPTURED_CTX
@@ -1120,14 +1118,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_GW_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across both gateway nodes.
+    sub_rate_sum=0
     for s in 1 2; do
+      sr=$(extract_rate < "/tmp/bench_gw_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_gw_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_gw_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 2 ))
     BG_PIDS=()
   done
   echo ""
@@ -1153,14 +1154,17 @@ if [[ "$MODE" == "full" ]]; then
     output=$(nats bench pub "bench.gw.fan" --msgs "$MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$RUST_GW_A_PORT" 2>&1)
     echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
-    rate_sum=$(( rate_sum + ${rate:-0} ))
 
     for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    # Average sub rate across both gateway nodes.
+    sub_rate_sum=0
     for s in 1 2; do
+      sr=$(extract_rate < "/tmp/bench_gw_sub_${s}.out" 2>/dev/null || echo 0)
+      sub_rate_sum=$(( sub_rate_sum + ${sr:-0} ))
       grep -E "stats:" "/tmp/bench_gw_sub_${s}.out" 2>/dev/null | sed "s/^/  sub[$s] /" || true
       rm -f "/tmp/bench_gw_sub_${s}.out"
     done
+    rate_sum=$(( rate_sum + sub_rate_sum / 2 ))
     BG_PIDS=()
   done
   echo ""
@@ -1253,6 +1257,7 @@ echo "  SUMMARY ($MODE mode)"
 echo "  msgs=$MSGS  size=${SIZE}B  runs=$RUNS  bin_duration=${BIN_DURATION}s"
 echo "  Scenarios 1-3, 14-16: Go+NATS text vs open-wire+Binary protocol"
 echo "  Scenarios 4-5: Go+NATS text vs open-wire+NATS text (cross-server leaf)"
+echo "  Rate = subscriber-side msgs/sec (delivered); pub-only scenario uses pub rate"
 echo "================================================================"
 echo ""
 
