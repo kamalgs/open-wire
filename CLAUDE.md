@@ -17,13 +17,14 @@ src/
 ├── lib.rs               # Module declarations + public re-exports
 ├── config.rs            # Go nats-server .conf file parser
 ├── protocol/
-│   ├── mod.rs           # types + nats_proto
+│   ├── mod.rs           # types + nats_proto + bin_proto
 │   ├── types.rs         # ServerInfo, ConnectInfo, HeaderMap
-│   └── nats_proto.rs    # ClientOp/LeafOp/RouteOp, MsgBuilder, parsers
+│   ├── nats_proto.rs    # ClientOp/LeafOp/RouteOp, MsgBuilder, parsers
+│   └── bin_proto.rs     # Binary wire protocol encoder/decoder (9-byte header)
 ├── io/
 │   ├── mod.rs           # buf + msg_writer + websocket
 │   ├── buf.rs           # AdaptiveBuf, BufConfig, Backoff, op re-exports
-│   ├── msg_writer.rs    # MsgWriter, create_eventfd
+│   ├── msg_writer.rs    # MsgWriter, BinSegBuf, create_eventfd, congestion signal
 │   └── websocket.rs     # WsCodec, HTTP upgrade, SHA-1/Base64
 ├── pubsub/
 │   ├── mod.rs           # sub_list
@@ -54,6 +55,8 @@ src/
         ├── handler.rs   # Inbound leaf protocol dispatch (LS+/LS-/LMSG)
         ├── upstream.rs  # Hub connection via leaf node protocol
         └── interest.rs  # InterestPipeline: subject mapping + interest collapse
+bin/
+└── bench.rs         # Binary-protocol benchmark tool (--pub, --sub, --size, --duration)
 examples/
 └── chat/            # Sample chat app (HTML + README)
 tests/
@@ -66,6 +69,7 @@ tests/
 ├── profile_pubsub.sh   # Ad-hoc perf: pubsub with frame pointers
 ├── profile_pubonly.sh   # Ad-hoc perf: pub-only with frame pointers
 ├── profile_hubleaf.sh   # Ad-hoc perf: hub→leaf with frame pointers
+├── profile_cluster.sh   # Ad-hoc perf: cluster pub/sub with frame pointers
 ├── memory.sh        # Idle-connection memory comparison (Go vs Rust)
 ├── clients/         # Go helper binary for memory bench
 └── configs/         # nats-server configs for benchmarks
@@ -117,6 +121,9 @@ cargo build --release
 
 # Build release with mesh
 cargo build --release --features mesh
+
+# Build release with binary-client (includes bench tool)
+cargo build --release --features binary-client
 
 # Build release with frame pointers (for perf profiling)
 RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
@@ -180,6 +187,8 @@ Always run `cargo +nightly fmt` before committing.
 - **AdaptiveBuf**: Go-style dynamic buffer sizing (512B → 64KB).
 - **Full-mesh clustering** (`mesh` feature): Route connections between peers using RS+/RS-/RMSG
   protocol. One-hop message forwarding — messages from routes are never re-forwarded to other routes.
+- **Route backpressure**: Per-connection `read_budget` shrinks when publishing to congested routes
+  (AtomicU8 congestion signal). TCP flow control throttles publishers naturally. No blocking.
 
 ### Key Types
 
@@ -189,12 +198,13 @@ Always run `cargo +nightly fmt` before committing.
 | `ServerConfig` | `core/server.rs` | Server configuration |
 | `load_config` | `config.rs` | Go nats-server `.conf` file parser |
 | `Worker` | `core/worker.rs` | Per-thread epoll event loop |
-| `NatsProto` / `MsgBuilder` | `core/protocol/nats_proto.rs` | Protocol parser + message builder |
-| `SubscriptionManager` | `core/pubsub/sub_list.rs` | Subscription storage + wildcard matching |
-| `MsgWriter` | `core/io/msg_writer.rs` | Shared buffer + eventfd cross-worker delivery |
-| `ServerConn` | `core/io/buf.rs` | Connection I/O wrapper (test-only) |
-| `Backoff` | `core/io/buf.rs` | Exponential backoff with jitter |
-| `AdaptiveBuf` | `core/io/buf.rs` | Dynamic read buffer |
+| `NatsProto` / `MsgBuilder` | `protocol/nats_proto.rs` | Protocol parser + message builder |
+| `BinProto` | `protocol/bin_proto.rs` | Binary wire protocol (9-byte header) |
+| `SubscriptionManager` | `pubsub/sub_list.rs` | Subscription storage + wildcard matching |
+| `MsgWriter` | `io/msg_writer.rs` | Shared buffer + eventfd + congestion signal |
+| `BinSegBuf` | `io/msg_writer.rs` | Zero-copy segment buffer for binary routes |
+| `BufConfig` | `io/buf.rs` | Buffer sizes + max_pending / max_pending_route |
+| `AdaptiveBuf` | `io/buf.rs` | Dynamic read buffer (512B → 64KB) |
 | `LeafConn` | `connector/leaf/conn.rs` | Leaf connection I/O wrapper |
 | `Upstream` | `connector/leaf/upstream.rs` | Hub connection management |
 | `InterestPipeline` | `connector/leaf/interest.rs` | Subject mapping + interest collapse |
@@ -214,6 +224,7 @@ Always run `cargo +nightly fmt` before committing.
 | `mesh` | no | Full mesh route clustering (RS+/RS-/RMSG) |
 | `gateway` | no | Gateway inter-cluster traffic |
 | `accounts` | no | Multi-tenant per-account subject isolation |
+| `binary-client` | no | Binary wire protocol client port (9-byte header) |
 | `worker-affinity` | no | Subject-based worker affinity tracking |
 
 ## Dependencies
