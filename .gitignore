@@ -19,4 +19,4 @@ mise.toml
 bench_clients_bin
 
 # Profiling output
-**/profile_results/
+**/profile_results/doc/

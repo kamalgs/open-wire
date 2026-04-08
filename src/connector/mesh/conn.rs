@@ -23,7 +23,7 @@ use crate::handler::{
     deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,
 };
 use crate::nats_proto::{self, MsgBuilder, RouteOp};
-use crate::sub_list::{MsgWriter, Subscription};
+use crate::sub_list::{MsgWriter, SubKind, Subscription};
 
 /// Virtual connection ID range for outbound route connections.
 /// Uses high IDs to avoid collision with inbound connection IDs.
@@ -618,26 +618,16 @@ fn handle_route_op(
                 .as_ref()
                 .map(|q| unsafe { std::str::from_utf8_unchecked(q) }.to_string());
 
-            let sub = Subscription {
+            let sub = Subscription::new(
                 conn_id,
                 sid,
-                sid_bytes: nats_proto::sid_to_bytes(sid),
-                subject: subject_str.to_string(),
-                queue: queue_str,
-                writer: direct_writer.clone(),
-                max_msgs: AtomicU64::new(0),
-                delivered: AtomicU64::new(0),
-                is_leaf: false,
-                is_route: true,
-
-                is_gateway: false,
-
-                is_binary_client: false,
+                subject_str.to_string(),
+                queue_str,
+                direct_writer.clone(),
+                SubKind::Route,
                 #[cfg(feature = "accounts")]
-                account_id: 0,
-
-                leaf_perms: None,
-            };
+                0,
+            );
 
             let mut subs = state
                 .get_subs(
@@ -751,26 +741,16 @@ fn handle_bin_frame(
                 .as_ref()
                 .map(|q| unsafe { std::str::from_utf8_unchecked(q) }.to_string());
 
-            let sub = Subscription {
+            let sub = Subscription::new(
                 conn_id,
                 sid,
-                sid_bytes: nats_proto::sid_to_bytes(sid),
-                subject: subject_str.to_string(),
-                queue: queue_str,
-                writer: direct_writer.clone(),
-                max_msgs: AtomicU64::new(0),
-                delivered: AtomicU64::new(0),
-                is_leaf: false,
-                is_route: true,
-
-                is_gateway: false,
-
-                is_binary_client: false,
+                subject_str.to_string(),
+                queue_str,
+                direct_writer.clone(),
+                SubKind::Route,
                 #[cfg(feature = "accounts")]
-                account_id: 0,
-
-                leaf_perms: None,
-            };
+                0,
+            );
 
             let mut subs = state
                 .get_subs(

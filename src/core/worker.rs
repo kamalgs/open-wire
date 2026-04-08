@@ -2718,9 +2718,8 @@ impl Worker {
     fn process_active_binary_client(&mut self, conn_id: u64) -> bool {
         use crate::handler::propagation::propagate_all_interest;
         use crate::handler::{DeliveryScope, Msg};
-        use crate::nats_proto::sid_to_bytes;
         use crate::protocol::bin_proto::{self, BinOp};
-        use crate::sub_list::Subscription;
+        use crate::sub_list::{SubKind, Subscription};
 
         let frame = {
             let client = self.conns.get_mut(&conn_id).unwrap();
@@ -2808,27 +2807,16 @@ impl Worker {
                     .get(&conn_id)
                     .map(|c| c.direct_writer.clone())
                     .unwrap();
-                let sub = Subscription {
+                let sub = Subscription::new(
                     conn_id,
                     sid,
-                    sid_bytes: sid_to_bytes(sid),
-                    subject: subject_str.to_string(),
-                    queue: queue_str,
+                    subject_str.to_string(),
+                    queue_str,
                     writer,
-                    max_msgs: std::sync::atomic::AtomicU64::new(0),
-                    delivered: std::sync::atomic::AtomicU64::new(0),
-                    is_leaf: false,
-
-                    is_route: false,
-
-                    is_gateway: false,
-
-                    is_binary_client: true,
+                    SubKind::BinaryClient,
                     #[cfg(feature = "accounts")]
-                    account_id: 0,
-
-                    leaf_perms: None,
-                };
+                    0,
+                );
                 {
                     let mut subs = self
                         .state

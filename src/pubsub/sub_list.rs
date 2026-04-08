@@ -10,6 +10,41 @@ pub(crate) use crate::msg_writer::{BinSeg, BinSegBuf};
 /// Backward-compatible alias for `MsgWriter`.
 pub(crate) type DirectWriter = MsgWriter;
 
+/// What kind of endpoint this subscription targets.
+/// Determines the wire format used for delivery and scope-filtering behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubKind {
+    /// Local NATS text-protocol client (MSG).
+    Client,
+    /// Inbound leaf node (LMSG).
+    Leaf,
+    /// Route peer in the same cluster (RMSG text or binary).
+    Route,
+    /// Gateway peer in a different cluster (RMSG).
+    Gateway,
+    /// Binary-protocol client (binary Msg frame via write_rmsg).
+    BinaryClient,
+}
+
+impl SubKind {
+    #[inline]
+    pub fn is_route(self) -> bool {
+        matches!(self, Self::Route)
+    }
+    #[inline]
+    pub fn is_gateway(self) -> bool {
+        matches!(self, Self::Gateway)
+    }
+    #[inline]
+    pub fn is_leaf(self) -> bool {
+        matches!(self, Self::Leaf)
+    }
+    #[inline]
+    pub fn is_local(self) -> bool {
+        matches!(self, Self::Client | Self::BinaryClient)
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct Subscription {
@@ -21,27 +56,46 @@ pub struct Subscription {
     pub subject: String,
     pub queue: Option<String>,
     /// Message writer to the client's shared write buffer.
-    /// Formats MSG bytes synchronously, bypassing mpsc channel overhead.
     pub(crate) writer: MsgWriter,
     /// Maximum messages to deliver before auto-unsubscribe. 0 = no limit.
-    /// Atomic because `for_each_match` holds a read lock while multiple workers deliver.
     pub(crate) max_msgs: AtomicU64,
     /// Number of messages delivered so far (only incremented when max_msgs > 0).
     pub(crate) delivered: AtomicU64,
-    /// True for inbound leaf node subscriptions (deliver via LMSG, not MSG).
-    pub is_leaf: bool,
-    /// True for route peer subscriptions (deliver via RMSG, not MSG).
-    pub is_route: bool,
-    /// True for gateway peer subscriptions (deliver via RMSG, not MSG).
-    pub is_gateway: bool,
-    /// True for binary-protocol client subscriptions (deliver via binary RMSG).
-    pub is_binary_client: bool,
+    /// What kind of endpoint this subscription targets.
+    pub kind: SubKind,
     /// Account this subscription belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     pub account_id: crate::core::server::AccountId,
-    /// Per-leaf publish permissions. Used during delivery to filter messages
-    /// that the leaf is not allowed to receive (subscribe permission check).
+    /// Per-leaf publish permissions (leaf subs only).
     pub leaf_perms: Option<std::sync::Arc<crate::core::server::Permissions>>,
+}
+
+impl Subscription {
+    /// Create a subscription for the given kind.
+    pub(crate) fn new(
+        conn_id: u64,
+        sid: u64,
+        subject: String,
+        queue: Option<String>,
+        writer: MsgWriter,
+        kind: SubKind,
+        #[cfg(feature = "accounts")] account_id: crate::core::server::AccountId,
+    ) -> Self {
+        Self {
+            conn_id,
+            sid,
+            sid_bytes: crate::nats_proto::sid_to_bytes(sid),
+            subject,
+            queue,
+            writer,
+            max_msgs: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
+            kind,
+            #[cfg(feature = "accounts")]
+            account_id,
+            leaf_perms: None,
+        }
+    }
 }
 
 impl Clone for Subscription {
@@ -55,16 +109,9 @@ impl Clone for Subscription {
             writer: self.writer.clone(),
             max_msgs: AtomicU64::new(self.max_msgs.load(Ordering::Relaxed)),
             delivered: AtomicU64::new(self.delivered.load(Ordering::Relaxed)),
-            is_leaf: self.is_leaf,
-
-            is_route: self.is_route,
-
-            is_gateway: self.is_gateway,
-
-            is_binary_client: self.is_binary_client,
+            kind: self.kind,
             #[cfg(feature = "accounts")]
             account_id: self.account_id,
-
             leaf_perms: self.leaf_perms.clone(),
         }
     }
@@ -72,30 +119,35 @@ impl Clone for Subscription {
 
 impl Subscription {
     /// Create a subscription without a real DirectWriter (for benchmarks/tests).
-    /// Messages written to this subscription's writer are discarded.
     pub fn new_dummy(conn_id: u64, sid: u64, subject: String, queue: Option<String>) -> Self {
-        let writer = DirectWriter::new_dummy();
-        Self {
+        Self::new(
             conn_id,
             sid,
-            sid_bytes: Bytes::from(sid.to_string().into_bytes()),
             subject,
             queue,
-            writer,
-            max_msgs: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
-            is_leaf: false,
-
-            is_route: false,
-
-            is_gateway: false,
-
-            is_binary_client: false,
+            DirectWriter::new_dummy(),
+            SubKind::Client,
             #[cfg(feature = "accounts")]
-            account_id: 0,
+            0,
+        )
+    }
 
-            leaf_perms: None,
-        }
+    // Backward-compat helpers used in delivery.rs and sub_list.rs tests.
+    #[inline]
+    pub fn is_route(&self) -> bool {
+        self.kind.is_route()
+    }
+    #[inline]
+    pub fn is_leaf(&self) -> bool {
+        self.kind.is_leaf()
+    }
+    #[inline]
+    pub fn is_gateway(&self) -> bool {
+        self.kind.is_gateway()
+    }
+    #[inline]
+    pub fn is_binary_client(&self) -> bool {
+        matches!(self.kind, SubKind::BinaryClient)
     }
 }
 
@@ -678,10 +730,10 @@ impl SubscriptionManager {
     pub fn has_local_interest(&self, subject: &str) -> bool {
         if let Some(subs) = self.exact.get(subject) {
             for sub in subs {
-                if sub.is_route {
+                if sub.is_route() {
                     continue;
                 }
-                if sub.is_gateway {
+                if sub.is_gateway() {
                     continue;
                 }
                 return true;
@@ -694,10 +746,10 @@ impl SubscriptionManager {
                 return;
             }
 
-            if sub.is_route {
+            if sub.is_route() {
                 return;
             }
-            if sub.is_gateway {
+            if sub.is_gateway() {
                 return;
             }
             found = true;
@@ -711,12 +763,12 @@ impl SubscriptionManager {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
             for sub in subs {
-                if !sub.is_leaf {
-                    if sub.is_route {
+                if !sub.is_leaf() {
+                    if sub.is_route() {
                         continue;
                     }
 
-                    if sub.is_gateway {
+                    if sub.is_gateway() {
                         continue;
                     }
                     set.insert((subj.as_str(), sub.queue.as_deref()));
@@ -724,12 +776,12 @@ impl SubscriptionManager {
             }
         }
         self.wild.for_each_sub(|sub| {
-            if !sub.is_leaf {
-                if sub.is_route {
+            if !sub.is_leaf() {
+                if sub.is_route() {
                     return;
                 }
 
-                if sub.is_gateway {
+                if sub.is_gateway() {
                     return;
                 }
                 set.insert((sub.subject.as_str(), sub.queue.as_deref()));
@@ -744,22 +796,22 @@ impl SubscriptionManager {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
             for sub in subs {
-                if sub.is_route {
+                if sub.is_route() {
                     continue;
                 }
 
-                if sub.is_gateway {
+                if sub.is_gateway() {
                     continue;
                 }
                 set.insert((subj.as_str(), sub.queue.as_deref()));
             }
         }
         self.wild.for_each_sub(|sub| {
-            if sub.is_route {
+            if sub.is_route() {
                 return;
             }
 
-            if sub.is_gateway {
+            if sub.is_gateway() {
                 return;
             }
             set.insert((sub.subject.as_str(), sub.queue.as_deref()));
@@ -1236,12 +1288,12 @@ mod tests {
 
         // Leaf sub — should be excluded from client_interests
         let mut leaf_sub = Subscription::new_dummy(10, 1, "foo".to_string(), None);
-        leaf_sub.is_leaf = true;
+        leaf_sub.kind = SubKind::Leaf;
         sl.insert(leaf_sub);
 
         let mut leaf_queue_sub =
             Subscription::new_dummy(11, 1, "bar".to_string(), Some("q1".to_string()));
-        leaf_queue_sub.is_leaf = true;
+        leaf_queue_sub.kind = SubKind::Leaf;
         sl.insert(leaf_queue_sub);
 
         let interests = sl.client_interests();
@@ -1311,7 +1363,7 @@ mod tests {
 
         // Gateway sub only — should NOT count as local interest
         let mut gw_sub = Subscription::new_dummy(10, 1, "foo".to_string(), None);
-        gw_sub.is_gateway = true;
+        gw_sub.kind = SubKind::Gateway;
         sl.insert(gw_sub);
 
         assert!(!sl.has_local_interest("foo"));

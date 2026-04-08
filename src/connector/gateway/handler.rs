@@ -5,7 +5,7 @@
 //! interest semantics: one outbound connection per remote cluster, and
 //! reply subject rewriting for cross-cluster request-reply.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use metrics::gauge;
@@ -18,7 +18,7 @@ use crate::handler::{
 };
 use crate::nats_proto;
 use crate::nats_proto::GatewayOp;
-use crate::sub_list::Subscription;
+use crate::sub_list::{SubKind, Subscription};
 
 /// Handles gateway protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct GatewayHandler;
@@ -120,26 +120,16 @@ impl GatewayHandler {
             _ => unreachable!("gateway op on non-gateway connection"),
         };
 
-        let sub = Subscription {
-            conn_id: conn.conn_id,
+        let sub = Subscription::new(
+            conn.conn_id,
             sid,
-            sid_bytes: nats_proto::sid_to_bytes(sid),
-            subject: subject_str.to_string(),
-            queue: queue_str,
-            writer: conn.direct_writer.clone(),
-            max_msgs: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
-            is_leaf: false,
-
-            is_route: false,
-            is_gateway: true,
-
-            is_binary_client: false,
+            subject_str.to_string(),
+            queue_str,
+            conn.direct_writer.clone(),
+            SubKind::Gateway,
             #[cfg(feature = "accounts")]
-            account_id: 0,
-
-            leaf_perms: None,
-        };
+            0,
+        );
 
         {
             let mut subs = wctx

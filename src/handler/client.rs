@@ -2,7 +2,7 @@
 //!
 //! Dispatched by the worker for connections with `ConnExt::Client`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use metrics::{counter, gauge};
@@ -14,7 +14,7 @@ use crate::handler::{
     MessageDeliveryHub, Msg,
 };
 use crate::nats_proto::{self, ClientOp};
-use crate::sub_list::Subscription;
+use crate::sub_list::{SubKind, Subscription};
 
 /// Handles client protocol operations (PUB, SUB, UNSUB, PING, PONG).
 pub(crate) struct ClientHandler;
@@ -106,23 +106,16 @@ impl ClientHandler {
         // Clone for upstream propagation before moving into Subscription
         let upstream_queue = queue_str.clone();
 
-        let sub = Subscription {
-            conn_id: conn.conn_id,
+        let sub = Subscription::new(
+            conn.conn_id,
             sid,
-            sid_bytes: nats_proto::sid_to_bytes(sid),
-            subject: subject_str.to_string(),
-            queue: queue_str,
-            writer: conn.direct_writer.clone(),
-            max_msgs: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
-            is_leaf: false,
-            is_route: false,
-            is_gateway: false,
-            is_binary_client: false,
+            subject_str.to_string(),
+            queue_str,
+            conn.direct_writer.clone(),
+            SubKind::Client,
             #[cfg(feature = "accounts")]
-            account_id: conn.account_id,
-            leaf_perms: None,
-        };
+            conn.account_id,
+        );
 
         {
             let mut subs = wctx

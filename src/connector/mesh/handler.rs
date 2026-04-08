@@ -2,7 +2,7 @@
 //!
 //! Dispatched by the worker for connections with `ConnExt::Route`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use metrics::gauge;
@@ -16,7 +16,7 @@ use crate::handler::{
     MessageDeliveryHub, Msg,
 };
 use crate::nats_proto;
-use crate::sub_list::Subscription;
+use crate::sub_list::{SubKind, Subscription};
 
 /// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct RouteHandler;
@@ -151,26 +151,16 @@ impl RouteHandler {
             _ => unreachable!("route op on non-route connection"),
         };
 
-        let sub = Subscription {
-            conn_id: conn.conn_id,
+        let sub = Subscription::new(
+            conn.conn_id,
             sid,
-            sid_bytes: nats_proto::sid_to_bytes(sid),
-            subject: subject_str.to_string(),
-            queue: queue_str,
-            writer: conn.direct_writer.clone(),
-            max_msgs: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
-            is_leaf: false,
-            is_route: true,
-
-            is_gateway: false,
-
-            is_binary_client: false,
+            subject_str.to_string(),
+            queue_str,
+            conn.direct_writer.clone(),
+            SubKind::Route,
             #[cfg(feature = "accounts")]
             account_id,
-
-            leaf_perms: None,
-        };
+        );
 
         {
             let mut subs = wctx

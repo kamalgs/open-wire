@@ -207,7 +207,7 @@ pub(crate) fn deliver_to_sub_inner(
     msg: &Msg<'_>,
     #[cfg(feature = "accounts")] account_name: &[u8],
 ) -> bool {
-    if sub.is_route {
+    if sub.is_route() {
         sub.writer.write_rmsg(
             &msg.subject,
             msg.reply.as_deref(),
@@ -218,7 +218,7 @@ pub(crate) fn deliver_to_sub_inner(
         );
         return true;
     }
-    if sub.is_leaf {
+    if sub.is_leaf() {
         // Check subscribe permissions: don't deliver to leaf if the subject
         // is not in the leaf's allowed subscribe set.
         if let Some(ref perms) = sub.leaf_perms {
@@ -236,7 +236,7 @@ pub(crate) fn deliver_to_sub_inner(
         return true;
     }
     // Binary-protocol client subscriptions: deliver via binary Msg frame.
-    if sub.is_binary_client {
+    if sub.is_binary_client() {
         sub.writer.write_rmsg(
             &msg.subject,
             msg.reply.as_deref(),
@@ -288,17 +288,17 @@ where
                 return false;
             }
 
-            if scope.skip_routes && sub.is_route {
+            if scope.skip_routes && sub.is_route() {
                 return false;
             }
 
-            if scope.skip_gateways && sub.is_gateway {
+            if scope.skip_gateways && sub.is_gateway() {
                 return false;
             }
             true
         },
         |sub| {
-            if sub.is_gateway {
+            if sub.is_gateway() {
                 let gw_reply =
                     crate::handler::propagation::rewrite_gateway_reply(msg.reply.as_deref(), state);
                 sub.writer.write_rmsg(
@@ -372,7 +372,7 @@ pub(crate) fn deliver_to_subs(
             wctx.queue_notify(sub.writer.event_raw_fd());
             // Signal route congestion so the worker can reduce this client's read budget.
 
-            if sub.is_route && sub.writer.congestion() >= 1 {
+            if sub.is_route() && sub.writer.congestion() >= 1 {
                 wctx.route_congested = true;
             }
         },
@@ -761,7 +761,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
     use std::sync::Arc;
 
-    use crate::sub_list::{DirectWriter, SubList, Subscription};
+    use crate::sub_list::{DirectWriter, SubKind, SubList, Subscription};
 
     use super::*;
 
@@ -859,27 +859,16 @@ mod tests {
         queue: Option<&str>,
         writer: &DirectWriter,
     ) -> Subscription {
-        Subscription {
+        Subscription::new(
             conn_id,
             sid,
-            sid_bytes: bytes::Bytes::from(sid.to_string().into_bytes()),
-            subject: subject.to_string(),
-            queue: queue.map(|s| s.to_string()),
-            writer: writer.clone(),
-            max_msgs: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
-            is_leaf: false,
-
-            is_route: false,
-
-            is_gateway: false,
-
-            is_binary_client: false,
+            subject.to_string(),
+            queue.map(|s| s.to_string()),
+            writer.clone(),
+            SubKind::Client,
             #[cfg(feature = "accounts")]
-            account_id: 0,
-
-            leaf_perms: None,
-        }
+            0,
+        )
     }
 
     /// Helper to run deliver_to_subs_core directly against a SubList.
@@ -1007,7 +996,7 @@ mod tests {
         let writer = DirectWriter::new_dummy();
         let mut subs = SubList::new();
         let mut sub = sub_with_writer(1, 1, "foo", None, &writer);
-        sub.is_route = true;
+        sub.kind = SubKind::Route;
         subs.insert(sub);
 
         let (delivered, _) =
@@ -1025,7 +1014,7 @@ mod tests {
         let mut subs = SubList::new();
         subs.insert(sub_with_writer(1, 1, "foo", None, &client_w));
         let mut route_sub = sub_with_writer(2, 1, "foo", None, &route_w);
-        route_sub.is_route = true;
+        route_sub.kind = SubKind::Route;
         subs.insert(route_sub);
 
         let (delivered, _) =
@@ -1046,13 +1035,13 @@ mod tests {
         {
             let route_w = DirectWriter::new_dummy();
             let mut route_sub = sub_with_writer(2, 1, "foo", None, &route_w);
-            route_sub.is_route = true;
+            route_sub.kind = SubKind::Route;
             subs.insert(route_sub);
         }
 
         let gw_w = DirectWriter::new_dummy();
         let mut gw_sub = sub_with_writer(3, 1, "foo", None, &gw_w);
-        gw_sub.is_gateway = true;
+        gw_sub.kind = SubKind::Gateway;
         subs.insert(gw_sub);
 
         let (delivered, _) =
@@ -1074,7 +1063,7 @@ mod tests {
         {
             let route_w = DirectWriter::new_dummy();
             let mut route_sub = sub_with_writer(2, 1, "foo", None, &route_w);
-            route_sub.is_route = true;
+            route_sub.kind = SubKind::Route;
             subs.insert(route_sub);
             total_expected += 1;
         }
@@ -1090,7 +1079,7 @@ mod tests {
     fn test_deliver_to_leaf_sub_writes_lmsg() {
         let writer = DirectWriter::new_dummy();
         let mut sub = sub_with_writer(1, 1, "foo.bar", None, &writer);
-        sub.is_leaf = true;
+        sub.kind = SubKind::Leaf;
 
         let msg = Msg::new(
             Bytes::from_static(b"foo.bar"),
@@ -1118,7 +1107,7 @@ mod tests {
 
         let writer = DirectWriter::new_dummy();
         let mut sub = sub_with_writer(1, 1, "secret.data", None, &writer);
-        sub.is_leaf = true;
+        sub.kind = SubKind::Leaf;
         sub.leaf_perms = Some(Arc::new(Permissions {
             publish: Permission {
                 allow: Vec::new(),
@@ -1152,7 +1141,7 @@ mod tests {
     fn test_deliver_to_route_sub_writes_rmsg() {
         let writer = DirectWriter::new_dummy();
         let mut sub = sub_with_writer(1, 1, "foo.bar", None, &writer);
-        sub.is_route = true;
+        sub.kind = SubKind::Route;
 
         let msg = Msg::new(
             Bytes::from_static(b"foo.bar"),

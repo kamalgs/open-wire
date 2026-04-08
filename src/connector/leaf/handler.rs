@@ -2,7 +2,7 @@
 //!
 //! Dispatched by the worker for connections with `ConnExt::Leaf`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use metrics::gauge;
@@ -17,7 +17,7 @@ use crate::handler::{
     MessageDeliveryHub, Msg,
 };
 use crate::nats_proto;
-use crate::sub_list::Subscription;
+use crate::sub_list::{SubKind, Subscription};
 
 /// Handles leaf node protocol operations (LS+, LS-, LMSG, PING, PONG).
 pub(crate) struct LeafHandler;
@@ -109,26 +109,17 @@ impl LeafHandler {
 
         let upstream_queue = queue_str.clone();
 
-        let sub = Subscription {
-            conn_id: conn.conn_id,
+        let mut sub = Subscription::new(
+            conn.conn_id,
             sid,
-            sid_bytes: nats_proto::sid_to_bytes(sid),
-            subject: subject_str.to_string(),
-            queue: queue_str,
-            writer: conn.direct_writer.clone(),
-            max_msgs: AtomicU64::new(0),
-            delivered: AtomicU64::new(0),
-            is_leaf: true,
-
-            is_route: false,
-
-            is_gateway: false,
-
-            is_binary_client: false,
+            subject_str.to_string(),
+            queue_str,
+            conn.direct_writer.clone(),
+            SubKind::Leaf,
             #[cfg(feature = "accounts")]
-            account_id: 0,
-            leaf_perms: leaf_perms_arc,
-        };
+            0,
+        );
+        sub.leaf_perms = leaf_perms_arc;
 
         {
             let mut subs = wctx
