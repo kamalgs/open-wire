@@ -753,63 +753,24 @@ impl Worker {
 
     /// Create a binary-protocol client connection — no handshake, active immediately.
     fn add_binary_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
-        stream.set_nonblocking(true).ok();
-        stream.set_nodelay(true).ok();
-        let fd = stream.as_raw_fd();
+        // Binary clients use register_conn with an empty INFO (no handshake)
+        // and then upgrade to Active phase with binary DirectBuf.
+        self.register_conn(id, stream, addr, b"", ConnExt::BinaryClient);
 
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: id,
-        };
-        let ret =
-            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
-        if ret != 0 {
-            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for binary client");
-            return;
+        // Upgrade: replace text DirectBuf with binary, set phase to Active.
+        if let Some(client) = self.conns.get_mut(&id) {
+            let direct_buf = Arc::new(Mutex::new(DirectBuf::Binary(BinSegBuf::new())));
+            let has_pending = Arc::new(AtomicBool::new(false));
+            client.direct_writer = MsgWriter::new_binary_shared(
+                Arc::clone(&direct_buf),
+                Arc::clone(&has_pending),
+                Arc::clone(&self.event_fd),
+            );
+            client.direct_buf = direct_buf;
+            client.has_pending = has_pending;
+            client.phase = ConnPhase::Active;
+            client.echo = false;
         }
-
-        // Binary clients share the same zero-copy segment buffer path as route connections.
-        let direct_buf = Arc::new(Mutex::new(DirectBuf::Binary(BinSegBuf::new())));
-        let has_pending = Arc::new(AtomicBool::new(false));
-        let direct_writer = MsgWriter::new_binary_shared(
-            Arc::clone(&direct_buf),
-            Arc::clone(&has_pending),
-            Arc::clone(&self.event_fd),
-        );
-
-        let client = ClientState {
-            fd,
-            _stream: stream,
-            read_buf: AdaptiveBuf::new(self.state.buf_config.max_read_buf),
-            write_buf: BytesMut::new(),
-            direct_writer,
-            direct_buf,
-            has_pending,
-            phase: ConnPhase::Active,
-            transport: Transport::Raw,
-            ext: ConnExt::BinaryClient,
-
-            upstream_txs: Vec::new(),
-            epoll_has_out: false,
-            echo: false,
-            no_responders: false,
-            accepted_at: Instant::now(),
-            last_activity: Instant::now(),
-            pings_outstanding: 0,
-            sub_count: 0,
-            permissions: None,
-            #[cfg(feature = "accounts")]
-            account_id: 0,
-            read_budget: usize::MAX,
-        };
-
-        self.fd_to_conn.insert(fd, id);
-        self.conns.insert(id, client);
-
-        counter!("binary_connections_total", "worker" => self.worker_label.clone()).increment(1);
-        gauge!("connections_active", "worker" => self.worker_label.clone())
-            .set(self.conns.len() as f64);
-        debug!(id, addr = %addr, "accepted binary client connection");
     }
 
     fn remove_conn(&mut self, conn_id: u64) {
