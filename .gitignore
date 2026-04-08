@@ -20,3 +20,4 @@ bench_clients_bin
 
 # Profiling output
 **/profile_results/doc/
+tests/profile_results/

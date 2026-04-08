@@ -1052,6 +1052,71 @@ impl AffinityMap {
     }
 }
 
+/// Runtime state for full-mesh clustering (route connections).
+pub(crate) struct ClusterState {
+    /// Registry of MsgWriters for inbound route connections.
+    /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
+    pub route_writers: std::sync::RwLock<FxHashMap<u64, MsgWriter>>,
+    /// Port for inbound route connections. `None` when cluster mode is not enabled.
+    pub port: Option<u16>,
+    /// Cluster name. Must match between peers.
+    pub name: Option<String>,
+    /// Seed route URLs for outbound connections.
+    pub seeds: Vec<String>,
+    /// Registry of connected route peers and known route URLs.
+    pub route_peers: Mutex<RoutePeerRegistry>,
+    /// Channel sender for the route coordinator thread. New gossip-discovered URLs
+    /// are sent here to trigger outbound connections.
+    pub connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+}
+
+/// Runtime state for gateway inter-cluster connections.
+pub(crate) struct GatewayState {
+    /// Registry of MsgWriters for inbound gateway connections.
+    pub writers: std::sync::RwLock<FxHashMap<u64, MsgWriter>>,
+    /// Port for inbound gateway connections.
+    pub port: Option<u16>,
+    /// This cluster's gateway name.
+    pub name: Option<String>,
+    /// Remote clusters to connect to via gateways.
+    pub remotes: Vec<GatewayRemote>,
+    /// Registry of connected gateway peers and known gateway URLs.
+    pub peers: Mutex<GatewayPeerRegistry>,
+    /// Channel sender for the gateway coordinator thread.
+    pub connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    /// Pre-computed `_GR_.<cluster_hash>.<server_hash>.` prefix for reply rewriting.
+    pub reply_prefix: Vec<u8>,
+    /// Cached INFO JSON line for gateway handshake and gossip.
+    /// Rebuilt when gateway URLs change.
+    pub cached_info: Mutex<String>,
+    /// Per-outbound-gateway interest mode state (optimistic → interest-only transition).
+    /// Keyed by outbound gateway conn_id. Used for optimistic forwarding and
+    /// negative interest tracking.
+    pub interest: std::sync::RwLock<FxHashMap<u64, GatewayInterestState>>,
+    /// Fast flag: true when any outbound gateway is in Optimistic mode.
+    /// Prevents the can_skip PUB optimization from discarding messages
+    /// that need to be forwarded across optimistic gateways.
+    pub has_interest: AtomicBool,
+}
+
+/// Runtime state for upstream/leaf node connections.
+pub(crate) struct LeafState {
+    pub upstreams: std::sync::RwLock<Vec<Upstream>>,
+    /// Lock-free senders for forwarding publishes to upstream hubs.
+    /// One entry per connected hub remote. Read without locking on every publish.
+    pub upstream_txs: std::sync::RwLock<Vec<mpsc::Sender<UpstreamCmd>>>,
+    /// Port advertised in INFO to inbound leaf connections (`leafnodes.listen` port).
+    /// `None` when hub mode is not enabled.
+    pub port: Option<u16>,
+    /// Registry of MsgWriters for inbound leaf connections.
+    /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
+    /// Each entry stores the writer and the leaf's optional publish permissions.
+    #[allow(clippy::type_complexity)]
+    pub inbound_writers: std::sync::RwLock<FxHashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
+    /// Inbound leaf node authentication configuration.
+    pub inbound_auth: LeafAuth,
+}
+
 pub(crate) struct ServerState {
     pub info: ServerInfo,
     pub auth: ClientAuth,
@@ -1077,10 +1142,6 @@ pub(crate) struct ServerState {
     #[cfg(feature = "accounts")]
     pub reverse_imports: Vec<Vec<ReverseImport>>,
 
-    pub upstreams: std::sync::RwLock<Vec<Upstream>>,
-    /// Lock-free senders for forwarding publishes to upstream hubs.
-    /// One entry per connected hub remote. Read without locking on every publish.
-    pub upstream_txs: std::sync::RwLock<Vec<mpsc::Sender<UpstreamCmd>>>,
     /// Lock-free flag: true when at least one subscription exists.
     /// Updated on subscribe/unsubscribe. Avoids taking subs lock on every publish
     /// just to check emptiness.
@@ -1101,59 +1162,16 @@ pub(crate) struct ServerState {
     pub max_subscriptions: AtomicUsize,
     /// Aggregated server statistics.
     pub stats: ServerStats,
-    /// Port advertised in INFO to inbound leaf connections (`leafnodes.listen` port).
-    /// `None` when hub mode is not enabled.
-    pub leafnode_port: Option<u16>,
-    /// Registry of MsgWriters for inbound leaf connections.
-    /// Used to propagate LS+/LS- when local clients subscribe/unsubscribe.
-    /// Each entry stores the writer and the leaf's optional publish permissions.
-    #[allow(clippy::type_complexity)]
-    pub inbound_leaf_writers:
-        std::sync::RwLock<FxHashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
-    /// Inbound leaf node authentication configuration.
-    pub inbound_leaf_auth: LeafAuth,
-    /// Registry of MsgWriters for inbound route connections.
-    /// Used to propagate RS+/RS- when local clients subscribe/unsubscribe.
-    pub route_writers: std::sync::RwLock<FxHashMap<u64, MsgWriter>>,
-    /// Port for inbound route connections. `None` when cluster mode is not enabled.
-    pub cluster_port: Option<u16>,
-    /// Cluster name. Must match between peers.
-    pub cluster_name: Option<String>,
-    /// Seed route URLs for outbound connections.
-    pub cluster_seeds: Vec<String>,
-    /// Registry of connected route peers and known route URLs.
-    pub route_peers: Mutex<RoutePeerRegistry>,
-    /// Channel sender for the route coordinator thread. New gossip-discovered URLs
-    /// are sent here to trigger outbound connections.
-    pub route_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
-    /// Registry of MsgWriters for inbound gateway connections.
-    pub gateway_writers: std::sync::RwLock<FxHashMap<u64, MsgWriter>>,
-    /// Port for inbound gateway connections.
-    pub gateway_port: Option<u16>,
-    /// This cluster's gateway name.
-    pub gateway_name: Option<String>,
-    /// Remote clusters to connect to via gateways.
-    pub gateway_remotes: Vec<GatewayRemote>,
-    /// Registry of connected gateway peers and known gateway URLs.
-    pub gateway_peers: Mutex<GatewayPeerRegistry>,
-    /// Channel sender for the gateway coordinator thread.
-    pub gateway_connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
-    /// Pre-computed `_GR_.<cluster_hash>.<server_hash>.` prefix for reply rewriting.
-    pub gateway_reply_prefix: Vec<u8>,
-    /// Cached INFO JSON line for gateway handshake and gossip.
-    /// Rebuilt when gateway URLs change.
-    pub cached_gateway_info: Mutex<String>,
-    /// Per-outbound-gateway interest mode state (optimistic → interest-only transition).
-    /// Keyed by outbound gateway conn_id. Used for optimistic forwarding and
-    /// negative interest tracking.
-    pub gateway_interest: std::sync::RwLock<FxHashMap<u64, GatewayInterestState>>,
-    /// Fast flag: true when any outbound gateway is in Optimistic mode.
-    /// Prevents the can_skip PUB optimization from discarding messages
-    /// that need to be forwarded across optimistic gateways.
-    pub has_gateway_interest: AtomicBool,
     /// Subject-prefix affinity map for tracking per-worker subscriber distribution.
     #[cfg(feature = "worker-affinity")]
     pub affinity: AffinityMap,
+
+    /// Upstream/leaf node connection state.
+    pub leaf: LeafState,
+    /// Full-mesh cluster routing state.
+    pub cluster: ClusterState,
+    /// Gateway inter-cluster state.
+    pub gateway: GatewayState,
 }
 
 impl ServerState {
@@ -1217,6 +1235,51 @@ impl ServerState {
             build_reverse_imports(&accounts, &registry)
         };
 
+        let cluster = ClusterState {
+            route_writers: std::sync::RwLock::new(FxHashMap::default()),
+            port: cluster_port,
+            name: cluster_name,
+            route_peers: {
+                let mut known_urls = HashSet::new();
+                if let Some(cp) = cluster_port {
+                    known_urls.insert(format!("{}:{cp}", cluster_self_host));
+                }
+                for seed in &cluster_seeds {
+                    known_urls.insert(crate::connector::mesh::normalize_route_url(seed));
+                }
+                Mutex::new(RoutePeerRegistry {
+                    connected: HashMap::new(),
+                    known_urls,
+                })
+            },
+            connect_tx: Mutex::new(None),
+            seeds: cluster_seeds,
+        };
+
+        let gateway = GatewayState {
+            writers: std::sync::RwLock::new(FxHashMap::default()),
+            port: gateway_port,
+            name: gateway_name.clone(),
+            remotes: gateway_remotes,
+            peers: Mutex::new(GatewayPeerRegistry {
+                connected: HashMap::new(),
+                known_urls: HashSet::new(),
+            }),
+            connect_tx: Mutex::new(None),
+            reply_prefix: gateway_reply_prefix,
+            cached_info: Mutex::new(String::new()),
+            interest: std::sync::RwLock::new(FxHashMap::default()),
+            has_interest: AtomicBool::new(false),
+        };
+
+        let leaf = LeafState {
+            upstreams: std::sync::RwLock::new(Vec::new()),
+            upstream_txs: std::sync::RwLock::new(Vec::new()),
+            port: leafnode_port,
+            inbound_writers: std::sync::RwLock::new(FxHashMap::default()),
+            inbound_auth: inbound_leaf_auth,
+        };
+
         Self {
             info,
             auth,
@@ -1242,9 +1305,6 @@ impl ServerState {
             #[cfg(feature = "accounts")]
             reverse_imports,
 
-            upstreams: std::sync::RwLock::new(Vec::new()),
-
-            upstream_txs: std::sync::RwLock::new(Vec::new()),
             has_subs: AtomicBool::new(false),
             buf_config,
             next_cid: AtomicU64::new(1),
@@ -1255,65 +1315,12 @@ impl ServerState {
             max_control_line: AtomicUsize::new(max_control_line),
             max_subscriptions: AtomicUsize::new(max_subscriptions),
             stats: ServerStats::default(),
-
-            leafnode_port,
-
-            inbound_leaf_writers: std::sync::RwLock::new(FxHashMap::default()),
-
-            inbound_leaf_auth,
-
-            route_writers: std::sync::RwLock::new(FxHashMap::default()),
-
-            cluster_port,
-
-            cluster_name,
-
-            route_peers: {
-                let mut known_urls = HashSet::new();
-                // Seed with own cluster endpoint so peers learn our address via
-                // INFO `connect_urls` gossip (enabling discovery of transitive peers).
-                // Use configured host or 127.0.0.1; never 0.0.0.0 which isn't routable.
-                if let Some(cp) = cluster_port {
-                    known_urls.insert(format!("{}:{cp}", cluster_self_host));
-                }
-                // Add configured seeds so they are advertised in our INFO immediately.
-                for seed in &cluster_seeds {
-                    known_urls.insert(crate::connector::mesh::normalize_route_url(seed));
-                }
-                Mutex::new(RoutePeerRegistry {
-                    connected: HashMap::new(),
-                    known_urls,
-                })
-            },
-
-            route_connect_tx: Mutex::new(None),
-
-            cluster_seeds,
-
-            gateway_writers: std::sync::RwLock::new(FxHashMap::default()),
-
-            gateway_port,
-
-            gateway_name: gateway_name.clone(),
-
-            gateway_remotes,
-
-            gateway_peers: Mutex::new(GatewayPeerRegistry {
-                connected: HashMap::new(),
-                known_urls: HashSet::new(),
-            }),
-
-            gateway_connect_tx: Mutex::new(None),
-
-            gateway_reply_prefix,
-
-            cached_gateway_info: Mutex::new(String::new()),
-
-            gateway_interest: std::sync::RwLock::new(FxHashMap::default()),
-
-            has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]
             affinity: AffinityMap::new(num_workers),
+
+            leaf,
+            cluster,
+            gateway,
         }
     }
 
@@ -1480,8 +1487,8 @@ impl Server {
             ) {
                 Ok(upstream) => {
                     let sender = upstream.sender();
-                    self.state.upstreams.write().unwrap().push(upstream);
-                    self.state.upstream_txs.write().unwrap().push(sender);
+                    self.state.leaf.upstreams.write().unwrap().push(upstream);
+                    self.state.leaf.upstream_txs.write().unwrap().push(sender);
                     info!(idx, "connected to upstream hub");
                 }
                 Err(e) => {
@@ -1495,8 +1502,8 @@ impl Server {
                         build_pipeline,
                     );
                     let sender = upstream.sender();
-                    self.state.upstreams.write().unwrap().push(upstream);
-                    self.state.upstream_txs.write().unwrap().push(sender);
+                    self.state.leaf.upstreams.write().unwrap().push(upstream);
+                    self.state.leaf.upstream_txs.write().unwrap().push(sender);
                 }
             }
         }
@@ -1645,8 +1652,8 @@ impl Server {
 
         self.connect_upstream();
 
-        let _route_mgr = if !self.state.cluster_seeds.is_empty() {
-            info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
+        let _route_mgr = if !self.state.cluster.seeds.is_empty() {
+            info!(seeds = ?self.state.cluster.seeds, "connecting to route peers");
             Some(crate::connector::mesh::RouteConnManager::spawn(Arc::clone(
                 &self.state,
             )))
@@ -1697,8 +1704,8 @@ impl Server {
             None
         };
 
-        let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
-            info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
+        let _gateway_mgr = if !self.state.gateway.remotes.is_empty() {
+            info!(remotes = ?self.state.gateway.remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
             Some(crate::connector::gateway::GatewayConnManager::spawn(
                 Arc::clone(&self.state),
             ))
@@ -1845,8 +1852,8 @@ impl Server {
 
         self.connect_upstream();
 
-        let _route_mgr = if !self.state.cluster_seeds.is_empty() {
-            info!(seeds = ?self.state.cluster_seeds, "connecting to route peers");
+        let _route_mgr = if !self.state.cluster.seeds.is_empty() {
+            info!(seeds = ?self.state.cluster.seeds, "connecting to route peers");
             Some(crate::connector::mesh::RouteConnManager::spawn(Arc::clone(
                 &self.state,
             )))
@@ -1902,8 +1909,8 @@ impl Server {
             None
         };
 
-        let _gateway_mgr = if !self.state.gateway_remotes.is_empty() {
-            info!(remotes = ?self.state.gateway_remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
+        let _gateway_mgr = if !self.state.gateway.remotes.is_empty() {
+            info!(remotes = ?self.state.gateway.remotes.iter().map(|r| &r.name).collect::<Vec<_>>(), "connecting to gateway peers");
             Some(crate::connector::gateway::GatewayConnManager::spawn(
                 Arc::clone(&self.state),
             ))
@@ -2088,8 +2095,8 @@ impl Server {
         }
 
         {
-            self.state.upstream_txs.write().unwrap().clear();
-            self.state.upstreams.write().unwrap().clear();
+            self.state.leaf.upstream_txs.write().unwrap().clear();
+            self.state.leaf.upstreams.write().unwrap().clear();
         }
 
         Ok(())

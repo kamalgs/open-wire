@@ -53,7 +53,7 @@ impl GatewayConnManager {
     pub(crate) fn spawn(state: Arc<ServerState>) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
 
-        for remote in &state.gateway_remotes {
+        for remote in &state.gateway.remotes {
             let st = Arc::clone(&state);
             let sd = Arc::clone(&shutdown);
             let remote = remote.clone();
@@ -153,8 +153,8 @@ fn connect_gateway(
 
     if let Some(ref urls) = peer_info.gateway_urls {
         if !urls.is_empty() {
-            let tx = state.gateway_connect_tx.lock().unwrap();
-            let mut peers = state.gateway_peers.lock().unwrap();
+            let tx = state.gateway.connect_tx.lock().unwrap();
+            let mut peers = state.gateway.peers.lock().unwrap();
             let mut changed = false;
             for url in urls {
                 if peers.known_urls.insert(url.clone()) {
@@ -203,7 +203,7 @@ fn connect_gateway(
     }
 
     {
-        let mut peers = state.gateway_peers.lock().unwrap();
+        let mut peers = state.gateway.peers.lock().unwrap();
         peers
             .connected
             .entry(expected_name.to_string())
@@ -214,7 +214,7 @@ fn connect_gateway(
     let direct_writer = MsgWriter::new_dummy();
 
     {
-        let mut writers = state.gateway_writers.write().unwrap();
+        let mut writers = state.gateway.writers.write().unwrap();
         writers.insert(conn_id, direct_writer.clone());
     }
 
@@ -222,7 +222,7 @@ fn connect_gateway(
     // has signaled negative interest (RS-). RS+ subs are only sent during the
     // transition to interest-only mode.
     {
-        let mut gi = state.gateway_interest.write().unwrap();
+        let mut gi = state.gateway.interest.write().unwrap();
         gi.insert(
             conn_id,
             GatewayInterestState {
@@ -232,7 +232,7 @@ fn connect_gateway(
                 writer: direct_writer.clone(),
             },
         );
-        state.has_gateway_interest.store(true, Ordering::Release);
+        state.gateway.has_interest.store(true, Ordering::Release);
     }
 
     let writer_dw = direct_writer.clone();
@@ -273,20 +273,20 @@ fn connect_gateway(
     }
 
     {
-        let mut writers = state.gateway_writers.write().unwrap();
+        let mut writers = state.gateway.writers.write().unwrap();
         writers.remove(&conn_id);
     }
 
     {
-        let mut gi = state.gateway_interest.write().unwrap();
+        let mut gi = state.gateway.interest.write().unwrap();
         gi.remove(&conn_id);
         if gi.is_empty() {
-            state.has_gateway_interest.store(false, Ordering::Release);
+            state.gateway.has_interest.store(false, Ordering::Release);
         }
     }
 
     {
-        let mut peers = state.gateway_peers.lock().unwrap();
+        let mut peers = state.gateway.peers.lock().unwrap();
         if let Some(ids) = peers.connected.get_mut(expected_name) {
             ids.remove(&conn_id);
             if ids.is_empty() {
@@ -365,7 +365,7 @@ fn handle_gateway_op(
         GatewayOp::RouteSub { subject, queue, .. } => {
             // Check if we're in optimistic mode — RS+ clears negative interest.
             {
-                let mut gi = state.gateway_interest.write().unwrap();
+                let mut gi = state.gateway.interest.write().unwrap();
                 if let Some(gis) = gi.get_mut(&conn_id) {
                     if gis.mode == GatewayInterestMode::Optimistic {
                         let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
@@ -415,7 +415,7 @@ fn handle_gateway_op(
 
             // Check interest mode — RS- means different things per mode.
             let transition = {
-                let mut gi = state.gateway_interest.write().unwrap();
+                let mut gi = state.gateway.interest.write().unwrap();
                 if let Some(gis) = gi.get_mut(&conn_id) {
                     if gis.mode == GatewayInterestMode::Optimistic {
                         gis.ni.insert(subject_str.to_string());
@@ -533,8 +533,8 @@ fn handle_gateway_op(
 
             if let Some(ref urls) = info.gateway_urls {
                 if !urls.is_empty() {
-                    let tx = state.gateway_connect_tx.lock().unwrap();
-                    let mut peers = state.gateway_peers.lock().unwrap();
+                    let tx = state.gateway.connect_tx.lock().unwrap();
+                    let mut peers = state.gateway.peers.lock().unwrap();
                     let mut changed = false;
                     for url in urls {
                         if peers.known_urls.insert(url.clone()) {
@@ -563,12 +563,12 @@ fn handle_gateway_op(
 
 /// Build INFO JSON for gateway protocol (uncached, used for rebuild).
 fn build_gateway_info_inner(state: &ServerState) -> String {
-    let gateway_name = state.gateway_name.as_deref().unwrap_or("default");
-    let gateway_port = state.gateway_port.unwrap_or(0);
+    let gateway_name = state.gateway.name.as_deref().unwrap_or("default");
+    let gateway_port = state.gateway.port.unwrap_or(0);
 
     // Collect known gateway URLs for gossip.
     let gateway_urls = {
-        let peers = state.gateway_peers.lock().unwrap();
+        let peers = state.gateway.peers.lock().unwrap();
         let urls: Vec<&str> = peers.known_urls.iter().map(|s| s.as_str()).collect();
         if urls.is_empty() {
             String::new()
@@ -596,7 +596,7 @@ fn build_gateway_info_inner(state: &ServerState) -> String {
 
 /// Get cached gateway INFO string, rebuilding if empty.
 pub(crate) fn get_gateway_info(state: &ServerState) -> String {
-    let mut cached = state.cached_gateway_info.lock().unwrap();
+    let mut cached = state.gateway.cached_info.lock().unwrap();
     if cached.is_empty() {
         *cached = build_gateway_info_inner(state);
     }
@@ -605,7 +605,7 @@ pub(crate) fn get_gateway_info(state: &ServerState) -> String {
 
 /// Rebuild the cached gateway INFO string (call when gateway URLs change).
 pub(crate) fn rebuild_gateway_info(state: &ServerState) {
-    let mut cached = state.cached_gateway_info.lock().unwrap();
+    let mut cached = state.gateway.cached_info.lock().unwrap();
     *cached = build_gateway_info_inner(state);
 }
 
@@ -614,7 +614,7 @@ pub(crate) fn broadcast_gateway_info(state: &ServerState) {
     rebuild_gateway_info(state);
     let info_line = get_gateway_info(state);
     let info_bytes = info_line.as_bytes();
-    let writers = state.gateway_writers.read().unwrap();
+    let writers = state.gateway.writers.read().unwrap();
     for writer in writers.values() {
         writer.write_raw(info_bytes);
         writer.notify();
@@ -623,7 +623,7 @@ pub(crate) fn broadcast_gateway_info(state: &ServerState) {
 
 /// Build CONNECT JSON for gateway protocol.
 fn build_gateway_connect(state: &ServerState, remote_name: &str) -> String {
-    let gateway_name = state.gateway_name.as_deref().unwrap_or("default");
+    let gateway_name = state.gateway.name.as_deref().unwrap_or("default");
     format!(
         "CONNECT {{\"server_id\":\"{}\",\"name\":\"{}\",\
          \"gateway\":\"{}\",\"remote_gateway\":\"{}\"}}\r\n",
@@ -646,7 +646,7 @@ fn transition_to_interest_only(
 
     // Step 1: Set mode to Transitioning
     {
-        let mut gi = state.gateway_interest.write().unwrap();
+        let mut gi = state.gateway.interest.write().unwrap();
         if let Some(gis) = gi.get_mut(&conn_id) {
             gis.mode = GatewayInterestMode::Transitioning;
         }
@@ -699,7 +699,7 @@ fn transition_to_interest_only(
 
     // Step 3: Set mode to InterestOnly, clear ni set
     {
-        let mut gi = state.gateway_interest.write().unwrap();
+        let mut gi = state.gateway.interest.write().unwrap();
         if let Some(gis) = gi.get_mut(&conn_id) {
             gis.mode = GatewayInterestMode::InterestOnly;
             gis.ni.clear();

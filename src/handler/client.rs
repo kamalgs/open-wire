@@ -136,7 +136,7 @@ impl ClientHandler {
             .record_sub(subject_str, wctx.worker_index);
 
         {
-            let mut upstreams = wctx.state.upstreams.write().unwrap();
+            let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
             for up in upstreams.iter_mut() {
                 if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue.clone()) {
                     warn!(error = %e, "failed to add upstream interest");
@@ -165,7 +165,7 @@ impl ClientHandler {
                     if crate::sub_list::subject_matches(&ri.local_pattern, subject_str) {
                         let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                         {
-                            let mut upstreams = wctx.state.upstreams.write().unwrap();
+                            let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
                             for up in upstreams.iter_mut() {
                                 let _ = up.add_interest(ri.src_pattern.clone(), None);
                             }
@@ -315,7 +315,7 @@ impl ClientHandler {
                     let has_sub = subs.has_any_subscriber(subject_str);
                     drop(subs);
 
-                    let has_gw = wctx.state.has_gateway_interest.load(Ordering::Relaxed);
+                    let has_gw = wctx.state.gateway.has_interest.load(Ordering::Relaxed);
 
                     if !has_sub && !has_gw {
                         let mut hdr = crate::types::HeaderMap::new();
@@ -371,7 +371,7 @@ fn cleanup_removed_sub(
         .affinity
         .record_unsub(&removed.subject, wctx.worker_index);
     {
-        let mut upstreams = wctx.state.upstreams.write().unwrap();
+        let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
         for up in upstreams.iter_mut() {
             up.remove_interest(&removed.subject, removed.queue.as_deref());
         }
@@ -410,7 +410,7 @@ fn propagate_reverse_unsub(
             if crate::sub_list::subject_matches(&ri.local_pattern, subject) {
                 let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
                 {
-                    let mut upstreams = wctx.state.upstreams.write().unwrap();
+                    let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
                     for up in upstreams.iter_mut() {
                         up.remove_interest(&ri.src_pattern, None);
                     }

@@ -108,8 +108,8 @@ impl ConnectionHandler for RouteHandler {
             }
             RouteOp::Info(info) => {
                 if !info.connect_urls.is_empty() {
-                    let mut peers = wctx.state.route_peers.lock().unwrap();
-                    let tx = wctx.state.route_connect_tx.lock().unwrap();
+                    let mut peers = wctx.state.cluster.route_peers.lock().unwrap();
+                    let tx = wctx.state.cluster.connect_tx.lock().unwrap();
                     for url in &info.connect_urls {
                         let normalized = crate::connector::mesh::normalize_route_url(url);
                         if peers.known_urls.insert(normalized.clone()) {

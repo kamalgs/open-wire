@@ -61,8 +61,8 @@ impl ConnectionHandler for GatewayHandler {
 
                 if let Some(ref urls) = info.gateway_urls {
                     if !urls.is_empty() {
-                        let tx = wctx.state.gateway_connect_tx.lock().unwrap();
-                        let mut peers = wctx.state.gateway_peers.lock().unwrap();
+                        let tx = wctx.state.gateway.connect_tx.lock().unwrap();
+                        let mut peers = wctx.state.gateway.peers.lock().unwrap();
                         let mut changed = false;
                         for url in urls {
                             if peers.known_urls.insert(url.clone()) {

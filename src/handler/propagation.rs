@@ -18,7 +18,7 @@ pub(crate) fn propagate_leaf_interest(
     queue: Option<&[u8]>,
     is_sub: bool,
 ) {
-    let writers = state.inbound_leaf_writers.read().unwrap();
+    let writers = state.leaf.inbound_writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
@@ -104,7 +104,7 @@ pub(crate) fn propagate_route_interest(
     is_sub: bool,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
-    let writers = state.route_writers.read().unwrap();
+    let writers = state.cluster.route_writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
@@ -172,12 +172,12 @@ pub(crate) fn propagate_gateway_interest(
 ) {
     use crate::core::server::GatewayInterestMode;
 
-    let writers = state.gateway_writers.read().unwrap();
+    let writers = state.gateway.writers.read().unwrap();
     if writers.is_empty() {
         return;
     }
 
-    let gi = state.gateway_interest.read().unwrap();
+    let gi = state.gateway.interest.read().unwrap();
 
     GW_BUILDER.with(|cell| {
         let mut builder = cell.borrow_mut();
@@ -294,7 +294,7 @@ pub(crate) fn rewrite_gateway_reply(
     if reply.starts_with(b"_GR_.") {
         return Some(bytes::Bytes::copy_from_slice(reply));
     }
-    let prefix = &state.gateway_reply_prefix;
+    let prefix = &state.gateway.reply_prefix;
     let mut buf = Vec::with_capacity(prefix.len() + reply.len());
     buf.extend_from_slice(prefix);
     buf.extend_from_slice(reply);
@@ -347,8 +347,6 @@ mod tests {
             cross_account_routes: Vec::new(),
             #[cfg(feature = "accounts")]
             reverse_imports: Vec::new(),
-            upstreams: std::sync::RwLock::new(Vec::new()),
-            upstream_txs: std::sync::RwLock::new(Vec::new()),
             has_subs: AtomicBool::new(false),
             buf_config: Default::default(),
             next_cid: AtomicU64::new(1),
@@ -359,33 +357,41 @@ mod tests {
             max_control_line: AtomicUsize::new(4096),
             max_subscriptions: AtomicUsize::new(0),
             stats: Default::default(),
-            leafnode_port: None,
-            inbound_leaf_writers: std::sync::RwLock::new(FxHashMap::default()),
-            inbound_leaf_auth: Default::default(),
-            route_writers: std::sync::RwLock::new(FxHashMap::default()),
-            cluster_port: None,
-            cluster_name: None,
-            cluster_seeds: Vec::new(),
-            route_peers: std::sync::Mutex::new(crate::core::server::RoutePeerRegistry {
-                connected: HashMap::new(),
-                known_urls: std::collections::HashSet::new(),
-            }),
-            route_connect_tx: std::sync::Mutex::new(None),
-            gateway_writers: std::sync::RwLock::new(FxHashMap::default()),
-            gateway_port: None,
-            gateway_name: None,
-            gateway_remotes: Vec::new(),
-            gateway_peers: std::sync::Mutex::new(crate::core::server::GatewayPeerRegistry {
-                connected: HashMap::new(),
-                known_urls: std::collections::HashSet::new(),
-            }),
-            gateway_connect_tx: std::sync::Mutex::new(None),
-            gateway_reply_prefix: b"_GR_.abc.def.".to_vec(),
-            cached_gateway_info: std::sync::Mutex::new(String::new()),
-            gateway_interest: std::sync::RwLock::new(FxHashMap::default()),
-            has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]
             affinity: crate::core::server::AffinityMap::new(1),
+            leaf: crate::core::server::LeafState {
+                upstreams: std::sync::RwLock::new(Vec::new()),
+                upstream_txs: std::sync::RwLock::new(Vec::new()),
+                port: None,
+                inbound_writers: std::sync::RwLock::new(FxHashMap::default()),
+                inbound_auth: Default::default(),
+            },
+            cluster: crate::core::server::ClusterState {
+                route_writers: std::sync::RwLock::new(FxHashMap::default()),
+                port: None,
+                name: None,
+                seeds: Vec::new(),
+                route_peers: std::sync::Mutex::new(crate::core::server::RoutePeerRegistry {
+                    connected: HashMap::new(),
+                    known_urls: std::collections::HashSet::new(),
+                }),
+                connect_tx: std::sync::Mutex::new(None),
+            },
+            gateway: crate::core::server::GatewayState {
+                writers: std::sync::RwLock::new(FxHashMap::default()),
+                port: None,
+                name: None,
+                remotes: Vec::new(),
+                peers: std::sync::Mutex::new(crate::core::server::GatewayPeerRegistry {
+                    connected: HashMap::new(),
+                    known_urls: std::collections::HashSet::new(),
+                }),
+                connect_tx: std::sync::Mutex::new(None),
+                reply_prefix: b"_GR_.abc.def.".to_vec(),
+                cached_info: std::sync::Mutex::new(String::new()),
+                interest: std::sync::RwLock::new(FxHashMap::default()),
+                has_interest: AtomicBool::new(false),
+            },
         }
     }
 
@@ -411,7 +417,8 @@ mod tests {
             },
         };
         state
-            .inbound_leaf_writers
+            .leaf
+            .inbound_writers
             .write()
             .unwrap()
             .insert(100, (writer.clone(), Some(Arc::new(perms))));
@@ -439,7 +446,7 @@ mod tests {
         let w2 = MsgWriter::new_dummy();
 
         {
-            let mut writers = state.inbound_leaf_writers.write().unwrap();
+            let mut writers = state.leaf.inbound_writers.write().unwrap();
             writers.insert(1, (w1.clone(), None));
             writers.insert(2, (w2.clone(), None));
         }

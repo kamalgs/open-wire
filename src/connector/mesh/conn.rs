@@ -46,11 +46,11 @@ impl RouteConnManager {
     /// plus a coordinator thread that handles gossip-discovered URLs.
     pub(crate) fn spawn(state: Arc<ServerState>) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let seeds = state.cluster_seeds.clone();
+        let seeds = state.cluster.seeds.clone();
 
         let (coord_tx, coord_rx) = std::sync::mpsc::channel::<String>();
         {
-            let mut tx_lock = state.route_connect_tx.lock().unwrap();
+            let mut tx_lock = state.cluster.connect_tx.lock().unwrap();
             *tx_lock = Some(coord_tx);
         }
 
@@ -102,7 +102,7 @@ fn run_route_coordinator(
         active_urls.insert(normalize_route_url(seed));
     }
 
-    if let Some(cp) = state.cluster_port {
+    if let Some(cp) = state.cluster.port {
         active_urls.insert(format!("0.0.0.0:{cp}"));
         active_urls.insert(format!("127.0.0.1:{cp}"));
     }
@@ -120,7 +120,7 @@ fn run_route_coordinator(
 
         let normalized = normalize_route_url(&url);
 
-        if let Some(cp) = state.cluster_port {
+        if let Some(cp) = state.cluster.port {
             if normalized == format!("0.0.0.0:{cp}")
                 || normalized == format!("127.0.0.1:{cp}")
                 || normalized == format!("{host}:{cp}", host = state.info.host)
@@ -177,8 +177,8 @@ fn parse_route_url(url: &str) -> String {
 /// Process `connect_urls` from a peer's INFO, adding new URLs to
 /// `known_urls` and sending them to the coordinator channel.
 pub(crate) fn process_gossip_urls(state: &ServerState, connect_urls: &[String]) {
-    let mut peers = state.route_peers.lock().unwrap();
-    let tx = state.route_connect_tx.lock().unwrap();
+    let mut peers = state.cluster.route_peers.lock().unwrap();
+    let tx = state.cluster.connect_tx.lock().unwrap();
     for url in connect_urls {
         let normalized = normalize_route_url(url);
         if peers.known_urls.insert(normalized.clone()) {
@@ -228,7 +228,7 @@ fn connect_route(
     let peer_server_id = peer_info.server_id.clone();
     let use_binary = peer_info.open_wire == Some(1);
     {
-        let peers = state.route_peers.lock().unwrap();
+        let peers = state.cluster.route_peers.lock().unwrap();
         if peers.connected.contains_key(&peer_server_id) {
             debug!(
                 peer_id = %peer_server_id,
@@ -275,7 +275,7 @@ fn connect_route(
     }
 
     {
-        let mut peers = state.route_peers.lock().unwrap();
+        let mut peers = state.cluster.route_peers.lock().unwrap();
         if peers.connected.contains_key(&peer_server_id) {
             debug!(
                 peer_id = %peer_server_id,
@@ -293,7 +293,7 @@ fn connect_route(
     };
 
     {
-        let mut writers = state.route_writers.write().unwrap();
+        let mut writers = state.cluster.route_writers.write().unwrap();
         writers.insert(conn_id, direct_writer.clone());
     }
 
@@ -394,12 +394,12 @@ fn connect_route(
     }
 
     {
-        let mut writers = state.route_writers.write().unwrap();
+        let mut writers = state.cluster.route_writers.write().unwrap();
         writers.remove(&conn_id);
     }
 
     {
-        let mut peers = state.route_peers.lock().unwrap();
+        let mut peers = state.cluster.route_peers.lock().unwrap();
         peers.connected.remove(&peer_server_id);
     }
 
@@ -819,11 +819,11 @@ fn handle_bin_frame(
 
 /// Build INFO JSON for route protocol, including `connect_urls` from known peers.
 pub(crate) fn build_route_info(state: &ServerState) -> String {
-    let cluster_name = state.cluster_name.as_deref().unwrap_or("default");
-    let cluster_port = state.cluster_port.unwrap_or(0);
+    let cluster_name = state.cluster.name.as_deref().unwrap_or("default");
+    let cluster_port = state.cluster.port.unwrap_or(0);
 
     let connect_urls = {
-        let peers = state.route_peers.lock().unwrap();
+        let peers = state.cluster.route_peers.lock().unwrap();
         let urls: Vec<&str> = peers.known_urls.iter().map(|s| s.as_str()).collect();
         if urls.is_empty() {
             String::new()
@@ -854,7 +854,7 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
 
 /// Build CONNECT JSON for route protocol.
 fn build_route_connect(state: &ServerState) -> String {
-    let cluster_name = state.cluster_name.as_deref().unwrap_or("default");
+    let cluster_name = state.cluster.name.as_deref().unwrap_or("default");
     format!(
         "CONNECT {{\"server_id\":\"{}\",\"name\":\"{}\",\"cluster\":\"{}\",\"open_wire\":1}}\r\n",
         state.info.server_id, state.info.server_name, cluster_name,
@@ -865,7 +865,7 @@ fn build_route_connect(state: &ServerState) -> String {
 pub(crate) fn broadcast_route_info(state: &ServerState) {
     let info_line = build_route_info(state);
     let info_bytes = info_line.as_bytes();
-    let writers = state.route_writers.read().unwrap();
+    let writers = state.cluster.route_writers.read().unwrap();
     for writer in writers.values() {
         // Binary-mode connections don't use text INFO gossip.
         if writer.is_binary() {
