@@ -9,7 +9,7 @@ use metrics::gauge;
 use tracing::debug;
 
 use crate::buf::RouteOp;
-#[cfg(feature = "gateway")]
+
 use crate::handler::propagation::propagate_gateway_interest;
 use crate::handler::{
     bytes_to_str, ConnCtx, ConnExt, ConnectionHandler, DeliveryScope, HandleResult,
@@ -162,13 +162,13 @@ impl RouteHandler {
             delivered: AtomicU64::new(0),
             is_leaf: false,
             is_route: true,
-            #[cfg(feature = "gateway")]
+
             is_gateway: false,
-            #[cfg(feature = "binary-client")]
+
             is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id,
-            #[cfg(feature = "hub")]
+
             leaf_perms: None,
         };
 
@@ -187,7 +187,6 @@ impl RouteHandler {
 
         *conn.sub_count += 1;
 
-        #[cfg(feature = "gateway")]
         propagate_gateway_interest(
             wctx.state,
             subject_str.as_bytes(),
@@ -250,7 +249,7 @@ impl RouteHandler {
 
         if let Some(ref removed) = removed {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
-            #[cfg(feature = "gateway")]
+
             propagate_gateway_interest(
                 wctx.state,
                 removed.subject.as_bytes(),
@@ -304,7 +303,6 @@ impl RouteHandler {
             account_id,
         );
 
-        #[cfg(feature = "leaf")]
         conn.forward_to_upstream(wctx.state, subject, reply, headers, payload);
 
         (HandleResult::Ok, expired)

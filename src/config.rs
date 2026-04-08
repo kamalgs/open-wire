@@ -17,7 +17,6 @@
 use std::fmt;
 use std::path::Path;
 
-#[cfg(feature = "leaf")]
 use crate::core::server::HubCredentials;
 #[cfg(feature = "accounts")]
 use crate::core::server::{AccountConfig, ExportRule, ImportRule};
@@ -66,7 +65,7 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
     if let Some(v) = args.opt_value_from_str("--ws-port")? {
         config.ws_port = Some(v);
     }
-    #[cfg(feature = "binary-client")]
+
     if let Some(v) = args.opt_value_from_str("--binary-port")? {
         config.binary_port = Some(v);
     }
@@ -132,7 +131,6 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
         config.client_auth = ClientAuth::UserPass { user, pass };
     }
 
-    #[cfg(feature = "leaf")]
     {
         if let Some(v) = args.opt_value_from_str("--hub")? {
             config.hub.url = Some(v);
@@ -160,7 +158,6 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
         }
     }
 
-    #[cfg(feature = "mesh")]
     {
         if let Some(v) = args.opt_value_from_str("--cluster-port")? {
             config.cluster.port = Some(v);
@@ -176,7 +173,6 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
         }
     }
 
-    #[cfg(feature = "gateway")]
     {
         if let Some(v) = args.opt_value_from_str("--gateway-port")? {
             config.gateway.port = Some(v);
@@ -976,15 +972,12 @@ fn build_config(root: &Value) -> Result<ServerConfig, ConfigError> {
             }
 
             // --- leafnodes block ---
-            #[cfg(any(feature = "leaf", feature = "hub"))]
             "leafnodes" => apply_leafnodes(&mut config, value)?,
 
             // --- cluster block ---
-            #[cfg(feature = "mesh")]
             "cluster" => apply_cluster(&mut config, value)?,
 
             // --- gateway block ---
-            #[cfg(feature = "gateway")]
             "gateway" => apply_gateway(&mut config, value)?,
 
             // --- accounts block ---
@@ -992,7 +985,6 @@ fn build_config(root: &Value) -> Result<ServerConfig, ConfigError> {
             "accounts" => apply_accounts(&mut config, value)?,
 
             // --- binary client block ---
-            #[cfg(feature = "binary-client")]
             "binary" => {
                 if let Some(entries) = value.as_map() {
                     for (bkey, bval) in entries {
@@ -1085,7 +1077,6 @@ fn build_config(root: &Value) -> Result<ServerConfig, ConfigError> {
     Ok(config)
 }
 
-#[cfg(any(feature = "leaf", feature = "hub"))]
 fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigError> {
     let entries = match value.as_map() {
         Some(e) => e,
@@ -1094,7 +1085,6 @@ fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), Confi
 
     for (lkey, lval) in entries {
         match lkey.as_str() {
-            #[cfg(feature = "leaf")]
             "remotes" => {
                 if let Some(arr) = lval.as_array() {
                     for remote in arr {
@@ -1102,7 +1092,7 @@ fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), Confi
                     }
                 }
             }
-            #[cfg(feature = "hub")]
+
             "listen" => {
                 // leafnodes.listen — parse host:port for inbound leaf connections.
                 let s = as_string(lval)?;
@@ -1111,7 +1101,7 @@ fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), Confi
                     config.leafnodes.port = Some(p);
                 }
             }
-            #[cfg(feature = "hub")]
+
             "authorization" => {
                 if let Some(auth_entries) = lval.as_map() {
                     for (akey, aval) in auth_entries {
@@ -1134,7 +1124,6 @@ fn apply_leafnodes(config: &mut ServerConfig, value: &Value) -> Result<(), Confi
 }
 
 /// Parse an array of leaf node user entries from the config.
-#[cfg(feature = "hub")]
 fn parse_leaf_users_array(
     arr: &[Value],
 ) -> Result<Vec<crate::core::server::LeafUserConfig>, ConfigError> {
@@ -1171,7 +1160,6 @@ fn parse_leaf_users_array(
 }
 
 /// Parse a `cluster { ... }` block.
-#[cfg(feature = "mesh")]
 fn apply_cluster(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigError> {
     let entries = match value.as_map() {
         Some(e) => e,
@@ -1208,7 +1196,6 @@ fn apply_cluster(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigE
 }
 
 /// Parse a `gateway { ... }` block.
-#[cfg(feature = "gateway")]
 fn apply_gateway(config: &mut ServerConfig, value: &Value) -> Result<(), ConfigError> {
     use crate::core::server::GatewayRemote;
 
@@ -1363,7 +1350,6 @@ fn apply_accounts(config: &mut ServerConfig, value: &Value) -> Result<(), Config
     Ok(())
 }
 
-#[cfg(feature = "leaf")]
 fn apply_remote(config: &mut ServerConfig, remote: &Value) -> Result<(), ConfigError> {
     let entries = match remote.as_map() {
         Some(e) => e,
@@ -1706,7 +1692,7 @@ leafnodes {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
+
     fn parse_bench_go_leaf_config() {
         let input = r#"
 # Go native leaf node for benchmarks.
@@ -1722,7 +1708,7 @@ leafnodes {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
+
     fn parse_bench_go_leaf_ws_config() {
         let input = r#"
 listen: 127.0.0.1:4225
@@ -1742,7 +1728,7 @@ websocket {
     }
 
     #[test]
-    #[cfg(all(feature = "leaf", feature = "hub"))]
+
     fn parse_hub_config() {
         let input = r#"
 listen: 127.0.0.1:4333
@@ -1772,7 +1758,7 @@ jetstream: {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
+
     fn parse_full_config() {
         let input = r#"
 server_name: "my-leaf"
@@ -1948,7 +1934,7 @@ another_unknown {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
+
     fn parse_multiple_remotes_uses_first() {
         let input = r#"
 leafnodes {
@@ -2000,7 +1986,7 @@ tls {
         assert!(!config.tls.verify);
     }
 
-    #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
+    #[cfg(feature = "interest-collapse")]
     #[test]
     fn parse_interest_collapse() {
         let input = r#"
@@ -2020,7 +2006,7 @@ leafnodes {
         assert_eq!(config.hub.interest_collapse[1], "telemetry.*.metrics.*");
     }
 
-    #[cfg(all(feature = "leaf", feature = "interest-collapse"))]
+    #[cfg(feature = "interest-collapse")]
     #[test]
     fn parse_interest_collapse_empty() {
         let input = r#"
@@ -2034,7 +2020,7 @@ leafnodes {
         assert!(config.hub.interest_collapse.is_empty());
     }
 
-    #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
+    #[cfg(feature = "subject-mapping")]
     #[test]
     fn parse_subject_mappings() {
         let input = r#"
@@ -2056,7 +2042,7 @@ leafnodes {
         assert_eq!(config.hub.subject_mappings[1].to, "new.exact");
     }
 
-    #[cfg(all(feature = "leaf", feature = "subject-mapping"))]
+    #[cfg(feature = "subject-mapping")]
     #[test]
     fn parse_subject_mappings_empty() {
         let input = r#"
@@ -2131,7 +2117,6 @@ accounts {
         assert_eq!(dst.imports[0].to, None);
     }
 
-    #[cfg(feature = "hub")]
     #[test]
     fn leafnodes_authorization_users() {
         let input = r#"
@@ -2167,7 +2152,6 @@ leafnodes {
         }
     }
 
-    #[cfg(feature = "hub")]
     #[test]
     fn leafnodes_authorization_empty() {
         let input = r#"

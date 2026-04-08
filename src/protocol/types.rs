@@ -50,15 +50,15 @@ pub struct ServerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_wire: Option<u8>,
     /// Advertised leafnode URLs (present in INFO sent on leafnode listener).
-    #[cfg(feature = "hub")]
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leafnode_urls: Option<Vec<String>>,
     /// Gateway name for this cluster (present in gateway INFO).
-    #[cfg(feature = "gateway")]
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<String>,
     /// Advertised gateway URLs for gossip discovery.
-    #[cfg(feature = "gateway")]
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_urls: Option<Vec<String>>,
 }
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
+
     fn server_info_leafnode_urls_serialization() {
         // When leafnode_urls is Some, it should be serialized
         let info = ServerInfo {

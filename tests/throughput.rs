@@ -110,9 +110,13 @@ fn bench_wildcard_scaling(c: &mut Criterion) {
         group.bench_function(format!("{count}_wild_subs"), |b| {
             b.iter(|| {
                 let mut matched = 0usize;
-                sl.for_each_match("app.orders.created", |_sub| {
-                    matched += 1;
-                });
+                sl.for_each_match(
+                    "app.orders.created",
+                    |_sub| true,
+                    |_sub| {
+                        matched += 1;
+                    },
+                );
                 assert_eq!(matched, 1);
             });
         });
@@ -153,9 +157,13 @@ fn bench_wildcard_fanout(c: &mut Criterion) {
         group.bench_function(format!("{count}_matching_wild"), |b| {
             b.iter(|| {
                 let mut matched = 0usize;
-                sl.for_each_match("app.events.x", |_sub| {
-                    matched += 1;
-                });
+                sl.for_each_match(
+                    "app.events.x",
+                    |_sub| true,
+                    |_sub| {
+                        matched += 1;
+                    },
+                );
             });
         });
     }
@@ -217,18 +225,26 @@ fn bench_mixed_realistic(c: &mut Criterion) {
     group.bench_function("publish_to_orders", |b| {
         b.iter(|| {
             let mut matched = 0usize;
-            sl.for_each_match("svc.orders.created", |_sub| {
-                matched += 1;
-            });
+            sl.for_each_match(
+                "svc.orders.created",
+                |_sub| true,
+                |_sub| {
+                    matched += 1;
+                },
+            );
         });
     });
 
     group.bench_function("publish_no_match", |b| {
         b.iter(|| {
             let mut matched = 0usize;
-            sl.for_each_match("unknown.topic.here", |_sub| {
-                matched += 1;
-            });
+            sl.for_each_match(
+                "unknown.topic.here",
+                |_sub| true,
+                |_sub| {
+                    matched += 1;
+                },
+            );
             assert_eq!(matched, 0);
         });
     });
@@ -341,7 +357,6 @@ mod proto_bench {
             });
         });
 
-        #[cfg(any(feature = "leaf", feature = "hub"))]
         group.bench_function("lmsg_128b", |b| {
             let mut builder = nats_proto::MsgBuilder::new();
             b.iter(|| {
@@ -354,7 +369,6 @@ mod proto_bench {
 
     /// Bench LMSG parsing (hub → leaf path).
     pub fn bench_parse_lmsg(_c: &mut Criterion) {
-        #[cfg(any(feature = "leaf", feature = "hub"))]
         {
             let mut group = _c.benchmark_group("parse_leaf");
 

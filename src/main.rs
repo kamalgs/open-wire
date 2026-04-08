@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         workers = config.workers,
         "starting leaf node server"
     );
-    #[cfg(feature = "leaf")]
+
     if let Some(ref hub) = config.hub.url {
         info!(hub, "upstream hub");
     }

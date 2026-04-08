@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use bytes::Bytes;
 
 pub(crate) use crate::msg_writer::{create_eventfd, DirectBuf, MsgWriter};
-#[cfg(any(feature = "mesh", feature = "binary-client"))]
+
 pub(crate) use crate::msg_writer::{BinSeg, BinSegBuf};
 
 /// Backward-compatible alias for `MsgWriter`.
@@ -31,20 +31,16 @@ pub struct Subscription {
     /// True for inbound leaf node subscriptions (deliver via LMSG, not MSG).
     pub is_leaf: bool,
     /// True for route peer subscriptions (deliver via RMSG, not MSG).
-    #[cfg(feature = "mesh")]
     pub is_route: bool,
     /// True for gateway peer subscriptions (deliver via RMSG, not MSG).
-    #[cfg(feature = "gateway")]
     pub is_gateway: bool,
     /// True for binary-protocol client subscriptions (deliver via binary RMSG).
-    #[cfg(feature = "binary-client")]
     pub is_binary_client: bool,
     /// Account this subscription belongs to. 0 = `$G` (global/default).
     #[cfg(feature = "accounts")]
     pub account_id: crate::core::server::AccountId,
     /// Per-leaf publish permissions. Used during delivery to filter messages
     /// that the leaf is not allowed to receive (subscribe permission check).
-    #[cfg(feature = "hub")]
     pub leaf_perms: Option<std::sync::Arc<crate::core::server::Permissions>>,
 }
 
@@ -60,15 +56,15 @@ impl Clone for Subscription {
             max_msgs: AtomicU64::new(self.max_msgs.load(Ordering::Relaxed)),
             delivered: AtomicU64::new(self.delivered.load(Ordering::Relaxed)),
             is_leaf: self.is_leaf,
-            #[cfg(feature = "mesh")]
+
             is_route: self.is_route,
-            #[cfg(feature = "gateway")]
+
             is_gateway: self.is_gateway,
-            #[cfg(feature = "binary-client")]
+
             is_binary_client: self.is_binary_client,
             #[cfg(feature = "accounts")]
             account_id: self.account_id,
-            #[cfg(feature = "hub")]
+
             leaf_perms: self.leaf_perms.clone(),
         }
     }
@@ -89,15 +85,15 @@ impl Subscription {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            #[cfg(feature = "mesh")]
+
             is_route: false,
-            #[cfg(feature = "gateway")]
+
             is_gateway: false,
-            #[cfg(feature = "binary-client")]
+
             is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
-            #[cfg(feature = "hub")]
+
             leaf_perms: None,
         }
     }
@@ -679,11 +675,9 @@ impl SubscriptionManager {
 
     /// Returns true if any local (non-route, non-gateway) subscription matches the subject.
     /// Cheap boolean check — no delivery, no queue routing.
-    #[cfg(feature = "gateway")]
     pub fn has_local_interest(&self, subject: &str) -> bool {
         if let Some(subs) = self.exact.get(subject) {
             for sub in subs {
-                #[cfg(feature = "mesh")]
                 if sub.is_route {
                     continue;
                 }
@@ -699,7 +693,7 @@ impl SubscriptionManager {
             if found {
                 return;
             }
-            #[cfg(feature = "mesh")]
+
             if sub.is_route {
                 return;
             }
@@ -713,17 +707,15 @@ impl SubscriptionManager {
 
     /// Returns unique non-leaf, non-route, non-gateway (subject, queue) pairs for leaf interest
     /// propagation. Only includes subscriptions from client connections.
-    #[cfg(feature = "hub")]
     pub fn client_interests(&self) -> Vec<(&str, Option<&str>)> {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
             for sub in subs {
                 if !sub.is_leaf {
-                    #[cfg(feature = "mesh")]
                     if sub.is_route {
                         continue;
                     }
-                    #[cfg(feature = "gateway")]
+
                     if sub.is_gateway {
                         continue;
                     }
@@ -733,11 +725,10 @@ impl SubscriptionManager {
         }
         self.wild.for_each_sub(|sub| {
             if !sub.is_leaf {
-                #[cfg(feature = "mesh")]
                 if sub.is_route {
                     return;
                 }
-                #[cfg(feature = "gateway")]
+
                 if sub.is_gateway {
                     return;
                 }
@@ -749,16 +740,14 @@ impl SubscriptionManager {
 
     /// Returns unique local (client + leaf) (subject, queue) pairs for route/gateway interest
     /// propagation. Excludes route and gateway subscriptions (avoids loops).
-    #[cfg(any(feature = "mesh", feature = "gateway"))]
     pub fn local_interests(&self) -> Vec<(&str, Option<&str>)> {
         let mut set: HashSet<(&str, Option<&str>)> = HashSet::new();
         for (subj, subs) in &self.exact {
             for sub in subs {
-                #[cfg(feature = "mesh")]
                 if sub.is_route {
                     continue;
                 }
-                #[cfg(feature = "gateway")]
+
                 if sub.is_gateway {
                     continue;
                 }
@@ -766,11 +755,10 @@ impl SubscriptionManager {
             }
         }
         self.wild.for_each_sub(|sub| {
-            #[cfg(feature = "mesh")]
             if sub.is_route {
                 return;
             }
-            #[cfg(feature = "gateway")]
+
             if sub.is_gateway {
                 return;
             }
@@ -1239,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
+
     fn test_client_interests_excludes_leaf_subs() {
         let mut sl = SubList::new();
         // Client subs
@@ -1295,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gateway")]
+
     fn test_has_local_interest_exact() {
         let mut sl = SubList::new();
         sl.insert(test_sub(1, 1, "foo"));
@@ -1305,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gateway")]
+
     fn test_has_local_interest_wildcard() {
         let mut sl = SubList::new();
         sl.insert(test_sub(1, 1, "foo.*"));
@@ -1317,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gateway")]
+
     fn test_has_local_interest_excludes_gateway_subs() {
         let mut sl = SubList::new();
 

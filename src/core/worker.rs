@@ -19,22 +19,21 @@ use bytes::{Buf, BufMut, BytesMut};
 use metrics::{counter, gauge};
 use tracing::{debug, info, warn};
 
-#[cfg(feature = "mesh")]
 use crate::buf::RouteOp;
 use crate::buf::{AdaptiveBuf, ClientOp};
-#[cfg(feature = "gateway")]
+
 use crate::connector::gateway::GatewayHandler;
-#[cfg(feature = "hub")]
+
 use crate::connector::leaf::LeafHandler;
-#[cfg(feature = "leaf")]
+
 use crate::connector::leaf::UpstreamCmd;
-#[cfg(feature = "mesh")]
+
 use crate::connector::mesh::RouteHandler;
 use crate::core::server::ServerState;
 use crate::handler::client::ClientHandler;
-#[cfg(any(feature = "mesh", feature = "gateway"))]
+
 use crate::handler::propagation::send_existing_route_subs;
-#[cfg(feature = "hub")]
+
 use crate::handler::propagation::send_existing_subs;
 use crate::handler::{
     handle_expired_subs, ConnCtx, ConnExt, ConnKind, ConnectionHandler, HandleResult,
@@ -42,7 +41,7 @@ use crate::handler::{
 };
 use crate::nats_proto;
 use crate::sub_list::{create_eventfd, DirectBuf, MsgWriter};
-#[cfg(any(feature = "mesh", feature = "binary-client"))]
+
 use crate::sub_list::{BinSeg, BinSegBuf};
 use crate::websocket::{self, DecodeStatus, WsCodec};
 
@@ -61,28 +60,24 @@ pub(crate) enum WorkerCmd {
         is_websocket: bool,
     },
     /// Accept an inbound leaf node connection (hub mode).
-    #[cfg(feature = "hub")]
     NewLeafConn {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
     },
     /// Accept an inbound route connection (cluster mode).
-    #[cfg(feature = "mesh")]
     NewRouteConn {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
     },
     /// Accept an inbound gateway connection (gateway mode).
-    #[cfg(feature = "gateway")]
     NewGatewayConn {
         id: u64,
         stream: TcpStream,
         addr: SocketAddr,
     },
     /// Accept an inbound binary-protocol client connection.
-    #[cfg(feature = "binary-client")]
     NewBinaryConn {
         id: u64,
         stream: TcpStream,
@@ -115,28 +110,24 @@ impl WorkerHandle {
     }
 
     /// Send a new inbound leaf node connection to this worker and wake it.
-    #[cfg(feature = "hub")]
     pub fn send_leaf_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewLeafConn { id, stream, addr });
         self.wake();
     }
 
     /// Send a new inbound route connection to this worker and wake it.
-    #[cfg(feature = "mesh")]
     pub fn send_route_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewRouteConn { id, stream, addr });
         self.wake();
     }
 
     /// Send a new inbound gateway connection to this worker and wake it.
-    #[cfg(feature = "gateway")]
     pub fn send_gateway_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewGatewayConn { id, stream, addr });
         self.wake();
     }
 
     /// Send a new binary-protocol client connection to this worker and wake it.
-    #[cfg(feature = "binary-client")]
     pub fn send_binary_conn(&self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let _ = self.tx.send(WorkerCmd::NewBinaryConn { id, stream, addr });
         self.wake();
@@ -202,7 +193,6 @@ pub(crate) struct Worker {
     state: Arc<ServerState>,
     info_line: Vec<u8>,
     /// INFO line for inbound leaf connections (port set to leafnode_port).
-    #[cfg(feature = "hub")]
     hub_info_line: Vec<u8>,
     shutdown: bool,
     /// Accumulated eventfd notifications. Flushed after processing a read batch.
@@ -276,7 +266,7 @@ pub(crate) struct ClientState {
     phase: ConnPhase,
     transport: Transport,
     ext: ConnExt,
-    #[cfg(feature = "leaf")]
+
     upstream_txs: Vec<mpsc::Sender<UpstreamCmd>>,
     /// Whether EPOLLOUT is currently registered for this fd.
     epoll_has_out: bool,
@@ -313,7 +303,7 @@ impl ClientState {
             echo: self.echo,
             no_responders: self.no_responders,
             sub_count: &mut self.sub_count,
-            #[cfg(feature = "leaf")]
+
             upstream_txs: &mut self.upstream_txs,
             permissions: &self.permissions,
             ext: &mut self.ext,
@@ -337,7 +327,7 @@ impl Worker {
         // Must have: port = leafnode_port, client_id != 0, leafnode_urls present.
         // The Go nats-server checks CID != 0 && leafnode_urls != nil to confirm
         // it connected to a leafnode port (not a client port).
-        #[cfg(feature = "hub")]
+
         let hub_info_line = if let Some(lp) = state.leafnode_port {
             let mut leaf_info = state.info.clone();
             leaf_info.port = lp;
@@ -379,7 +369,7 @@ impl Worker {
                     rx,
                     state,
                     info_line,
-                    #[cfg(feature = "hub")]
+
                     hub_info_line,
                     shutdown: false,
                     pending_notify: [-1; 16],
@@ -512,19 +502,19 @@ impl Worker {
                 } => {
                     self.add_conn(id, stream, addr, is_websocket);
                 }
-                #[cfg(feature = "hub")]
+
                 WorkerCmd::NewLeafConn { id, stream, addr } => {
                     self.add_leaf_conn(id, stream, addr);
                 }
-                #[cfg(feature = "mesh")]
+
                 WorkerCmd::NewRouteConn { id, stream, addr } => {
                     self.add_route_conn(id, stream, addr);
                 }
-                #[cfg(feature = "gateway")]
+
                 WorkerCmd::NewGatewayConn { id, stream, addr } => {
                     self.add_gateway_conn(id, stream, addr);
                 }
-                #[cfg(feature = "binary-client")]
+
                 WorkerCmd::NewBinaryConn { id, stream, addr } => {
                     self.add_binary_conn(id, stream, addr);
                 }
@@ -607,7 +597,7 @@ impl Worker {
             phase,
             transport,
             ext: ConnExt::Client,
-            #[cfg(feature = "leaf")]
+
             upstream_txs: Vec::new(),
             epoll_has_out: false,
             echo: true,
@@ -641,7 +631,6 @@ impl Worker {
     ///
     /// Configures the socket, registers with epoll, creates MsgWriter,
     /// queues the INFO line, and inserts into the connection map.
-    #[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
     fn register_conn(
         &mut self,
         id: u64,
@@ -689,7 +678,7 @@ impl Worker {
             phase: ConnPhase::SendInfo,
             transport: Transport::Raw,
             ext,
-            #[cfg(feature = "leaf")]
+
             upstream_txs: Vec::new(),
             epoll_has_out: false,
             echo: true,
@@ -716,7 +705,6 @@ impl Worker {
         self.try_flush_conn(id);
     }
 
-    #[cfg(feature = "hub")]
     fn add_leaf_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let info = self.hub_info_line.clone();
         self.register_conn(
@@ -731,7 +719,6 @@ impl Worker {
         );
     }
 
-    #[cfg(feature = "mesh")]
     fn add_route_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let info = crate::connector::mesh::build_route_info(&self.state);
         self.register_conn(
@@ -748,7 +735,6 @@ impl Worker {
         );
     }
 
-    #[cfg(feature = "gateway")]
     fn add_gateway_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
         let info = crate::connector::gateway::get_gateway_info(&self.state);
         self.register_conn(
@@ -766,7 +752,6 @@ impl Worker {
     }
 
     /// Create a binary-protocol client connection — no handshake, active immediately.
-    #[cfg(feature = "binary-client")]
     fn add_binary_conn(&mut self, id: u64, stream: TcpStream, addr: SocketAddr) {
         stream.set_nonblocking(true).ok();
         stream.set_nodelay(true).ok();
@@ -803,7 +788,7 @@ impl Worker {
             phase: ConnPhase::Active,
             transport: Transport::Raw,
             ext: ConnExt::BinaryClient,
-            #[cfg(feature = "leaf")]
+
             upstream_txs: Vec::new(),
             epoll_has_out: false,
             echo: false,
@@ -842,7 +827,6 @@ impl Worker {
                 .active_connections
                 .fetch_sub(1, Ordering::Relaxed);
 
-            #[cfg(feature = "hub")]
             if client.ext.is_leaf() {
                 self.state
                     .inbound_leaf_writers
@@ -850,7 +834,7 @@ impl Worker {
                     .unwrap()
                     .remove(&conn_id);
             }
-            #[cfg(feature = "mesh")]
+
             if client.ext.is_route() {
                 self.state.route_writers.write().unwrap().remove(&conn_id);
                 if let ConnExt::Route {
@@ -861,7 +845,7 @@ impl Worker {
                     self.state.route_peers.lock().unwrap().connected.remove(sid);
                 }
             }
-            #[cfg(feature = "gateway")]
+
             if client.ext.is_gateway() {
                 self.state.gateway_writers.write().unwrap().remove(&conn_id);
                 if let ConnExt::Gateway {
@@ -907,11 +891,8 @@ impl Worker {
             enum DrainResult {
                 Empty,
                 FlatBytes(BytesMut),
-                #[cfg(any(feature = "mesh", feature = "binary-client"))]
-                Segs {
-                    segs: Vec<BinSeg>,
-                    total_len: usize,
-                },
+
+                Segs { segs: Vec<BinSeg>, total_len: usize },
             }
             let drained = {
                 let mut dbuf = client.direct_buf.lock().unwrap();
@@ -920,7 +901,7 @@ impl Worker {
                 } else if matches!(client.transport, Transport::Raw) {
                     match &mut *dbuf {
                         DirectBuf::Text(b) => DrainResult::FlatBytes(b.split()),
-                        #[cfg(any(feature = "mesh", feature = "binary-client"))]
+
                         DirectBuf::Binary(seg_buf) => {
                             let total_len = seg_buf.total_len;
                             DrainResult::Segs {
@@ -936,7 +917,7 @@ impl Worker {
                             client.write_buf.extend_from_slice(b);
                             b.clear();
                         }
-                        #[cfg(any(feature = "mesh", feature = "binary-client"))]
+
                         DirectBuf::Binary(seg_buf) => {
                             seg_buf.materialize_into(&mut client.write_buf);
                         }
@@ -946,10 +927,8 @@ impl Worker {
             };
             // Materialise DrainResult: text path uses direct_data; binary uses segs_drain.
             let direct_data: BytesMut;
-            #[cfg(any(feature = "mesh", feature = "binary-client"))]
+
             let segs_drain: Option<(Vec<BinSeg>, usize)>;
-            #[cfg(not(any(feature = "mesh", feature = "binary-client")))]
-            let segs_drain: Option<(Vec<()>, usize)>;
             match drained {
                 DrainResult::Empty => {
                     direct_data = BytesMut::new();
@@ -959,7 +938,7 @@ impl Worker {
                     direct_data = b;
                     segs_drain = None;
                 }
-                #[cfg(any(feature = "mesh", feature = "binary-client"))]
+
                 DrainResult::Segs { segs, total_len } => {
                     direct_data = BytesMut::new();
                     segs_drain = Some((segs, total_len));
@@ -1065,7 +1044,7 @@ impl Worker {
             let mut error = false;
             if is_raw {
                 // ── Binary segment path (zero-copy scatter-gather) ──────────
-                #[cfg(any(feature = "mesh", feature = "binary-client"))]
+
                 if let Some((segs, _total_len)) = segs_drain {
                     // Build iovec array: write_buf (if any) + per-segment iovecs.
                     // Each Msg segment contributes up to 4 iovecs; Inline contributes 1.
@@ -1488,7 +1467,7 @@ impl Worker {
                                 client.write_buf.extend_from_slice(b);
                                 b.clear();
                             }
-                            #[cfg(any(feature = "mesh", feature = "binary-client"))]
+
                             DirectBuf::Binary(seg_buf) => {
                                 seg_buf.materialize_into(&mut client.write_buf);
                             }
@@ -1925,20 +1904,10 @@ impl Worker {
                         (phase, &kind),
                         (ConnPhase::Active | ConnPhase::Draining, ConnKind::Client)
                     ) && {
-                        #[cfg(feature = "gateway")]
                         let has_gw = self.state.has_gateway_interest.load(Ordering::Relaxed);
-                        #[cfg(not(feature = "gateway"))]
-                        let has_gw = false;
-                        #[cfg(feature = "leaf")]
-                        {
-                            c.upstream_txs.is_empty()
-                                && !self.state.has_subs.load(Ordering::Relaxed)
-                                && !has_gw
-                        }
-                        #[cfg(not(feature = "leaf"))]
-                        {
-                            !self.state.has_subs.load(Ordering::Relaxed) && !has_gw
-                        }
+                        c.upstream_txs.is_empty()
+                            && !self.state.has_subs.load(Ordering::Relaxed)
+                            && !has_gw
                     };
                     (phase, kind, can_skip)
                 }
@@ -2092,16 +2061,13 @@ impl Worker {
     /// Returns `true` if the caller should `continue` the loop, `false` to `return`.
     fn process_wait_connect(&mut self, conn_id: u64) -> bool {
         // Route connections use the route protocol parser (INFO+CONNECT+PING).
-        #[cfg(feature = "mesh")]
+
         let is_route_conn = self
             .conns
             .get(&conn_id)
             .map(|c| c.ext.is_route())
             .unwrap_or(false);
-        #[cfg(not(feature = "mesh"))]
-        let _is_route_conn = false;
 
-        #[cfg(feature = "mesh")]
         if is_route_conn {
             let route_op = {
                 let client = self.conns.get_mut(&conn_id).unwrap();
@@ -2165,7 +2131,7 @@ impl Worker {
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     client.phase = ConnPhase::Active;
                     client.echo = false;
-                    #[cfg(feature = "leaf")]
+
                     {
                         client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
                     }
@@ -2232,14 +2198,13 @@ impl Worker {
         }
 
         // Gateway connections use the gateway protocol parser (INFO+CONNECT+PING).
-        #[cfg(feature = "gateway")]
+
         let is_gateway_conn = self
             .conns
             .get(&conn_id)
             .map(|c| c.ext.is_gateway())
             .unwrap_or(false);
 
-        #[cfg(feature = "gateway")]
         if is_gateway_conn {
             let gw_op = {
                 let client = self.conns.get_mut(&conn_id).unwrap();
@@ -2275,7 +2240,7 @@ impl Worker {
                     let client = self.conns.get_mut(&conn_id).unwrap();
                     client.phase = ConnPhase::Active;
                     client.echo = false;
-                    #[cfg(feature = "leaf")]
+
                     {
                         client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
                     }
@@ -2343,18 +2308,15 @@ impl Worker {
         };
         match op {
             Some(ClientOp::Connect(connect_info)) => {
-                #[cfg(feature = "hub")]
                 let is_leaf = self
                     .conns
                     .get(&conn_id)
                     .map(|c| c.ext.is_leaf())
                     .unwrap_or(false);
-                #[cfg(not(feature = "hub"))]
-                let is_leaf = false;
 
                 if is_leaf {
                     // Inbound leaf node — validate leaf auth, send PING, go Active.
-                    #[cfg(feature = "hub")]
+
                     {
                         let leaf_perms = self.state.inbound_leaf_auth.validate(&connect_info);
                         let leaf_perms = match leaf_perms {
@@ -2381,7 +2343,7 @@ impl Worker {
                         client.phase = ConnPhase::Active;
                         client.echo = false; // suppress echo for leaf conns
                         client.permissions = leaf_perms.as_ref().map(|p| p.as_ref().clone());
-                        #[cfg(feature = "leaf")]
+
                         {
                             client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
                         }
@@ -2431,7 +2393,7 @@ impl Worker {
                     {
                         client.account_id = acct_id;
                     }
-                    #[cfg(feature = "leaf")]
+
                     {
                         client.upstream_txs = self.state.upstream_txs.read().unwrap().clone();
                     }
@@ -2459,9 +2421,8 @@ impl Worker {
     /// `conns.get` that read the connection phase, avoiding a second lookup.
     fn dispatch_active(&mut self, conn_id: u64, kind: ConnKind, can_skip: bool) -> bool {
         match kind {
-            #[cfg(feature = "hub")]
             ConnKind::Leaf => self.process_active::<LeafHandler>(conn_id),
-            #[cfg(feature = "mesh")]
+
             ConnKind::Route => {
                 let is_binary = self
                     .conns
@@ -2474,9 +2435,9 @@ impl Worker {
                     self.process_active::<RouteHandler>(conn_id)
                 }
             }
-            #[cfg(feature = "gateway")]
+
             ConnKind::Gateway => self.process_active::<GatewayHandler>(conn_id),
-            #[cfg(feature = "binary-client")]
+
             ConnKind::BinaryClient => self.process_active_binary_client(conn_id),
             ConnKind::Client => self.process_active_client(conn_id, can_skip),
         }
@@ -2705,7 +2666,6 @@ impl Worker {
     ///
     /// Maps `BinOp::Ping/Pong` in-place, converts `Msg/HMsg/Sub/Unsub` to `RouteOp`
     /// and delegates to `RouteHandler` via `dispatch_and_apply`.
-    #[cfg(feature = "mesh")]
     fn process_active_route_binary(&mut self, conn_id: u64) -> bool {
         use crate::protocol::bin_proto::{self, BinOp};
 
@@ -2755,7 +2715,6 @@ impl Worker {
     /// - `Sub`: register a subscription; subject=pattern, reply=queue, payload=SID (u32 LE).
     /// - `Unsub`: remove a subscription; subject=SID (u32 LE).
     /// - `Ping`/`Pong`: keepalive.
-    #[cfg(feature = "binary-client")]
     fn process_active_binary_client(&mut self, conn_id: u64) -> bool {
         use crate::handler::propagation::propagate_all_interest;
         use crate::handler::{DeliveryScope, Msg};
@@ -2859,15 +2818,15 @@ impl Worker {
                     max_msgs: std::sync::atomic::AtomicU64::new(0),
                     delivered: std::sync::atomic::AtomicU64::new(0),
                     is_leaf: false,
-                    #[cfg(feature = "mesh")]
+
                     is_route: false,
-                    #[cfg(feature = "gateway")]
+
                     is_gateway: false,
-                    #[cfg(feature = "binary-client")]
+
                     is_binary_client: true,
                     #[cfg(feature = "accounts")]
                     account_id: 0,
-                    #[cfg(feature = "hub")]
+
                     leaf_perms: None,
                 };
                 {
@@ -2940,7 +2899,6 @@ impl Worker {
 ///
 /// `Ping` and `Pong` are handled in-place by `process_active_route_binary` and
 /// must not be passed to this function.
-#[cfg(feature = "mesh")]
 fn bin_frame_to_route_op(frame: crate::protocol::bin_proto::BinFrame) -> Option<RouteOp> {
     use crate::protocol::bin_proto::BinOp;
     match frame.op {
@@ -3048,7 +3006,6 @@ fn cleanup_conn(id: u64, state: &ServerState) {
         }
     };
 
-    #[cfg(feature = "leaf")]
     if !removed.is_empty() {
         let mut upstreams = state.upstreams.write().unwrap();
         for up in upstreams.iter_mut() {
@@ -3057,14 +3014,12 @@ fn cleanup_conn(id: u64, state: &ServerState) {
             }
         }
     }
-    #[cfg(not(feature = "leaf"))]
-    let _ = &removed;
 
     info!(id, "client cleaned up");
 }
 
 /// Tests for `bin_frame_to_route_op`: binary frame → RouteOp conversion.
-#[cfg(all(test, feature = "mesh"))]
+#[cfg(test)]
 mod bin_frame_tests {
     use super::*;
     use crate::protocol::bin_proto::{self, BinOp};
