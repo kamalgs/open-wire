@@ -11,7 +11,6 @@
 
 use std::os::fd::RawFd;
 use std::sync::atomic::Ordering;
-#[cfg(feature = "leaf")]
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -20,7 +19,6 @@ use metrics::gauge;
 use tracing::debug;
 
 use super::ConnCtx;
-#[cfg(feature = "leaf")]
 use crate::connector::leaf::UpstreamCmd;
 use crate::core::server::ServerState;
 use crate::sub_list::MsgWriter;
@@ -119,10 +117,8 @@ pub(crate) struct DeliveryScope {
     /// Skip delivery back to the publishing connection.
     pub skip_echo: bool,
     /// Skip route subscriptions (one-hop enforcement from routes).
-    #[cfg(feature = "mesh")]
     pub skip_routes: bool,
     /// Skip gateway subscriptions (one-hop enforcement from gateways).
-    #[cfg(feature = "gateway")]
     pub skip_gateways: bool,
 }
 
@@ -132,32 +128,26 @@ impl DeliveryScope {
     pub(crate) fn local(skip_echo: bool) -> Self {
         Self {
             skip_echo,
-            #[cfg(feature = "mesh")]
             skip_routes: false,
-            #[cfg(feature = "gateway")]
             skip_gateways: false,
         }
     }
 
     /// Scope for messages arriving from a route peer (one-hop: skip routes).
-    #[cfg(feature = "mesh")]
     #[inline]
     pub(crate) fn from_route() -> Self {
         Self {
             skip_echo: true,
             skip_routes: true,
-            #[cfg(feature = "gateway")]
             skip_gateways: false,
         }
     }
 
     /// Scope for messages arriving from a gateway peer (one-hop: skip routes + gateways).
-    #[cfg(feature = "gateway")]
     #[inline]
     pub(crate) fn from_gateway() -> Self {
         Self {
             skip_echo: true,
-            #[cfg(feature = "mesh")]
             skip_routes: true,
             skip_gateways: true,
         }
@@ -185,7 +175,6 @@ impl MessageDeliveryHub<'_> {
             account_id,
         );
 
-        #[cfg(feature = "gateway")]
         if !scope.skip_gateways {
             forward_to_optimistic_gateways(
                 self,
@@ -218,7 +207,6 @@ pub(crate) fn deliver_to_sub_inner(
     msg: &Msg<'_>,
     #[cfg(feature = "accounts")] account_name: &[u8],
 ) -> bool {
-    #[cfg(feature = "mesh")]
     if sub.is_route {
         sub.writer.write_rmsg(
             &msg.subject,
@@ -230,7 +218,6 @@ pub(crate) fn deliver_to_sub_inner(
         );
         return true;
     }
-    #[cfg(feature = "hub")]
     if sub.is_leaf {
         // Check subscribe permissions: don't deliver to leaf if the subject
         // is not in the leaf's allowed subscribe set.
@@ -249,7 +236,6 @@ pub(crate) fn deliver_to_sub_inner(
         return true;
     }
     // Binary-protocol client subscriptions: deliver via binary Msg frame.
-    #[cfg(feature = "binary-client")]
     if sub.is_binary_client {
         sub.writer.write_rmsg(
             &msg.subject,
@@ -285,7 +271,7 @@ fn deliver_to_subs_core<F>(
     skip_conn_id: u64,
     scope: &DeliveryScope,
     #[cfg(feature = "accounts")] acct_name: &[u8],
-    #[cfg(feature = "gateway")] state: &ServerState,
+    state: &ServerState,
     mut on_deliver: F,
 ) -> (usize, Vec<(u64, u64)>)
 where
@@ -301,18 +287,17 @@ where
             if scope.skip_echo && sub.conn_id == skip_conn_id {
                 return false;
             }
-            #[cfg(feature = "mesh")]
+
             if scope.skip_routes && sub.is_route {
                 return false;
             }
-            #[cfg(feature = "gateway")]
+
             if scope.skip_gateways && sub.is_gateway {
                 return false;
             }
             true
         },
         |sub| {
-            #[cfg(feature = "gateway")]
             if sub.is_gateway {
                 let gw_reply =
                     crate::handler::propagation::rewrite_gateway_reply(msg.reply.as_deref(), state);
@@ -325,15 +310,6 @@ where
                     acct_name,
                 );
             } else if !deliver_to_sub_inner(
-                sub,
-                msg,
-                #[cfg(feature = "accounts")]
-                acct_name,
-            ) {
-                return;
-            }
-            #[cfg(not(feature = "gateway"))]
-            if !deliver_to_sub_inner(
                 sub,
                 msg,
                 #[cfg(feature = "accounts")]
@@ -372,7 +348,6 @@ pub(crate) fn deliver_to_subs(
     #[cfg(feature = "accounts")]
     let acct_name = acct_name_str.as_bytes();
 
-    #[cfg(feature = "gateway")]
     let gw_state = Arc::clone(wctx.state);
 
     let subs = wctx
@@ -391,13 +366,12 @@ pub(crate) fn deliver_to_subs(
         scope,
         #[cfg(feature = "accounts")]
         acct_name,
-        #[cfg(feature = "gateway")]
         &gw_state,
         |sub| {
             wctx.record_delivery(payload_len);
             wctx.queue_notify(sub.writer.event_raw_fd());
             // Signal route congestion so the worker can reduce this client's read budget.
-            #[cfg(feature = "mesh")]
+
             if sub.is_route && sub.writer.congestion() >= 1 {
                 wctx.route_congested = true;
             }
@@ -412,7 +386,6 @@ pub(crate) fn deliver_to_subs(
 /// Unlike `deliver_to_subs`, this variant collects dirty writers for batch
 /// notification (since the upstream reader runs outside the worker event loop)
 /// and does not track worker-level metrics.
-#[cfg(feature = "leaf")]
 pub(crate) fn deliver_to_subs_upstream(
     state: &ServerState,
     msg: &Msg<'_>,
@@ -462,7 +435,6 @@ pub(crate) fn deliver_to_subs_upstream_inner(
         scope,
         #[cfg(feature = "accounts")]
         acct_name,
-        #[cfg(feature = "gateway")]
         state,
         |sub| {
             dirty_writers.push(sub.writer.clone());
@@ -474,7 +446,6 @@ pub(crate) fn deliver_to_subs_upstream_inner(
 
 /// Forward a publish to all upstream hubs. If a writer thread has gone,
 /// refresh the senders from global state.
-#[cfg(feature = "leaf")]
 pub(crate) fn forward_to_upstream(
     upstream_txs: &mut Vec<mpsc::Sender<UpstreamCmd>>,
     state: &ServerState,
@@ -508,7 +479,6 @@ pub(crate) fn forward_to_upstream(
 
 impl ConnCtx<'_> {
     /// Forward a publish to all upstream hubs via the connection's cached senders.
-    #[cfg(feature = "leaf")]
     #[inline]
     pub(crate) fn forward_to_upstream(
         &mut self,
@@ -548,7 +518,7 @@ pub(crate) fn handle_expired_subs(
             if let Some(client) = conns.get_mut(exp_conn_id) {
                 client.sub_count = client.sub_count.saturating_sub(1);
             }
-            #[cfg(feature = "leaf")]
+
             {
                 let mut upstreams = state.upstreams.write().unwrap();
                 for up in upstreams.iter_mut() {
@@ -576,7 +546,6 @@ pub(crate) fn handle_expired_subs(
 ///
 /// Similar to `handle_expired_subs` but without access to worker connections
 /// (upstream runs in its own thread).
-#[cfg(feature = "leaf")]
 pub(crate) fn handle_expired_subs_upstream(
     expired: &[(u64, u64)],
     state: &ServerState,
@@ -608,7 +577,6 @@ pub(crate) fn handle_expired_subs_upstream(
 /// Called after `deliver_to_subs` when gateway subs may not exist in SubscriptionManager
 /// (because the remote hasn't sent RS+ yet). In optimistic mode, we forward
 /// unless the subject is in the gateway's negative interest set.
-#[cfg(feature = "gateway")]
 pub(crate) fn forward_to_optimistic_gateways(
     wctx: &mut MessageDeliveryHub<'_>,
     msg: &Msg<'_>,
@@ -820,9 +788,9 @@ mod tests {
             cross_account_routes: Vec::new(),
             #[cfg(feature = "accounts")]
             reverse_imports: Vec::new(),
-            #[cfg(feature = "leaf")]
+
             upstreams: std::sync::RwLock::new(Vec::new()),
-            #[cfg(feature = "leaf")]
+
             upstream_txs: std::sync::RwLock::new(Vec::new()),
             has_subs: AtomicBool::new(false),
             buf_config: Default::default(),
@@ -834,49 +802,49 @@ mod tests {
             max_control_line: AtomicUsize::new(4096),
             max_subscriptions: AtomicUsize::new(0),
             stats: Default::default(),
-            #[cfg(feature = "hub")]
+
             leafnode_port: None,
-            #[cfg(feature = "hub")]
+
             inbound_leaf_writers: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "hub")]
+
             inbound_leaf_auth: Default::default(),
-            #[cfg(feature = "mesh")]
+
             route_writers: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "mesh")]
+
             cluster_port: None,
-            #[cfg(feature = "mesh")]
+
             cluster_name: None,
-            #[cfg(feature = "mesh")]
+
             cluster_seeds: Vec::new(),
-            #[cfg(feature = "mesh")]
+
             route_peers: std::sync::Mutex::new(crate::core::server::RoutePeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
-            #[cfg(feature = "mesh")]
+
             route_connect_tx: std::sync::Mutex::new(None),
-            #[cfg(feature = "gateway")]
+
             gateway_writers: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "gateway")]
+
             gateway_port: None,
-            #[cfg(feature = "gateway")]
+
             gateway_name: None,
-            #[cfg(feature = "gateway")]
+
             gateway_remotes: Vec::new(),
-            #[cfg(feature = "gateway")]
+
             gateway_peers: std::sync::Mutex::new(crate::core::server::GatewayPeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
-            #[cfg(feature = "gateway")]
+
             gateway_connect_tx: std::sync::Mutex::new(None),
-            #[cfg(feature = "gateway")]
+
             gateway_reply_prefix: b"_GR_.abc.def.".to_vec(),
-            #[cfg(feature = "gateway")]
+
             cached_gateway_info: std::sync::Mutex::new(String::new()),
-            #[cfg(feature = "gateway")]
+
             gateway_interest: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "gateway")]
+
             has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]
             affinity: crate::core::server::AffinityMap::new(1),
@@ -901,15 +869,15 @@ mod tests {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            #[cfg(feature = "mesh")]
+
             is_route: false,
-            #[cfg(feature = "gateway")]
+
             is_gateway: false,
-            #[cfg(feature = "binary-client")]
+
             is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
-            #[cfg(feature = "hub")]
+
             leaf_perms: None,
         }
     }
@@ -928,7 +896,7 @@ mod tests {
             None,
             Bytes::copy_from_slice(payload),
         );
-        #[cfg(feature = "gateway")]
+
         let state = test_server_state();
         deliver_to_subs_core(
             subs,
@@ -937,7 +905,6 @@ mod tests {
             scope,
             #[cfg(feature = "accounts")]
             b"$G",
-            #[cfg(feature = "gateway")]
             &state,
             |_sub| {},
         )
@@ -955,7 +922,7 @@ mod tests {
             None,
             Bytes::from_static(b"hello"),
         );
-        #[cfg(feature = "gateway")]
+
         let state = test_server_state();
         let (delivered, expired) = deliver_to_subs_core(
             &subs,
@@ -964,7 +931,6 @@ mod tests {
             &DeliveryScope::local(false),
             #[cfg(feature = "accounts")]
             b"$G",
-            #[cfg(feature = "gateway")]
             &state,
             |_sub| {},
         );
@@ -1036,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mesh")]
+
     fn test_from_route_skips_route_subs() {
         let writer = DirectWriter::new_dummy();
         let mut subs = SubList::new();
@@ -1052,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mesh")]
+
     fn test_from_route_delivers_to_client_subs() {
         let client_w = DirectWriter::new_dummy();
         let route_w = DirectWriter::new_dummy();
@@ -1071,13 +1037,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gateway")]
+
     fn test_from_gateway_skips_route_and_gateway_subs() {
         let client_w = DirectWriter::new_dummy();
         let mut subs = SubList::new();
         subs.insert(sub_with_writer(1, 1, "foo", None, &client_w));
 
-        #[cfg(feature = "mesh")]
         {
             let route_w = DirectWriter::new_dummy();
             let mut route_sub = sub_with_writer(2, 1, "foo", None, &route_w);
@@ -1106,7 +1071,6 @@ mod tests {
         #[allow(unused_mut)]
         let mut total_expected = 1;
 
-        #[cfg(feature = "mesh")]
         {
             let route_w = DirectWriter::new_dummy();
             let mut route_sub = sub_with_writer(2, 1, "foo", None, &route_w);
@@ -1122,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
+
     fn test_deliver_to_leaf_sub_writes_lmsg() {
         let writer = DirectWriter::new_dummy();
         let mut sub = sub_with_writer(1, 1, "foo.bar", None, &writer);
@@ -1148,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
+
     fn test_deliver_leaf_sub_filtered_by_permissions() {
         use crate::core::server::{Permission, Permissions};
 
@@ -1184,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "mesh")]
+
     fn test_deliver_to_route_sub_writes_rmsg() {
         let writer = DirectWriter::new_dummy();
         let mut sub = sub_with_writer(1, 1, "foo.bar", None, &writer);

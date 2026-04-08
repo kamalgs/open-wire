@@ -3,20 +3,15 @@
 //! Propagates LS+/LS-, RS+/RS-, and gateway interest changes to connected
 //! leaf, route, and gateway peers. Also handles gateway reply rewriting.
 
-#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::core::server::ServerState;
-#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::nats_proto;
-#[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
 use crate::sub_list::MsgWriter;
 
-#[cfg(feature = "gateway")]
 use std::cell::RefCell;
 
 /// Propagate LS+ (`is_sub=true`) or LS- (`is_sub=false`) to all inbound leaf connections.
 ///
 /// Filtered by each leaf's publish permissions.
-#[cfg(feature = "hub")]
 pub(crate) fn propagate_leaf_interest(
     state: &ServerState,
     subject: &[u8],
@@ -55,7 +50,6 @@ pub(crate) fn propagate_leaf_interest(
 ///
 /// Filters by the leaf's publish permissions — only sends LS+ for subjects that
 /// the leaf is allowed to publish on (controls what the leaf can export).
-#[cfg(feature = "hub")]
 pub(crate) fn send_existing_subs(
     state: &ServerState,
     writer: &MsgWriter,
@@ -103,7 +97,6 @@ pub(crate) fn send_existing_subs(
 }
 
 /// Propagate RS+ (`is_sub=true`) or RS- (`is_sub=false`) to all inbound route connections.
-#[cfg(feature = "mesh")]
 pub(crate) fn propagate_route_interest(
     state: &ServerState,
     subject: &[u8],
@@ -140,7 +133,6 @@ pub(crate) fn propagate_route_interest(
 /// Both route and gateway peers use the same RS+ wire format, so this single
 /// function replaces the old `send_existing_subs_to_route` and
 /// `send_existing_subs_to_gateway`.
-#[cfg(any(feature = "mesh", feature = "gateway"))]
 pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) {
     #[cfg(feature = "accounts")]
     {
@@ -164,7 +156,6 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
     writer.notify();
 }
 
-#[cfg(feature = "gateway")]
 thread_local! {
     static GW_BUILDER: RefCell<nats_proto::MsgBuilder> = RefCell::new(nats_proto::MsgBuilder::new());
 }
@@ -172,7 +163,6 @@ thread_local! {
 /// Propagate RS+ (`is_sub=true`) or RS- (`is_sub=false`) to all gateway connections.
 ///
 /// Skipped for outbound gateways in Optimistic mode.
-#[cfg(feature = "gateway")]
 pub(crate) fn propagate_gateway_interest(
     state: &ServerState,
     subject: &[u8],
@@ -246,9 +236,7 @@ pub(crate) fn propagate_all_interest(
     is_sub: bool,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
-    #[cfg(feature = "hub")]
     propagate_leaf_interest(state, subject, queue, is_sub);
-    #[cfg(feature = "mesh")]
     propagate_route_interest(
         state,
         subject,
@@ -257,7 +245,6 @@ pub(crate) fn propagate_all_interest(
         #[cfg(feature = "accounts")]
         account,
     );
-    #[cfg(feature = "gateway")]
     propagate_gateway_interest(
         state,
         subject,
@@ -279,7 +266,6 @@ pub(crate) fn propagate_route_gateway_interest(
     is_sub: bool,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
-    #[cfg(feature = "mesh")]
     propagate_route_interest(
         state,
         subject,
@@ -288,7 +274,6 @@ pub(crate) fn propagate_route_gateway_interest(
         #[cfg(feature = "accounts")]
         account,
     );
-    #[cfg(feature = "gateway")]
     propagate_gateway_interest(
         state,
         subject,
@@ -301,7 +286,6 @@ pub(crate) fn propagate_route_gateway_interest(
 
 /// Rewrite outbound reply: `reply` → `_GR_.<cluster_hash>.<server_hash>.reply`.
 /// Returns `None` if the input reply is `None`.
-#[cfg(feature = "gateway")]
 pub(crate) fn rewrite_gateway_reply(
     reply: Option<&[u8]>,
     state: &ServerState,
@@ -319,7 +303,6 @@ pub(crate) fn rewrite_gateway_reply(
 
 /// Unwrap inbound reply as a zero-copy `Bytes` sub-slice.
 /// Returns a `Bytes::slice()` into the original buffer — no heap allocation.
-#[cfg(feature = "gateway")]
 pub(crate) fn unwrap_gateway_reply_bytes(reply: &bytes::Bytes) -> bytes::Bytes {
     if !reply.starts_with(b"_GR_.") {
         return reply.clone();
@@ -340,7 +323,7 @@ pub(crate) fn unwrap_gateway_reply_bytes(reply: &bytes::Bytes) -> bytes::Bytes {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "hub", feature = "gateway"))]
+
     pub(crate) fn test_server_state() -> crate::core::server::ServerState {
         use rustc_hash::FxHashMap;
         use std::collections::HashMap;
@@ -364,9 +347,7 @@ mod tests {
             cross_account_routes: Vec::new(),
             #[cfg(feature = "accounts")]
             reverse_imports: Vec::new(),
-            #[cfg(feature = "leaf")]
             upstreams: std::sync::RwLock::new(Vec::new()),
-            #[cfg(feature = "leaf")]
             upstream_txs: std::sync::RwLock::new(Vec::new()),
             has_subs: AtomicBool::new(false),
             buf_config: Default::default(),
@@ -378,49 +359,30 @@ mod tests {
             max_control_line: AtomicUsize::new(4096),
             max_subscriptions: AtomicUsize::new(0),
             stats: Default::default(),
-            #[cfg(feature = "hub")]
             leafnode_port: None,
-            #[cfg(feature = "hub")]
             inbound_leaf_writers: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "hub")]
             inbound_leaf_auth: Default::default(),
-            #[cfg(feature = "mesh")]
             route_writers: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "mesh")]
             cluster_port: None,
-            #[cfg(feature = "mesh")]
             cluster_name: None,
-            #[cfg(feature = "mesh")]
             cluster_seeds: Vec::new(),
-            #[cfg(feature = "mesh")]
             route_peers: std::sync::Mutex::new(crate::core::server::RoutePeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
-            #[cfg(feature = "mesh")]
             route_connect_tx: std::sync::Mutex::new(None),
-            #[cfg(feature = "gateway")]
             gateway_writers: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "gateway")]
             gateway_port: None,
-            #[cfg(feature = "gateway")]
             gateway_name: None,
-            #[cfg(feature = "gateway")]
             gateway_remotes: Vec::new(),
-            #[cfg(feature = "gateway")]
             gateway_peers: std::sync::Mutex::new(crate::core::server::GatewayPeerRegistry {
                 connected: HashMap::new(),
                 known_urls: std::collections::HashSet::new(),
             }),
-            #[cfg(feature = "gateway")]
             gateway_connect_tx: std::sync::Mutex::new(None),
-            #[cfg(feature = "gateway")]
             gateway_reply_prefix: b"_GR_.abc.def.".to_vec(),
-            #[cfg(feature = "gateway")]
             cached_gateway_info: std::sync::Mutex::new(String::new()),
-            #[cfg(feature = "gateway")]
             gateway_interest: std::sync::RwLock::new(FxHashMap::default()),
-            #[cfg(feature = "gateway")]
             has_gateway_interest: AtomicBool::new(false),
             #[cfg(feature = "worker-affinity")]
             affinity: crate::core::server::AffinityMap::new(1),
@@ -428,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
+
     fn test_propagate_leaf_filters_by_publish_permission() {
         use std::sync::Arc;
 
@@ -468,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
+
     fn test_propagate_leaf_sends_to_all_leaves() {
         use crate::sub_list::MsgWriter;
 
@@ -489,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "hub")]
+
     fn test_send_existing_subs_filters_permissions() {
         use std::sync::Arc;
 
@@ -541,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gateway")]
+
     fn test_rewrite_gateway_reply_adds_prefix() {
         let state = test_server_state();
         let result = super::rewrite_gateway_reply(Some(b"reply"), &state);
@@ -551,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gateway")]
+
     fn test_rewrite_gateway_reply_no_double_rewrite() {
         let state = test_server_state();
         let already = b"_GR_.abc.def.reply";
@@ -565,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "gateway")]
+
     fn test_unwrap_gateway_reply_strips_prefix() {
         let reply = bytes::Bytes::from_static(b"_GR_.abc.def.my.reply");
         let unwrapped = super::unwrap_gateway_reply_bytes(&reply);

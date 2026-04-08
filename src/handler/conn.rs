@@ -11,9 +11,7 @@ use bytes::{Bytes, BytesMut};
 use crate::core::server::Permissions;
 use crate::sub_list::MsgWriter;
 
-#[cfg(feature = "leaf")]
 use crate::connector::leaf::UpstreamCmd;
-#[cfg(feature = "leaf")]
 use std::sync::mpsc;
 
 /// Trait unifying protocol handlers for different connection types.
@@ -51,7 +49,6 @@ pub(crate) struct ConnCtx<'a> {
     /// When true, send 503 no-responders status for request-reply with zero subscribers.
     pub no_responders: bool,
     pub sub_count: &'a mut usize,
-    #[cfg(feature = "leaf")]
     pub upstream_txs: &'a mut Vec<mpsc::Sender<UpstreamCmd>>,
     pub permissions: &'a Option<Permissions>,
     pub ext: &'a mut ConnExt,
@@ -68,13 +65,11 @@ pub(crate) enum ConnExt {
     /// Normal NATS client connection (uses MSG/HMSG for delivery).
     Client,
     /// Inbound leaf node connection (uses LMSG for delivery, LS+/LS- for interest).
-    #[cfg(feature = "hub")]
     Leaf {
         leaf_sid_counter: u64,
         leaf_sids: HashMap<(Bytes, Option<Bytes>), u64>,
     },
     /// Inbound route connection (uses RMSG for delivery, RS+/RS- for interest).
-    #[cfg(feature = "mesh")]
     Route {
         route_sid_counter: u64,
         route_sids: HashMap<(Bytes, Option<Bytes>), u64>,
@@ -84,7 +79,6 @@ pub(crate) enum ConnExt {
         binary: bool,
     },
     /// Inbound gateway connection (uses RMSG for delivery, RS+/RS- for interest).
-    #[cfg(feature = "gateway")]
     Gateway {
         gateway_sid_counter: u64,
         gateway_sids: HashMap<(Bytes, Option<Bytes>), u64>,
@@ -94,7 +88,6 @@ pub(crate) enum ConnExt {
         peer_gateway_name: Option<String>,
     },
     /// Binary-protocol client: uses the binary wire format for pub/sub/deliver.
-    #[cfg(feature = "binary-client")]
     BinaryClient,
 }
 
@@ -103,16 +96,12 @@ pub(crate) enum ConnKind {
     /// Normal NATS client connection.
     Client,
     /// Inbound leaf node connection.
-    #[cfg(feature = "hub")]
     Leaf,
     /// Inbound route connection.
-    #[cfg(feature = "mesh")]
     Route,
     /// Inbound gateway connection.
-    #[cfg(feature = "gateway")]
     Gateway,
-    /// Binary-protocol client connection (`binary-client` feature).
-    #[cfg(feature = "binary-client")]
+    /// Binary-protocol client connection.
     BinaryClient,
 }
 
@@ -121,67 +110,35 @@ impl ConnExt {
     pub(crate) fn kind_tag(&self) -> ConnKind {
         match self {
             Self::Client => ConnKind::Client,
-            #[cfg(feature = "hub")]
             Self::Leaf { .. } => ConnKind::Leaf,
-            #[cfg(feature = "mesh")]
             Self::Route { .. } => ConnKind::Route,
-            #[cfg(feature = "gateway")]
             Self::Gateway { .. } => ConnKind::Gateway,
-            #[cfg(feature = "binary-client")]
             Self::BinaryClient => ConnKind::BinaryClient,
         }
     }
 
     /// Returns `true` for inbound leaf connections.
-    #[cfg(feature = "hub")]
     pub fn is_leaf(&self) -> bool {
         matches!(self, Self::Leaf { .. })
     }
 
-    /// Returns `true` for inbound leaf connections.
-    #[cfg(not(feature = "hub"))]
-    pub fn is_leaf(&self) -> bool {
-        false
-    }
-
     /// Returns `true` for inbound route connections.
-    #[cfg(feature = "mesh")]
     pub fn is_route(&self) -> bool {
         matches!(self, Self::Route { .. })
     }
 
-    /// Returns `true` for inbound route connections.
-    #[cfg(not(feature = "mesh"))]
-    #[allow(dead_code)]
-    pub fn is_route(&self) -> bool {
-        false
-    }
-
     /// Returns `true` for inbound gateway connections.
-    #[cfg(feature = "gateway")]
     pub fn is_gateway(&self) -> bool {
         matches!(self, Self::Gateway { .. })
     }
 
-    /// Returns `true` for inbound gateway connections.
-    #[cfg(not(feature = "gateway"))]
-    #[allow(dead_code)]
-    pub fn is_gateway(&self) -> bool {
-        false
-    }
-
     /// Connection type label for metrics and logging.
-    #[cfg(any(feature = "hub", feature = "mesh", feature = "gateway"))]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Client => "client",
-            #[cfg(feature = "hub")]
             Self::Leaf { .. } => "leaf",
-            #[cfg(feature = "mesh")]
             Self::Route { .. } => "route",
-            #[cfg(feature = "gateway")]
             Self::Gateway { .. } => "gateway",
-            #[cfg(feature = "binary-client")]
             Self::BinaryClient => "binary",
         }
     }

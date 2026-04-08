@@ -104,7 +104,6 @@ impl ClientHandler {
         let queue_str = queue_group.as_ref().map(|q| bytes_to_str(q).to_string());
 
         // Clone for upstream propagation before moving into Subscription
-        #[cfg(feature = "leaf")]
         let upstream_queue = queue_str.clone();
 
         let sub = Subscription {
@@ -117,15 +116,11 @@ impl ClientHandler {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: false,
-            #[cfg(feature = "mesh")]
             is_route: false,
-            #[cfg(feature = "gateway")]
             is_gateway: false,
-            #[cfg(feature = "binary-client")]
             is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: conn.account_id,
-            #[cfg(feature = "hub")]
             leaf_perms: None,
         };
 
@@ -147,7 +142,6 @@ impl ClientHandler {
             .affinity
             .record_sub(subject_str, wctx.worker_index);
 
-        #[cfg(feature = "leaf")]
         {
             let mut upstreams = wctx.state.upstreams.write().unwrap();
             for up in upstreams.iter_mut() {
@@ -177,7 +171,6 @@ impl ClientHandler {
                 for ri in reverses {
                     if crate::sub_list::subject_matches(&ri.local_pattern, subject_str) {
                         let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
-                        #[cfg(feature = "leaf")]
                         {
                             let mut upstreams = wctx.state.upstreams.write().unwrap();
                             for up in upstreams.iter_mut() {
@@ -316,16 +309,7 @@ impl ClientHandler {
         // Skip this check when connected to an upstream hub — let the hub handle it.
         if let Some(ref reply_bytes) = respond {
             if conn.no_responders {
-                let has_upstream = {
-                    #[cfg(feature = "leaf")]
-                    {
-                        !conn.upstream_txs.is_empty()
-                    }
-                    #[cfg(not(feature = "leaf"))]
-                    {
-                        false
-                    }
-                };
+                let has_upstream = { !conn.upstream_txs.is_empty() };
                 if !has_upstream {
                     let subs = wctx
                         .state
@@ -338,10 +322,7 @@ impl ClientHandler {
                     let has_sub = subs.has_any_subscriber(subject_str);
                     drop(subs);
 
-                    #[cfg(feature = "gateway")]
                     let has_gw = wctx.state.has_gateway_interest.load(Ordering::Relaxed);
-                    #[cfg(not(feature = "gateway"))]
-                    let has_gw = false;
 
                     if !has_sub && !has_gw {
                         let mut hdr = crate::types::HeaderMap::new();
@@ -376,7 +357,6 @@ impl ClientHandler {
             conn.account_id,
         );
 
-        #[cfg(feature = "leaf")]
         conn.forward_to_upstream(wctx.state, subject, respond, headers, payload);
 
         (HandleResult::Ok, expired)
@@ -397,7 +377,6 @@ fn cleanup_removed_sub(
     wctx.state
         .affinity
         .record_unsub(&removed.subject, wctx.worker_index);
-    #[cfg(feature = "leaf")]
     {
         let mut upstreams = wctx.state.upstreams.write().unwrap();
         for up in upstreams.iter_mut() {
@@ -437,7 +416,6 @@ fn propagate_reverse_unsub(
         for ri in reverses {
             if crate::sub_list::subject_matches(&ri.local_pattern, subject) {
                 let src_acct_name = wctx.state.account_name(ri.src_account_id).as_bytes();
-                #[cfg(feature = "leaf")]
                 {
                     let mut upstreams = wctx.state.upstreams.write().unwrap();
                     for up in upstreams.iter_mut() {

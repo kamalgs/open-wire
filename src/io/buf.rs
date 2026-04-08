@@ -24,9 +24,7 @@ use crate::types::ServerInfo;
 
 // Re-export parsed op types so the rest of the crate uses nats_proto's types.
 pub(crate) use crate::nats_proto::ClientOp;
-#[cfg(any(feature = "leaf", feature = "hub"))]
 pub(crate) use crate::nats_proto::LeafOp;
-#[cfg(feature = "mesh")]
 pub(crate) use crate::nats_proto::RouteOp;
 
 // --- Adaptive read buffer (Go-style dynamic sizing) ---
@@ -537,7 +535,6 @@ mod tests {
 
     // Leaf protocol parsing tests live in nats_proto.rs.
 
-    #[cfg(feature = "leaf")]
     fn make_leaf_pair() -> (crate::connector::leaf::LeafConn, TcpStream) {
         let (server, client) = tcp_pair();
         let conn = crate::connector::leaf::LeafConn::new(server, BufConfig::default());
@@ -545,7 +542,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
     fn test_leaf_send_leaf_sub_unsub() {
         let (conn, mut hub) = make_leaf_pair();
         let (_reader, mut writer) = conn.split().unwrap();
@@ -560,7 +556,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
     fn test_leaf_send_lmsg_no_headers() {
         let (conn, mut hub) = make_leaf_pair();
         let (_reader, mut writer) = conn.split().unwrap();
@@ -576,7 +571,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
     fn test_leaf_send_lmsg_with_reply() {
         let (conn, mut hub) = make_leaf_pair();
         let (_reader, mut writer) = conn.split().unwrap();
@@ -592,7 +586,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
     fn test_leaf_connect_no_creds() {
         let (mut conn, mut hub) = make_leaf_pair();
         conn.send_leaf_connect("test-leaf", true, None).unwrap();
@@ -609,7 +602,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
     fn test_leaf_connect_with_creds() {
         use crate::connector::leaf::UpstreamConnectCreds;
         let (mut conn, mut hub) = make_leaf_pair();
@@ -631,7 +623,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "leaf")]
     fn test_leaf_split_produces_independent_halves() {
         let (conn, mut hub) = make_leaf_pair();
         let (mut reader, mut writer) = conn.split().unwrap();

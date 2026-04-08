@@ -629,13 +629,13 @@ fn handle_route_op(
                 delivered: AtomicU64::new(0),
                 is_leaf: false,
                 is_route: true,
-                #[cfg(feature = "gateway")]
+
                 is_gateway: false,
-                #[cfg(feature = "binary-client")]
+
                 is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
-                #[cfg(feature = "hub")]
+
                 leaf_perms: None,
             };
 
@@ -762,13 +762,13 @@ fn handle_bin_frame(
                 delivered: AtomicU64::new(0),
                 is_leaf: false,
                 is_route: true,
-                #[cfg(feature = "gateway")]
+
                 is_gateway: false,
-                #[cfg(feature = "binary-client")]
+
                 is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
-                #[cfg(feature = "hub")]
+
                 leaf_perms: None,
             };
 

@@ -94,36 +94,23 @@ CLAUDE.md  LICENSE  NOTICE  README.md
 # Check
 cargo check
 
-# Check with mesh feature
-cargo check --features mesh
-
 # Test (unit — no external deps)
 cargo test --lib
-
-# Test with mesh feature
-cargo test --lib --features mesh
 
 # Test (all — requires nats-server in PATH)
 cargo test
 
-# Test mesh integration tests
-cargo test --test e2e --features mesh -- mesh
+# Test with all optional features (accounts, worker-affinity, etc.)
+cargo test --lib --all-features
 
 # Format (required: nightly toolchain)
 cargo +nightly fmt
 
 # Lint
 cargo clippy --all-targets -- --deny clippy::all
-cargo clippy --all-targets --features mesh -- --deny clippy::all
 
 # Build release
 cargo build --release
-
-# Build release with mesh
-cargo build --release --features mesh
-
-# Build release with binary-client (includes bench tool)
-cargo build --release --features binary-client
 
 # Build release with frame pointers (for perf profiling)
 RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
@@ -131,7 +118,7 @@ RUSTFLAGS="-C force-frame-pointers=yes" cargo build --release
 # Benchmarks (quick — 5 core scenarios)
 cd tests && ./throughput.sh
 
-# Benchmarks (full — all 16 scenarios including mesh)
+# Benchmarks (full — all scenarios including mesh/gateway/cluster)
 cd tests && ./throughput.sh --full
 
 cd tests && ./smoke_test.sh
@@ -215,16 +202,14 @@ Always run `cargo +nightly fmt` before committing.
 
 ## Feature Flags
 
+Mesh clustering, gateway, binary-client, leaf, and hub are always compiled.
+Only truly optional features remain as compile-time flags:
+
 | Feature | Default | Purpose |
 |---------|---------|---------|
-| `leaf` | yes | Upstream hub connection support |
-| `hub` | yes | Inbound leaf node connection support |
 | `interest-collapse` | yes | N:1 wildcard aggregation for upstream subs |
 | `subject-mapping` | yes | Stateless subject rewriting before upstream |
-| `mesh` | no | Full mesh route clustering (RS+/RS-/RMSG) |
-| `gateway` | no | Gateway inter-cluster traffic |
 | `accounts` | no | Multi-tenant per-account subject isolation |
-| `binary-client` | no | Binary wire protocol client port (9-byte header) |
 | `worker-affinity` | no | Subject-based worker affinity tracking |
 
 ## Dependencies

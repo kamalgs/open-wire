@@ -9,16 +9,11 @@ autobenches = false
 autotests = false
 
 [features]
-default = ["interest-collapse", "subject-mapping", "leaf", "hub"]
+default = ["interest-collapse", "subject-mapping"]
 interest-collapse = []
 subject-mapping = []
-leaf = []      # Upstream hub connection support
-hub = []       # Inbound leaf node connection support
-mesh = []      # Full mesh route clustering support
-gateway = []   # Gateway inter-cluster traffic support
 worker-affinity = []  # Subject-based worker affinity tracking
 accounts = []  # Multi-tenant per-account subject isolation
-binary-client = []    # Binary-protocol client port + bench tool
 
 [dependencies]
 bytes = "1.4.0"

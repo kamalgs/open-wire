@@ -182,7 +182,6 @@ fn connect_gateway(
         }
     };
 
-    #[cfg(feature = "gateway")]
     if let Some(ref gw_name) = peer_info.gateway {
         if gw_name != expected_name {
             return Err(format!(
@@ -193,7 +192,6 @@ fn connect_gateway(
         }
     }
 
-    #[cfg(feature = "gateway")]
     if let Some(ref urls) = peer_info.gateway_urls {
         if !urls.is_empty() {
             let tx = state.gateway_connect_tx.lock().unwrap();
@@ -490,14 +488,14 @@ fn handle_gateway_op(
                 max_msgs: AtomicU64::new(0),
                 delivered: AtomicU64::new(0),
                 is_leaf: false,
-                #[cfg(feature = "mesh")]
+
                 is_route: false,
                 is_gateway: true,
-                #[cfg(feature = "binary-client")]
+
                 is_binary_client: false,
                 #[cfg(feature = "accounts")]
                 account_id: 0,
-                #[cfg(feature = "hub")]
+
                 leaf_perms: None,
             };
 
@@ -633,7 +631,7 @@ fn handle_gateway_op(
         GatewayOp::Pong => {}
         GatewayOp::Info(info) => {
             // Gossip: process gateway_urls from active-phase INFO updates.
-            #[cfg(feature = "gateway")]
+
             if let Some(ref urls) = info.gateway_urls {
                 if !urls.is_empty() {
                     let tx = state.gateway_connect_tx.lock().unwrap();

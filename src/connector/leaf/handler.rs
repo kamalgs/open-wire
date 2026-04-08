@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use metrics::gauge;
 use tracing::debug;
-#[cfg(feature = "leaf")]
+
 use tracing::warn;
 
 use crate::buf::LeafOp;
@@ -99,15 +99,14 @@ impl LeafHandler {
                 sid
             }
             ConnExt::Client => unreachable!("leaf op on client connection"),
-            #[cfg(feature = "mesh")]
+
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
-            #[cfg(feature = "gateway")]
+
             ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
-            #[cfg(feature = "binary-client")]
+
             ConnExt::BinaryClient => unreachable!("leaf op on binary client connection"),
         };
 
-        #[cfg(feature = "leaf")]
         let upstream_queue = queue_str.clone();
 
         let sub = Subscription {
@@ -120,11 +119,11 @@ impl LeafHandler {
             max_msgs: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             is_leaf: true,
-            #[cfg(feature = "mesh")]
+
             is_route: false,
-            #[cfg(feature = "gateway")]
+
             is_gateway: false,
-            #[cfg(feature = "binary-client")]
+
             is_binary_client: false,
             #[cfg(feature = "accounts")]
             account_id: 0,
@@ -144,7 +143,6 @@ impl LeafHandler {
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
 
-        #[cfg(feature = "leaf")]
         {
             let mut upstreams = wctx.state.upstreams.write().unwrap();
             for up in upstreams.iter_mut() {
@@ -189,11 +187,11 @@ impl LeafHandler {
                 None => return HandleResult::Ok,
             },
             ConnExt::Client => unreachable!("leaf op on client connection"),
-            #[cfg(feature = "mesh")]
+
             ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
-            #[cfg(feature = "gateway")]
+
             ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
-            #[cfg(feature = "binary-client")]
+
             ConnExt::BinaryClient => unreachable!("leaf op on binary client connection"),
         };
 
@@ -215,7 +213,7 @@ impl LeafHandler {
 
         if let Some(ref removed) = removed {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
-            #[cfg(feature = "leaf")]
+
             {
                 let mut upstreams = wctx.state.upstreams.write().unwrap();
                 for up in upstreams.iter_mut() {
@@ -282,7 +280,6 @@ impl LeafHandler {
             conn.account_id,
         );
 
-        #[cfg(feature = "leaf")]
         conn.forward_to_upstream(wctx.state, subject, reply, headers, payload);
 
         (HandleResult::Ok, expired)
