@@ -1182,12 +1182,19 @@ if [[ "$MODE" == "full" ]]; then
   # ──────────────────────────────────────────────────────────────────────
   # Scenario 19: Gateway request-reply (service mode across the gateway)
   # ──────────────────────────────────────────────────────────────────────
-  RR_MSGS=10000  # req-reply is sequential round-trip, ~400 msgs/sec across gateway
+  RR_MSGS=100000
+  RR_CLIENTS=50  # concurrent request-reply clients (saturates the gateway pipeline)
   echo "================================================================"
   echo "  19. GATEWAY REQUEST-REPLY (req on alpha, reply on beta)"
-  echo "      ${RR_MSGS} msgs × ${SIZE}B"
+  echo "      ${RR_MSGS} msgs × ${SIZE}B, ${RR_CLIENTS} concurrent clients"
   echo "================================================================"
   echo ""
+
+  # Extract aggregated rate from nats bench service output (with concurrent clients,
+  # per-client stats appear first; we want the "aggregated stats:" line).
+  extract_agg_rate() {
+    grep -oP 'aggregated stats: \K[\d,]+(?= msgs/sec)' | tr -d ',' || echo 0
+  }
 
   # Go gateway request-reply
   echo "--- Go Gateway req-reply ---"
@@ -1195,18 +1202,23 @@ if [[ "$MODE" == "full" ]]; then
   ctx_before=$(ctx_switches "$GO_GW_A_PID")
   rate_sum=0
   for i in $(seq 1 "$RUNS"); do
-    nats bench service serve "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+    timeout 120 nats bench service serve "bench.reqrep.go.$i" \
+      --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$GO_GW_B_PORT" >"/tmp/bench_gw_reply.out" 2>&1 &
     BG_PIDS+=($!)
     sleep 0.5
 
-    output=$(timeout 60 nats bench service request "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+    output=$(timeout 120 nats bench service request "bench.reqrep.go.$i" \
+      --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+      --clients "$RR_CLIENTS" \
       -s "nats://127.0.0.1:$GO_GW_A_PORT" 2>&1) || true
-    echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
+    echo "$output" | grep -E "aggregated stats:" || true
+    rate=$(echo "$output" | extract_agg_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
 
-    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for pid in "${BG_PIDS[@]}"; do
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    done
     BG_PIDS=()
   done
   echo ""
@@ -1221,18 +1233,23 @@ if [[ "$MODE" == "full" ]]; then
   ctx_before=$(ctx_switches "$RUST_GW_A_PID")
   rate_sum=0
   for i in $(seq 1 "$RUNS"); do
-    nats bench service serve "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+    timeout 120 nats bench service serve "bench.reqrep.rs.$i" \
+      --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
       -s "nats://127.0.0.1:$RUST_GW_B_PORT" >"/tmp/bench_gw_reply.out" 2>&1 &
     BG_PIDS+=($!)
     sleep 0.5
 
-    output=$(timeout 60 nats bench service request "bench.reqrep.svc" --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+    output=$(timeout 120 nats bench service request "bench.reqrep.rs.$i" \
+      --msgs "$RR_MSGS" --size "$SIZE" --no-progress \
+      --clients "$RR_CLIENTS" \
       -s "nats://127.0.0.1:$RUST_GW_A_PORT" 2>&1) || true
-    echo "$output" | grep -E "stats:" || true
-    rate=$(echo "$output" | extract_rate)
+    echo "$output" | grep -E "aggregated stats:" || true
+    rate=$(echo "$output" | extract_agg_rate)
     rate_sum=$(( rate_sum + ${rate:-0} ))
 
-    for pid in "${BG_PIDS[@]}"; do wait_or_kill "$pid" 30; done
+    for pid in "${BG_PIDS[@]}"; do
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    done
     BG_PIDS=()
   done
   echo ""
