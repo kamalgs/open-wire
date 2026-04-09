@@ -22,6 +22,12 @@ use crate::buf::AdaptiveBuf;
 
 pub use crate::protocol::msg_builder::{sid_to_bytes, MsgBuilder};
 
+/// Maximum subject length in bytes. Subjects longer than this are rejected
+/// at parse time to prevent trie memory exhaustion from malicious clients.
+/// Go nats-server uses a similar limit (default: no hard limit, but INFO
+/// advertises max_payload which implicitly caps it).
+const MAX_SUBJECT_LEN: usize = 4096;
+
 macro_rules! parse_int {
     ($name:ident, $ty:ty, $max_digits:expr, $label:expr) => {
         #[inline]
@@ -358,6 +364,9 @@ fn parse_pub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
         3 => (args[0], Some(args[1]), args[2]),
         _ => return proto_err(buf, "invalid PUB arguments"),
     };
+    if subject.len() > MAX_SUBJECT_LEN {
+        return proto_err(buf, "subject too long");
+    }
 
     let payload_len = parse_size(size_arg)?;
 
@@ -414,6 +423,9 @@ fn parse_hpub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
         }
         _ => return proto_err(buf, "invalid HPUB arguments"),
     };
+    if subject.len() > MAX_SUBJECT_LEN {
+        return proto_err(buf, "subject too long");
+    }
 
     let total_needed = nl + 1 + total_len + 2;
     if buf.len() < total_needed {
@@ -457,6 +469,9 @@ fn parse_sub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
     }
     let args_bytes = &buf[4..line_end];
     let (args, argc) = split_args::<3>(args_bytes);
+    if args[0].len() > MAX_SUBJECT_LEN {
+        return proto_err(buf, "subject too long");
+    }
 
     let buf_ptr = buf.as_ptr() as usize;
 
@@ -635,6 +650,9 @@ fn parse_leaf_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     // Skip "LS+ " or "LS- " (4 bytes)
     let args_bytes = &buf[4..line_end];
     let (args, argc) = split_args::<2>(args_bytes);
+    if args[0].len() > MAX_SUBJECT_LEN {
+        return leaf_proto_err(buf, "subject too long");
+    }
 
     let op = match argc {
         1 => {
@@ -689,6 +707,9 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
     let buf_ptr = buf.as_ptr() as usize;
     let subj_off = args[0].as_ptr() as usize - buf_ptr;
     let subj_len = args[0].len();
+    if subj_len > MAX_SUBJECT_LEN {
+        return leaf_proto_err(buf, "subject too long");
+    }
 
     match argc {
         // LMSG subject size
@@ -913,6 +934,9 @@ fn parse_route_sub_unsub(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     // Skip "RS+ " or "RS- " (4 bytes)
     let args_bytes = &buf[4..line_end];
     let (args, argc) = split_args::<4>(args_bytes);
+    if argc >= 2 && args[1].len() > MAX_SUBJECT_LEN {
+        return route_proto_err(buf, "subject too long");
+    }
 
     let op = if is_sub {
         match argc {
@@ -970,6 +994,9 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
     let acct_len = args[0].len();
     let subj_off = args[1].as_ptr() as usize - buf_ptr;
     let subj_len = args[1].len();
+    if subj_len > MAX_SUBJECT_LEN {
+        return route_proto_err(buf, "subject too long");
+    }
 
     match argc {
         // RMSG account subject size

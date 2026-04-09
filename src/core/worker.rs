@@ -408,7 +408,9 @@ impl Worker {
             } else {
                 (ping_interval_ms / 2).min(30_000)
             };
-            let auth_half = if auth_timeout_ms == 0 || !self.state.auth.is_required() {
+            // Always enforce the handshake timeout, even without auth.
+            // Prevents idle connections from leaking FDs in WaitConnect phase.
+            let auth_half = if auth_timeout_ms == 0 {
                 u64::MAX
             } else {
                 (auth_timeout_ms / 2).clamp(100, 30_000)
@@ -1370,10 +1372,11 @@ impl Worker {
         }
     }
 
-    /// Disconnect clients that haven't completed authentication within the deadline.
+    /// Disconnect connections that haven't completed handshake within the deadline.
+    /// Enforced even without auth to prevent idle FD leaks from half-open connections.
     fn check_auth_timeout(&mut self) {
         let timeout_ms = self.state.auth_timeout_ms.load(Ordering::Relaxed);
-        if timeout_ms == 0 || !self.state.auth.is_required() {
+        if timeout_ms == 0 {
             return;
         }
         let timeout = std::time::Duration::from_millis(timeout_ms);
