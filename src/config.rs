@@ -557,7 +557,8 @@ impl<'a> Parser<'a> {
         if self.peeked.is_none() {
             self.peeked = Some(self.lexer.next_token()?);
         }
-        Ok(self.peeked.as_ref().unwrap())
+        // peeked is always Some here — we just set it above when it was None.
+        Ok(self.peeked.as_ref().expect("peeked token just set"))
     }
 
     fn next(&mut self) -> Result<Token, ConfigError> {

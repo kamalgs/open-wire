@@ -210,7 +210,10 @@ impl RouteHandler {
                 } else {
                     let key = route_sids.keys().find(|(s, _)| *s == subject).cloned();
                     match key {
-                        Some(k) => route_sids.remove(&k).unwrap(),
+                        Some(k) => match route_sids.remove(&k) {
+                            Some(v) => v,
+                            None => return HandleResult::Ok,
+                        },
                         None => return HandleResult::Ok,
                     }
                 }

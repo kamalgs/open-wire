@@ -584,10 +584,10 @@ fn handle_route_op(
             let sid = *route_sid_counter;
             route_sids.insert((subject.clone(), queue.clone()), sid);
 
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
+            let subject_str = std::str::from_utf8(&subject).unwrap_or("");
             let queue_str = queue
                 .as_ref()
-                .map(|q| unsafe { std::str::from_utf8_unchecked(q) }.to_string());
+                .map(|q| std::str::from_utf8(q).unwrap_or("").to_string());
 
             let sub = Subscription::new(
                 conn_id,
@@ -707,10 +707,10 @@ fn handle_bin_frame(
             };
             route_sids.insert((subject_b.clone(), queue_b.clone()), sid);
 
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject_b) };
+            let subject_str = std::str::from_utf8(&subject_b).unwrap_or("");
             let queue_str = queue_b
                 .as_ref()
-                .map(|q| unsafe { std::str::from_utf8_unchecked(q) }.to_string());
+                .map(|q| std::str::from_utf8(q).unwrap_or("").to_string());
 
             let sub = Subscription::new(
                 conn_id,

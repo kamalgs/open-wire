@@ -793,7 +793,7 @@ impl Worker {
                     .leaf
                     .inbound_writers
                     .write()
-                    .unwrap()
+                    .expect("inbound_writers write lock")
                     .remove(&conn_id);
             }
 
@@ -1944,7 +1944,9 @@ impl Worker {
                     }
                 }
             }
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let Some(client) = self.conns.get_mut(&conn_id) else {
+                return;
+            };
             client.write_buf.extend_from_slice(&self.info_line);
             client.phase = ConnPhase::SendInfo;
             self.tls_flush_encrypted(conn_id);
@@ -1971,7 +1973,9 @@ impl Worker {
     /// Returns `true` if the caller should `continue` the loop, `false` to `return`.
     fn process_ws_handshake(&mut self, conn_id: u64) -> bool {
         let result = {
-            let client = self.conns.get(&conn_id).unwrap();
+            let Some(client) = self.conns.get(&conn_id) else {
+                return false;
+            };
             websocket::parse_ws_upgrade(&client.read_buf)
         };
         match result {
@@ -1988,13 +1992,17 @@ impl Worker {
             }
             Some(Ok((upgrade, consumed))) => {
                 let response = websocket::build_ws_accept_response(&upgrade.key);
-                let client = self.conns.get_mut(&conn_id).unwrap();
+                let Some(client) = self.conns.get_mut(&conn_id) else {
+                    return false;
+                };
                 client.read_buf.advance(consumed);
                 if let Transport::WebSocket { ws_out, .. } = &mut client.transport {
                     ws_out.extend_from_slice(&response);
                 }
                 let info_line = self.info_line.clone();
-                let client = self.conns.get_mut(&conn_id).unwrap();
+                let Some(client) = self.conns.get_mut(&conn_id) else {
+                    return false;
+                };
                 client.write_buf.extend_from_slice(&info_line);
                 client.phase = ConnPhase::SendInfo;
                 self.try_flush_conn(conn_id);
@@ -2010,7 +2018,9 @@ impl Worker {
         let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
         if max_ctrl > 0 {
             let exceeded = {
-                let client = self.conns.get(&conn_id).unwrap();
+                let Some(client) = self.conns.get(&conn_id) else {
+                    return false;
+                };
                 let buf: &[u8] = &client.read_buf;
                 buf.len() > max_ctrl && memchr::memchr(b'\n', &buf[..max_ctrl]).is_none()
             };
@@ -2048,7 +2058,9 @@ impl Worker {
 
         if is_route_conn {
             let route_op = {
-                let client = self.conns.get_mut(&conn_id).unwrap();
+                let Some(client) = self.conns.get_mut(&conn_id) else {
+                    return false;
+                };
                 match nats_proto::try_parse_route_op(&mut client.read_buf) {
                     Ok(op) => op,
                     Err(_) => {
@@ -2111,7 +2123,9 @@ impl Worker {
                         connect_info.open_wire == Some(1) && self.state.info.open_wire == Some(1);
 
                     // Peer's CONNECT — go Active, register, exchange subs.
-                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    let Some(client) = self.conns.get_mut(&conn_id) else {
+                        return false;
+                    };
                     client.phase = ConnPhase::Active;
                     client.echo = false;
 
@@ -2197,7 +2211,9 @@ impl Worker {
 
         if is_gateway_conn {
             let gw_op = {
-                let client = self.conns.get_mut(&conn_id).unwrap();
+                let Some(client) = self.conns.get_mut(&conn_id) else {
+                    return false;
+                };
                 match nats_proto::try_parse_gateway_op(&mut client.read_buf) {
                     Ok(op) => op,
                     Err(_) => {
@@ -2233,7 +2249,9 @@ impl Worker {
                     let peer_gw_name = connect_info.gateway.clone();
 
                     // Peer's CONNECT — go Active, register, exchange subs.
-                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    let Some(client) = self.conns.get_mut(&conn_id) else {
+                        return false;
+                    };
                     client.phase = ConnPhase::Active;
                     client.echo = false;
 
@@ -2301,7 +2319,9 @@ impl Worker {
         }
 
         let op = {
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let Some(client) = self.conns.get_mut(&conn_id) else {
+                return false;
+            };
             match nats_proto::try_parse_client_op_cursor(&mut client.read_buf) {
                 Ok(op) => op,
                 Err(_) => {
@@ -2343,7 +2363,9 @@ impl Worker {
                             }
                         };
 
-                        let client = self.conns.get_mut(&conn_id).unwrap();
+                        let Some(client) = self.conns.get_mut(&conn_id) else {
+                            return false;
+                        };
                         client.phase = ConnPhase::Active;
                         client.echo = false; // suppress echo for leaf conns
                         client.permissions = leaf_perms.as_ref().map(|p| p.as_ref().clone());
@@ -2395,7 +2417,9 @@ impl Worker {
                     let perms = self.state.auth.lookup_permissions(&connect_info);
                     #[cfg(feature = "accounts")]
                     let acct_id = self.state.lookup_account(connect_info.user.as_deref());
-                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    let Some(client) = self.conns.get_mut(&conn_id) else {
+                        return false;
+                    };
                     client.phase = ConnPhase::Active;
                     client.echo = connect_info.echo;
                     client.no_responders = connect_info.no_responders && connect_info.headers;
@@ -2479,7 +2503,7 @@ impl Worker {
     fn parse_conn_op<H: ConnectionHandler>(&mut self, conn_id: u64) -> Option<H::Op> {
         let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
         let result = {
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let client = self.conns.get_mut(&conn_id)?;
             H::parse_op(&mut client.read_buf)
         };
         match result {
@@ -2521,7 +2545,9 @@ impl Worker {
     /// Dispatch a parsed op through its handler, then apply the result.
     fn dispatch_and_apply<H: ConnectionHandler>(&mut self, conn_id: u64, op: H::Op) -> bool {
         let (result, expired, congested) = {
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let Some(client) = self.conns.get_mut(&conn_id) else {
+                return false;
+            };
             let mut conn_ctx = client.conn_ctx(conn_id);
             let mut worker_ctx = MessageDeliveryHub {
                 state: &self.state,
@@ -2632,7 +2658,7 @@ impl Worker {
     fn parse_client_op(&mut self, conn_id: u64, can_skip: bool) -> Option<ClientOp> {
         let max_ctrl = self.state.max_control_line.load(Ordering::Relaxed);
         let result = {
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let client = self.conns.get_mut(&conn_id)?;
             if can_skip {
                 nats_proto::try_skip_or_parse_client_op_cursor(&mut client.read_buf)
             } else {
@@ -2692,7 +2718,9 @@ impl Worker {
         // we already sent PONG when processing CONNECT, so a second PONG
         // would arrive as invalid bytes in the peer's binary parser.
         {
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let Some(client) = self.conns.get_mut(&conn_id) else {
+                return false;
+            };
             let buf = client.read_buf.bytes_mut();
             if buf.starts_with(b"PING\r\n") {
                 buf.advance(6);
@@ -2701,7 +2729,9 @@ impl Worker {
         }
 
         let frame = {
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let Some(client) = self.conns.get_mut(&conn_id) else {
+                return false;
+            };
             bin_proto::try_decode(client.read_buf.bytes_mut())
         };
         let frame = match frame {
@@ -2711,7 +2741,9 @@ impl Worker {
 
         match frame.op {
             BinOp::Ping => {
-                let client = self.conns.get_mut(&conn_id).unwrap();
+                let Some(client) = self.conns.get_mut(&conn_id) else {
+                    return false;
+                };
                 bin_proto::write_pong(&mut client.write_buf);
                 return true;
             }
@@ -2739,7 +2771,9 @@ impl Worker {
         use crate::sub_list::{SubKind, Subscription};
 
         let frame = {
-            let client = self.conns.get_mut(&conn_id).unwrap();
+            let Some(client) = self.conns.get_mut(&conn_id) else {
+                return false;
+            };
             bin_proto::try_decode(client.read_buf.bytes_mut())
         };
         let frame = match frame {
@@ -2749,7 +2783,9 @@ impl Worker {
 
         match frame.op {
             BinOp::Ping => {
-                let client = self.conns.get_mut(&conn_id).unwrap();
+                let Some(client) = self.conns.get_mut(&conn_id) else {
+                    return false;
+                };
                 bin_proto::write_pong(&mut client.write_buf);
                 return true;
             }
@@ -2762,7 +2798,9 @@ impl Worker {
                 };
                 let msg = Msg::new(frame.subject, reply, None, frame.payload);
                 let (expired, congested) = {
-                    let client = self.conns.get_mut(&conn_id).unwrap();
+                    let Some(client) = self.conns.get_mut(&conn_id) else {
+                        return false;
+                    };
                     let conn_ctx = client.conn_ctx(conn_id);
                     let mut wctx = MessageDeliveryHub {
                         state: &self.state,
@@ -2812,18 +2850,16 @@ impl Worker {
                 } else {
                     return true; // malformed, ignore
                 };
-                let subject_str = unsafe { std::str::from_utf8_unchecked(&frame.subject) };
+                let subject_str = std::str::from_utf8(&frame.subject).unwrap_or("");
                 let queue_str = if frame.reply.is_empty() {
                     None
                 } else {
-                    Some(unsafe { std::str::from_utf8_unchecked(&frame.reply) }.to_string())
+                    Some(std::str::from_utf8(&frame.reply).unwrap_or("").to_string())
                 };
 
-                let writer = self
-                    .conns
-                    .get(&conn_id)
-                    .map(|c| c.direct_writer.clone())
-                    .unwrap();
+                let Some(writer) = self.conns.get(&conn_id).map(|c| c.direct_writer.clone()) else {
+                    return true;
+                };
                 let sub = Subscription::new(
                     conn_id,
                     sid,
@@ -2842,7 +2878,7 @@ impl Worker {
                             0,
                         )
                         .write()
-                        .unwrap();
+                        .expect("subs write lock");
                     subs.insert(sub);
                     self.state.has_subs.store(true, Ordering::Relaxed);
                 }
@@ -2882,7 +2918,7 @@ impl Worker {
                             0,
                         )
                         .write()
-                        .unwrap();
+                        .expect("subs write lock");
                     let r = subs.remove(conn_id, sid);
                     self.state
                         .has_subs

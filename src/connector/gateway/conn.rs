@@ -389,7 +389,7 @@ fn handle_gateway_op(
                     .expect("gateway interest write lock");
                 if let Some(gis) = gi.get_mut(&conn_id) {
                     if gis.mode == GatewayInterestMode::Optimistic {
-                        let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
+                        let subject_str = std::str::from_utf8(&subject).unwrap_or("");
                         gis.ni.remove(subject_str);
                         // In optimistic mode, we don't need to track gateway subs in SubscriptionManager.
                         // The remote is telling us it now wants this subject (positive override).
@@ -403,10 +403,10 @@ fn handle_gateway_op(
             let sid = *gateway_sid_counter;
             gateway_sids.insert((subject.clone(), queue.clone()), sid);
 
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
+            let subject_str = std::str::from_utf8(&subject).unwrap_or("");
             let queue_str = queue
                 .as_ref()
-                .map(|q| unsafe { std::str::from_utf8_unchecked(q) }.to_string());
+                .map(|q| std::str::from_utf8(q).unwrap_or("").to_string());
 
             let sub = Subscription::new(
                 conn_id,
@@ -432,7 +432,7 @@ fn handle_gateway_op(
             debug!(conn_id, sid, subject = %subject_str, "outbound gateway sub");
         }
         GatewayOp::RouteUnsub { subject, .. } => {
-            let subject_str = unsafe { std::str::from_utf8_unchecked(&subject) };
+            let subject_str = std::str::from_utf8(&subject).unwrap_or("");
 
             // Check interest mode — RS- means different things per mode.
             let transition = {

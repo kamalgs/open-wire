@@ -300,28 +300,28 @@ impl Args {
                         .next()
                         .expect("--pub requires a value")
                         .parse()
-                        .unwrap()
+                        .expect("--pub must be a valid integer")
                 }
                 "--sub" => {
                     n_sub = args
                         .next()
                         .expect("--sub requires a value")
                         .parse()
-                        .unwrap()
+                        .expect("--sub must be a valid integer")
                 }
                 "--size" => {
                     size = args
                         .next()
                         .expect("--size requires a value")
                         .parse()
-                        .unwrap()
+                        .expect("--size must be a valid integer")
                 }
                 "--duration" => {
                     duration = args
                         .next()
                         .expect("--duration requires a value")
                         .parse()
-                        .unwrap()
+                        .expect("--duration must be a valid integer")
                 }
                 "--subject" => subject = args.next().expect("--subject requires a value"),
                 other => {
