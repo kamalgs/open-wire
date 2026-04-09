@@ -114,7 +114,7 @@ impl LeafHandler {
                 .write()
                 .expect("subs write lock");
             subs.insert(sub);
-            wctx.state.has_subs.store(true, Ordering::Relaxed);
+            wctx.state.has_subs.store(true, Ordering::Release);
         }
 
         {
@@ -186,7 +186,7 @@ impl LeafHandler {
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs
-                .store(!subs.is_empty(), Ordering::Relaxed);
+                .store(!subs.is_empty(), Ordering::Release);
             r
         };
 

@@ -127,7 +127,7 @@ impl ClientHandler {
                 .write()
                 .expect("subs write lock");
             subs.insert(sub);
-            wctx.state.has_subs.store(true, Ordering::Relaxed);
+            wctx.state.has_subs.store(true, Ordering::Release);
         }
 
         #[cfg(feature = "worker-affinity")]
@@ -233,7 +233,7 @@ impl ClientHandler {
                 if let Some(removed) = subs.remove(conn.conn_id, sid) {
                     wctx.state
                         .has_subs
-                        .store(!subs.is_empty(), Ordering::Relaxed);
+                        .store(!subs.is_empty(), Ordering::Release);
                     cleanup_removed_sub(
                         conn,
                         wctx,
@@ -256,7 +256,7 @@ impl ClientHandler {
                 let r = subs.remove(conn.conn_id, sid);
                 wctx.state
                     .has_subs
-                    .store(!subs.is_empty(), Ordering::Relaxed);
+                    .store(!subs.is_empty(), Ordering::Release);
                 r
             };
 
@@ -325,7 +325,7 @@ impl ClientHandler {
                     let has_sub = subs.has_any_subscriber(subject_str);
                     drop(subs);
 
-                    let has_gw = wctx.state.gateway.has_interest.load(Ordering::Relaxed);
+                    let has_gw = wctx.state.gateway.has_interest.load(Ordering::Acquire);
 
                     if !has_sub && !has_gw {
                         let mut hdr = crate::types::HeaderMap::new();

@@ -78,7 +78,7 @@ pub(crate) fn run_writer_loop(tcp: TcpStream, dw: MsgWriter, shutdown: Arc<Atomi
     let mut tcp_out = BufWriter::new(tcp);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Acquire) {
             if let Some(data) = dw.drain() {
                 let _ = tcp_out.write_all(&data);
                 let _ = tcp_out.flush();

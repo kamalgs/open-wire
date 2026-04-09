@@ -385,14 +385,14 @@ fn connect_route(
                     .account_subs
                     .iter()
                     .any(|s| !s.read().expect("subs read lock").is_empty()),
-                Ordering::Relaxed,
+                Ordering::Release,
             );
         }
         #[cfg(not(feature = "accounts"))]
         {
             let mut subs = state.subs.write().expect("subs write lock");
             subs.remove_conn(conn_id);
-            state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+            state.has_subs.store(!subs.is_empty(), Ordering::Release);
         }
     }
 
@@ -440,7 +440,7 @@ fn run_route_writer(
     let mut tcp_out = io::BufWriter::new(tcp);
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        if shutdown.load(Ordering::Acquire) {
             if let Some(data) = dw.drain() {
                 let _ = tcp_out.write_all(&data);
                 let _ = tcp_out.flush();
@@ -608,7 +608,7 @@ fn handle_route_op(
                 .write()
                 .expect("subs write lock");
             subs.insert(sub);
-            state.has_subs.store(true, Ordering::Relaxed);
+            state.has_subs.store(true, Ordering::Release);
 
             debug!(conn_id, sid, subject = %subject_str, "outbound route sub");
         }
@@ -623,7 +623,7 @@ fn handle_route_op(
                     .write()
                     .expect("subs write lock");
                 subs.remove(conn_id, sid);
-                state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+                state.has_subs.store(!subs.is_empty(), Ordering::Release);
             }
         }
         RouteOp::RouteMsg {
@@ -731,7 +731,7 @@ fn handle_bin_frame(
                 .write()
                 .expect("subs write lock");
             subs.insert(sub);
-            state.has_subs.store(true, Ordering::Relaxed);
+            state.has_subs.store(true, Ordering::Release);
 
             debug!(conn_id, sid, subject = %subject_str, "outbound binary route sub");
         }
@@ -746,7 +746,7 @@ fn handle_bin_frame(
                     .write()
                     .expect("subs write lock");
                 subs.remove(conn_id, sid);
-                state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+                state.has_subs.store(!subs.is_empty(), Ordering::Release);
             }
         }
         BinOp::Msg => {

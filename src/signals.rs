@@ -11,14 +11,14 @@ static SHUTDOWN_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(ptr::null_mut());
 static RELOAD_PTR: AtomicPtr<AtomicBool> = AtomicPtr::new(ptr::null_mut());
 
 extern "C" fn handle_shutdown(_sig: libc::c_int) {
-    let ptr = SHUTDOWN_PTR.load(Ordering::Relaxed);
+    let ptr = SHUTDOWN_PTR.load(Ordering::Acquire);
     if !ptr.is_null() {
         unsafe { &*ptr }.store(true, Ordering::Release);
     }
 }
 
 extern "C" fn handle_reload(_sig: libc::c_int) {
-    let ptr = RELOAD_PTR.load(Ordering::Relaxed);
+    let ptr = RELOAD_PTR.load(Ordering::Acquire);
     if !ptr.is_null() {
         unsafe { &*ptr }.store(true, Ordering::Release);
     }

@@ -248,13 +248,13 @@ impl MsgWriter {
     /// Lock-free read — safe to call from any worker thread.
     #[inline]
     pub(crate) fn congestion(&self) -> u8 {
-        self.congestion.load(Ordering::Relaxed)
+        self.congestion.load(Ordering::Acquire)
     }
 
     /// Set the congestion level (called by the drainer after each flush cycle).
     #[inline]
     pub(crate) fn set_congestion(&self, level: u8) {
-        self.congestion.store(level, Ordering::Relaxed);
+        self.congestion.store(level, Ordering::Release);
     }
 
     /// Current buffer length (acquires the lock briefly).

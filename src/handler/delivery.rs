@@ -543,7 +543,7 @@ pub(crate) fn handle_expired_subs(
             );
         }
     }
-    state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+    state.has_subs.store(!subs.is_empty(), Ordering::Release);
 }
 
 /// Handle expired subscriptions from the upstream reader thread.
@@ -573,7 +573,7 @@ pub(crate) fn handle_expired_subs_upstream(
             }
         }
     }
-    state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+    state.has_subs.store(!subs.is_empty(), Ordering::Release);
 }
 
 /// Forward a message to outbound gateways in optimistic mode.

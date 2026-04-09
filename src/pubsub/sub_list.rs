@@ -635,16 +635,27 @@ impl SubscriptionManager {
             ($sub:expr) => {{
                 let max = $sub.max_msgs.load(Ordering::Relaxed);
                 if max > 0 {
-                    let prev = $sub.delivered.fetch_add(1, Ordering::Relaxed);
-                    if prev >= max {
-                        // Already over limit — undo increment, skip delivery
-                        $sub.delivered.fetch_sub(1, Ordering::Relaxed);
-                    } else {
-                        if prev + 1 >= max {
-                            expired.push(($sub.conn_id, $sub.sid));
+                    loop {
+                        let current = $sub.delivered.load(Ordering::Relaxed);
+                        if current >= max {
+                            break; // Already at or past max, skip delivery
                         }
-                        f($sub);
-                        count += 1;
+                        match $sub.delivered.compare_exchange_weak(
+                            current,
+                            current + 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(prev) => {
+                                if prev + 1 >= max {
+                                    expired.push(($sub.conn_id, $sub.sid));
+                                }
+                                f($sub);
+                                count += 1;
+                                break;
+                            }
+                            Err(_) => continue, // CAS failed, retry
+                        }
                     }
                 } else {
                     f($sub);

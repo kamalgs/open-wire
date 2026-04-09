@@ -270,14 +270,14 @@ fn connect_gateway(
                     .account_subs
                     .iter()
                     .any(|s| !s.read().expect("subs read lock").is_empty()),
-                Ordering::Relaxed,
+                Ordering::Release,
             );
         }
         #[cfg(not(feature = "accounts"))]
         {
             let mut subs = state.subs.write().expect("subs write lock");
             subs.remove_conn(conn_id);
-            state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+            state.has_subs.store(!subs.is_empty(), Ordering::Release);
         }
     }
 
@@ -427,7 +427,7 @@ fn handle_gateway_op(
                 .write()
                 .expect("subs write lock");
             subs.insert(sub);
-            state.has_subs.store(true, Ordering::Relaxed);
+            state.has_subs.store(true, Ordering::Release);
 
             debug!(conn_id, sid, subject = %subject_str, "outbound gateway sub");
         }
@@ -475,7 +475,7 @@ fn handle_gateway_op(
                     .write()
                     .expect("subs write lock");
                 subs.remove(conn_id, sid);
-                state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+                state.has_subs.store(!subs.is_empty(), Ordering::Release);
             }
         }
         GatewayOp::RouteMsg {

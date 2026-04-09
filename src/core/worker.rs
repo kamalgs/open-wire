@@ -861,7 +861,7 @@ impl Worker {
             if !client.has_pending.load(Ordering::Acquire) {
                 continue;
             }
-            client.has_pending.store(false, Ordering::Relaxed);
+            client.has_pending.store(false, Ordering::Release);
             // Drain the per-connection direct buffer.
             // For Raw+Text: O(1) split, then writev with write_buf.
             // For Raw+Binary: take segment list, build scatter-gather iovecs (zero-copy).
@@ -1882,9 +1882,9 @@ impl Worker {
                         (phase, &kind),
                         (ConnPhase::Active | ConnPhase::Draining, ConnKind::Client)
                     ) && {
-                        let has_gw = self.state.gateway.has_interest.load(Ordering::Relaxed);
+                        let has_gw = self.state.gateway.has_interest.load(Ordering::Acquire);
                         c.upstream_txs.is_empty()
-                            && !self.state.has_subs.load(Ordering::Relaxed)
+                            && !self.state.has_subs.load(Ordering::Acquire)
                             && !has_gw
                     };
                     (phase, kind, can_skip)
@@ -2880,7 +2880,7 @@ impl Worker {
                         .write()
                         .expect("subs write lock");
                     subs.insert(sub);
-                    self.state.has_subs.store(true, Ordering::Relaxed);
+                    self.state.has_subs.store(true, Ordering::Release);
                 }
                 if let Some(c) = self.conns.get_mut(&conn_id) {
                     c.sub_count += 1;
@@ -2922,7 +2922,7 @@ impl Worker {
                     let r = subs.remove(conn_id, sid);
                     self.state
                         .has_subs
-                        .store(!subs.is_empty(), Ordering::Relaxed);
+                        .store(!subs.is_empty(), Ordering::Release);
                     r
                 };
                 if removed.is_some() {
@@ -3034,7 +3034,7 @@ fn cleanup_conn(id: u64, state: &ServerState) {
                     .account_subs
                     .iter()
                     .any(|s| !s.read().expect("subs read lock").is_empty()),
-                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Release,
             );
             all_removed
         }
@@ -3042,7 +3042,7 @@ fn cleanup_conn(id: u64, state: &ServerState) {
         {
             let mut subs = state.subs.write().expect("subs write lock");
             let r = subs.remove_conn(id);
-            state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
+            state.has_subs.store(!subs.is_empty(), Ordering::Release);
             r
         }
     };
