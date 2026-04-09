@@ -17,7 +17,6 @@ use std::time::Duration;
 use bytes::BytesMut;
 use tracing::{debug, error, info, warn};
 
-use crate::buf::Backoff;
 use crate::core::server::ServerState;
 use crate::handler::{
     deliver_to_subs_upstream_inner, handle_expired_subs_upstream, DeliveryScope, Msg,

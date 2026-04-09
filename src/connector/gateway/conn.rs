@@ -13,12 +13,7 @@ use std::net::{Shutdown, TcpStream};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
-use bytes::BytesMut;
-use tracing::{debug, error, info, warn};
-
-use crate::buf::Backoff;
 use crate::core::server::{
     GatewayInterestMode, GatewayInterestState, GatewayRemote, ServerState,
     GATEWAY_MAX_NI_BEFORE_SWITCH,
@@ -31,6 +26,8 @@ use crate::handler::{
 };
 use crate::nats_proto::{self, GatewayOp, MsgBuilder};
 use crate::sub_list::{MsgWriter, SubKind, Subscription};
+use bytes::BytesMut;
+use tracing::{debug, info};
 
 /// Virtual connection ID range for outbound gateway connections.
 /// Uses high IDs to avoid collision with inbound connection IDs and route IDs.

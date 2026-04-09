@@ -2993,14 +2993,7 @@ mod bin_frame_tests {
     /// Encode a frame with the given fields and decode it back.
     fn frame(op: BinOp, subject: &[u8], reply: &[u8], payload: &[u8]) -> bin_proto::BinFrame {
         let mut buf = BytesMut::new();
-        match op {
-            BinOp::Msg => bin_proto::write_msg(subject, reply, payload, &mut buf),
-            BinOp::Sub => bin_proto::write_sub(subject, reply, payload, &mut buf),
-            BinOp::Unsub => bin_proto::write_unsub(subject, payload, &mut buf),
-            BinOp::Ping => bin_proto::write_ping(&mut buf),
-            BinOp::Pong => bin_proto::write_pong(&mut buf),
-            BinOp::HMsg => panic!("use write_hmsg directly"),
-        }
+        bin_proto::encode_into(op, subject, reply, payload, &mut buf);
         bin_proto::try_decode(&mut buf).expect("decode failed")
     }
 
