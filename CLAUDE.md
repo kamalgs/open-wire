@@ -245,7 +245,8 @@ New dependencies should use permissive licenses: MIT, Apache-2.0, ISC, BSD-2-Cla
 
 ## Code Conventions
 
-- **No `unwrap()` or `expect()`** in library code.
+- **No `unwrap()`** in library code — enforced by `#![deny(clippy::unwrap_used)]` in `lib.rs`.
+  Use `let-else` guards, `.unwrap_or()`, or `.expect("context")` for truly infallible operations (locks).
 - **Imports**: Group std → external crates → crate-internal.
 - All public items should have doc comments.
 - Tests go in `#[cfg(test)] mod tests` within each source file (314 unit tests with `--all-features`).

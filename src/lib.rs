@@ -4,6 +4,10 @@
 //! Routes messages between local clients, optionally bridges traffic to an
 //! upstream NATS hub, and can form full-mesh clusters with peer nodes.
 
+// Deny unwrap in production code — forces explicit error handling.
+// Test code uses #[cfg_attr(test, allow(clippy::unwrap_used))].
+#![deny(clippy::unwrap_used)]
+
 // Internal module visibility is controlled at the item level within each module.
 // Modules are `pub` to allow re-exports from lib.rs; internal items use `pub(crate)`.
 pub mod config;
