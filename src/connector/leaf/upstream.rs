@@ -277,7 +277,7 @@ fn connect_and_run(
                     0,
                 )
                 .read()
-                .unwrap();
+                .expect("subs read lock");
             subs.unique_interests()
                 .into_iter()
                 .map(|(s, q)| (s.to_string(), q.map(|q| q.to_string())))

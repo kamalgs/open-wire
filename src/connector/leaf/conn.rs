@@ -40,7 +40,7 @@ impl Read for HubStream {
         match self {
             HubStream::Plain(s) => s.read(buf),
             HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().unwrap();
+                let mut conn = tls.lock().expect("tls lock");
                 match conn.read_tls(tcp) {
                     Ok(0) => return Ok(0),
                     Ok(_) => {}
@@ -64,7 +64,7 @@ impl Write for HubStream {
         match self {
             HubStream::Plain(s) => s.write(buf),
             HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().unwrap();
+                let mut conn = tls.lock().expect("tls lock");
                 let n = conn.writer().write(buf)?;
                 conn.write_tls(tcp)?;
                 Ok(n)
@@ -76,7 +76,7 @@ impl Write for HubStream {
         match self {
             HubStream::Plain(s) => s.flush(),
             HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().unwrap();
+                let mut conn = tls.lock().expect("tls lock");
                 conn.writer().flush()?;
                 conn.write_tls(tcp)?;
                 tcp.flush()

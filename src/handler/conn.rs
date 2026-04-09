@@ -205,10 +205,9 @@ pub(crate) enum HandleResult {
     Disconnect,
 }
 
-/// Convert `Bytes` to `&str` without UTF-8 validation.
+/// Convert `Bytes` to `&str` with safe UTF-8 validation.
 /// NATS subjects are restricted to ASCII printable characters.
 #[inline]
 pub(crate) fn bytes_to_str(b: &Bytes) -> &str {
-    // SAFETY: NATS protocol subjects/reply-to are always ASCII
-    unsafe { std::str::from_utf8_unchecked(b) }
+    std::str::from_utf8(b).unwrap_or("<invalid-utf8>")
 }

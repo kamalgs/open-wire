@@ -104,11 +104,10 @@ impl<'a> Msg<'a> {
 
     /// Return the subject as a `&str`.
     ///
-    /// # Safety
     /// NATS subjects are always valid ASCII (a subset of UTF-8).
     #[inline]
     pub(crate) fn subject_str(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(&self.subject) }
+        std::str::from_utf8(&self.subject).unwrap_or("")
     }
 }
 
@@ -357,7 +356,7 @@ pub(crate) fn deliver_to_subs(
             account_id,
         )
         .read()
-        .unwrap();
+        .expect("subs read lock");
 
     let (delivered, expired) = deliver_to_subs_core(
         &subs,
@@ -427,7 +426,7 @@ pub(crate) fn deliver_to_subs_upstream_inner(
             account_id,
         )
         .read()
-        .unwrap();
+        .expect("subs read lock");
     let (delivered, expired) = deliver_to_subs_core(
         &subs,
         msg,

@@ -96,8 +96,8 @@ fn base64_encode(data: &[u8]) -> String {
             out.push(b'=');
         }
     }
-    // SAFETY: B64_CHARS and '=' are all ASCII
-    unsafe { String::from_utf8_unchecked(out) }
+    // B64_CHARS and '=' are all ASCII, so this is always valid UTF-8.
+    String::from_utf8(out).expect("base64 output is always valid ASCII")
 }
 
 /// NATS-specific WebSocket GUID used by the Go nats.go client library.
