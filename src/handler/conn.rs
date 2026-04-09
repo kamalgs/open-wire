@@ -142,6 +142,57 @@ impl ConnExt {
             Self::BinaryClient => "binary",
         }
     }
+
+    /// Allocate the next SID for an interest-propagated subscription (leaf/route/gateway).
+    ///
+    /// Increments the internal counter and records the (subject, queue) → sid mapping
+    /// so that a later unsub can look it up. Returns `None` for Client/BinaryClient
+    /// (which receive SIDs from the protocol, not generated internally).
+    pub(crate) fn next_sid(&mut self, subject: &Bytes, queue: &Option<Bytes>) -> Option<u64> {
+        match self {
+            Self::Leaf {
+                leaf_sid_counter,
+                leaf_sids,
+            } => {
+                *leaf_sid_counter += 1;
+                let sid = *leaf_sid_counter;
+                leaf_sids.insert((subject.clone(), queue.clone()), sid);
+                Some(sid)
+            }
+            Self::Route {
+                route_sid_counter,
+                route_sids,
+                ..
+            } => {
+                *route_sid_counter += 1;
+                let sid = *route_sid_counter;
+                route_sids.insert((subject.clone(), queue.clone()), sid);
+                Some(sid)
+            }
+            Self::Gateway {
+                gateway_sid_counter,
+                gateway_sids,
+                ..
+            } => {
+                *gateway_sid_counter += 1;
+                let sid = *gateway_sid_counter;
+                gateway_sids.insert((subject.clone(), queue.clone()), sid);
+                Some(sid)
+            }
+            Self::Client | Self::BinaryClient => None,
+        }
+    }
+
+    /// Look up and remove a SID by (subject, queue) key. Used for unsub.
+    pub(crate) fn remove_sid(&mut self, subject: &Bytes, queue: &Option<Bytes>) -> Option<u64> {
+        let key = (subject.clone(), queue.clone());
+        match self {
+            Self::Leaf { leaf_sids, .. } => leaf_sids.remove(&key),
+            Self::Route { route_sids, .. } => route_sids.remove(&key),
+            Self::Gateway { gateway_sids, .. } => gateway_sids.remove(&key),
+            Self::Client | Self::BinaryClient => None,
+        }
+    }
 }
 
 /// Result of handling a single protocol operation.

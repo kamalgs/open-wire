@@ -108,8 +108,18 @@ impl ConnectionHandler for RouteHandler {
             }
             RouteOp::Info(info) => {
                 if !info.connect_urls.is_empty() {
-                    let mut peers = wctx.state.cluster.route_peers.lock().unwrap();
-                    let tx = wctx.state.cluster.connect_tx.lock().unwrap();
+                    let mut peers = wctx
+                        .state
+                        .cluster
+                        .route_peers
+                        .lock()
+                        .expect("route_peers lock");
+                    let tx = wctx
+                        .state
+                        .cluster
+                        .connect_tx
+                        .lock()
+                        .expect("connect_tx lock");
                     for url in &info.connect_urls {
                         let normalized = crate::connector::mesh::normalize_route_url(url);
                         if peers.known_urls.insert(normalized.clone()) {
@@ -136,20 +146,7 @@ impl RouteHandler {
     ) -> HandleResult {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
-
-        let sid = match conn.ext {
-            ConnExt::Route {
-                ref mut route_sid_counter,
-                ref mut route_sids,
-                ..
-            } => {
-                *route_sid_counter += 1;
-                let sid = *route_sid_counter;
-                route_sids.insert((subject.clone(), queue.clone()), sid);
-                sid
-            }
-            _ => unreachable!("route op on non-route connection"),
-        };
+        let sid = conn.ext.next_sid(&subject, &queue).expect("route conn");
 
         let sub = Subscription::new(
             conn.conn_id,
@@ -170,7 +167,7 @@ impl RouteHandler {
                     account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -229,7 +226,7 @@ impl RouteHandler {
                     account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs

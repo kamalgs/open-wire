@@ -236,7 +236,7 @@ impl MsgWriter {
     fn backpressure_check(&self) {
         const HWM: usize = 32 * 1024 * 1024;
         const MAX: usize = 64 * 1024 * 1024;
-        let len = self.buf.lock().unwrap().len();
+        let len = self.buf.lock().expect("buf lock").len();
         if len > HWM {
             let congestion = ((len - HWM) as f64 / (MAX - HWM) as f64).min(1.0);
             let sleep_us = 1 + (congestion * 500.0) as u64;
@@ -259,13 +259,13 @@ impl MsgWriter {
 
     /// Current buffer length (acquires the lock briefly).
     pub(crate) fn buf_len(&self) -> usize {
-        self.buf.lock().unwrap().len()
+        self.buf.lock().expect("buf lock").len()
     }
 
     /// Append pre-formatted text bytes to the shared buffer and mark as pending.
     #[inline]
     fn append_text(&self, data: &[u8]) {
-        let mut buf = self.buf.lock().unwrap();
+        let mut buf = self.buf.lock().expect("buf lock");
         if let DirectBuf::Text(b) = &mut *buf {
             b.extend_from_slice(data);
         }
@@ -283,7 +283,7 @@ impl MsgWriter {
         payload: &[u8],
     ) {
         self.backpressure_check();
-        let mut builder = self.msg_builder.lock().unwrap();
+        let mut builder = self.msg_builder.lock().expect("msg_builder lock");
         let data = builder.build_msg(subject, sid_bytes, reply, headers, payload);
         self.append_text(data);
     }
@@ -297,7 +297,7 @@ impl MsgWriter {
         payload: &[u8],
     ) {
         self.backpressure_check();
-        let mut builder = self.msg_builder.lock().unwrap();
+        let mut builder = self.msg_builder.lock().expect("msg_builder lock");
         let data = builder.build_lmsg(subject, reply, headers, payload);
         self.append_text(data);
     }
@@ -321,7 +321,7 @@ impl MsgWriter {
     ) {
         if self.binary {
             let reply_slice = reply.unwrap_or(b"");
-            let mut buf = self.buf.lock().unwrap();
+            let mut buf = self.buf.lock().expect("buf lock");
             if let Some(hdrs) = headers {
                 // Headers are rare and serialised inline; store as Inline segment.
                 let mut tmp = BytesMut::new();
@@ -352,7 +352,7 @@ impl MsgWriter {
             self.has_pending.store(true, Ordering::Release);
             return;
         }
-        let mut builder = self.msg_builder.lock().unwrap();
+        let mut builder = self.msg_builder.lock().expect("msg_builder lock");
         let data = builder.build_rmsg(
             subject.as_ref(),
             reply,
@@ -367,7 +367,7 @@ impl MsgWriter {
     /// Append a binary inline segment and mark as pending.
     #[inline]
     fn append_binary_inline(&self, data: Bytes) {
-        let mut buf = self.buf.lock().unwrap();
+        let mut buf = self.buf.lock().expect("buf lock");
         if let DirectBuf::Binary(seg) = &mut *buf {
             seg.push_inline(data);
         }
@@ -390,7 +390,7 @@ impl MsgWriter {
             self.append_binary_inline(tmp.freeze());
             return;
         }
-        let mut builder = self.msg_builder.lock().unwrap();
+        let mut builder = self.msg_builder.lock().expect("msg_builder lock");
         let data = if let Some(q) = queue {
             builder.build_route_sub_queue(
                 subject,
@@ -423,7 +423,7 @@ impl MsgWriter {
             self.append_binary_inline(tmp.freeze());
             return;
         }
-        let mut builder = self.msg_builder.lock().unwrap();
+        let mut builder = self.msg_builder.lock().expect("msg_builder lock");
         let data = if let Some(q) = queue {
             builder.build_route_unsub_queue(
                 subject,
@@ -465,7 +465,7 @@ impl MsgWriter {
     /// For binary-mode buffers, segments are materialised into a flat `BytesMut`
     /// so callers (e.g. tests) can inspect the raw bytes.
     pub(crate) fn drain(&self) -> Option<BytesMut> {
-        let mut buf = self.buf.lock().unwrap();
+        let mut buf = self.buf.lock().expect("buf lock");
         if buf.is_empty() {
             return None;
         }

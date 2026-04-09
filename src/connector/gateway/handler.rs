@@ -61,8 +61,14 @@ impl ConnectionHandler for GatewayHandler {
 
                 if let Some(ref urls) = info.gateway_urls {
                     if !urls.is_empty() {
-                        let tx = wctx.state.gateway.connect_tx.lock().unwrap();
-                        let mut peers = wctx.state.gateway.peers.lock().unwrap();
+                        let tx = wctx
+                            .state
+                            .gateway
+                            .connect_tx
+                            .lock()
+                            .expect("gateway connect_tx lock");
+                        let mut peers =
+                            wctx.state.gateway.peers.lock().expect("gateway peers lock");
                         let mut changed = false;
                         for url in urls {
                             if peers.known_urls.insert(url.clone()) {
@@ -100,25 +106,18 @@ impl GatewayHandler {
         let subject_str = bytes_to_str(&subject);
         let queue_str = queue.as_ref().map(|q| bytes_to_str(q).to_string());
 
-        // Generate synthetic SID for this gateway subscription.
-        let sid = match conn.ext {
-            ConnExt::Gateway {
-                ref mut gateway_sid_counter,
-                ref mut gateway_sids,
-                ref mut gateway_sids_by_subject,
-                ..
-            } => {
-                *gateway_sid_counter += 1;
-                let sid = *gateway_sid_counter;
-                gateway_sids.insert((subject.clone(), queue.clone()), sid);
-                gateway_sids_by_subject
-                    .entry(subject.clone())
-                    .or_default()
-                    .push((queue.clone(), sid));
-                sid
-            }
-            _ => unreachable!("gateway op on non-gateway connection"),
-        };
+        let sid = conn.ext.next_sid(&subject, &queue).expect("gateway conn");
+        // Gateway also maintains a secondary subject→(queue,sid) index for unsub.
+        if let ConnExt::Gateway {
+            ref mut gateway_sids_by_subject,
+            ..
+        } = conn.ext
+        {
+            gateway_sids_by_subject
+                .entry(subject.clone())
+                .or_default()
+                .push((queue.clone(), sid));
+        }
 
         let sub = Subscription::new(
             conn.conn_id,
@@ -139,7 +138,7 @@ impl GatewayHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -194,7 +193,7 @@ impl GatewayHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs

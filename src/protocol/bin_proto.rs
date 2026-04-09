@@ -94,7 +94,13 @@ pub(crate) fn try_decode(buf: &mut BytesMut) -> Option<BinFrame> {
 
 // ── Encoders ─────────────────────────────────────────────────────────────────
 
-fn encode_into(op: BinOp, subject: &[u8], reply: &[u8], payload: &[u8], out: &mut BytesMut) {
+pub(crate) fn encode_into(
+    op: BinOp,
+    subject: &[u8],
+    reply: &[u8],
+    payload: &[u8],
+    out: &mut BytesMut,
+) {
     out.extend_from_slice(&[op as u8]);
     out.extend_from_slice(&(subject.len() as u16).to_le_bytes());
     out.extend_from_slice(&(reply.len() as u16).to_le_bytes());
@@ -104,17 +110,8 @@ fn encode_into(op: BinOp, subject: &[u8], reply: &[u8], payload: &[u8], out: &mu
     out.extend_from_slice(payload);
 }
 
-#[allow(dead_code)]
-pub(crate) fn write_ping(out: &mut BytesMut) {
-    encode_into(BinOp::Ping, b"", b"", b"", out);
-}
-
 pub(crate) fn write_pong(out: &mut BytesMut) {
     encode_into(BinOp::Pong, b"", b"", b"", out);
-}
-
-pub(crate) fn write_msg(subject: &[u8], reply: &[u8], payload: &[u8], out: &mut BytesMut) {
-    encode_into(BinOp::Msg, subject, reply, payload, out);
 }
 
 /// Build the 9-byte binary Msg frame header for scatter-gather (zero-copy) writes.
@@ -175,7 +172,7 @@ mod tests {
     #[test]
     fn ping_pong_roundtrip() {
         let mut buf = BytesMut::new();
-        write_ping(&mut buf);
+        encode_into(BinOp::Ping, b"", b"", b"", &mut buf);
         let f = try_decode(&mut buf).unwrap();
         assert_eq!(f.op, BinOp::Ping);
         assert!(f.subject.is_empty());

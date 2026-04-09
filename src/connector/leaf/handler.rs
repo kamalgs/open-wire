@@ -88,24 +88,7 @@ impl LeafHandler {
             .as_ref()
             .map(|p| std::sync::Arc::new(p.clone()));
 
-        let sid = match conn.ext {
-            ConnExt::Leaf {
-                ref mut leaf_sid_counter,
-                ref mut leaf_sids,
-            } => {
-                *leaf_sid_counter += 1;
-                let sid = *leaf_sid_counter;
-                leaf_sids.insert((subject.clone(), queue.clone()), sid);
-                sid
-            }
-            ConnExt::Client => unreachable!("leaf op on client connection"),
-
-            ConnExt::Route { .. } => unreachable!("leaf op on route connection"),
-
-            ConnExt::Gateway { .. } => unreachable!("leaf op on gateway connection"),
-
-            ConnExt::BinaryClient => unreachable!("leaf op on binary client connection"),
-        };
+        let sid = conn.ext.next_sid(&subject, &queue).expect("leaf conn");
 
         let upstream_queue = queue_str.clone();
 
@@ -129,13 +112,18 @@ impl LeafHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
 
         {
-            let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
+            let mut upstreams = wctx
+                .state
+                .leaf
+                .upstreams
+                .write()
+                .expect("upstreams write lock");
             for up in upstreams.iter_mut() {
                 if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue.clone()) {
                     warn!(error = %e, "failed to add upstream interest for leaf sub");
@@ -194,7 +182,7 @@ impl LeafHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs
@@ -206,7 +194,12 @@ impl LeafHandler {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
 
             {
-                let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
+                let mut upstreams = wctx
+                    .state
+                    .leaf
+                    .upstreams
+                    .write()
+                    .expect("upstreams write lock");
                 for up in upstreams.iter_mut() {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }

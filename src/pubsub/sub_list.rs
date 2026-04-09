@@ -46,7 +46,6 @@ impl SubKind {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct Subscription {
     pub conn_id: u64,
     pub sid: u64,

@@ -100,10 +100,6 @@ pub enum ClientOp {
         respond: Option<Bytes>,
         headers: Option<HeaderMap>,
         payload: Bytes,
-        /// The payload/total size as original ASCII bytes from the protocol
-        /// line, so outgoing MSG can reuse them without re-formatting.
-        #[allow(dead_code)]
-        size_bytes: Bytes,
     },
     Subscribe {
         sid: u64,
@@ -373,8 +369,6 @@ fn parse_pub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
     let buf_ptr = buf.as_ptr() as usize;
     let subj_off = subject.as_ptr() as usize - buf_ptr;
     let subj_len = subject.len();
-    let size_off = size_arg.as_ptr() as usize - buf_ptr;
-    let size_len = size_arg.len();
     let respond_range = respond.map(|r| {
         let off = r.as_ptr() as usize - buf_ptr;
         off..off + r.len()
@@ -382,7 +376,6 @@ fn parse_pub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
 
     let header_line = buf.split_and_consume(nl + 1).freeze();
     let subject = header_line.slice(subj_off..subj_off + subj_len);
-    let size_bytes = header_line.slice(size_off..size_off + size_len);
     let respond = respond_range.map(|r| header_line.slice(r));
 
     let payload = buf.split_and_consume(payload_len).freeze();
@@ -393,7 +386,6 @@ fn parse_pub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
         respond,
         headers: None,
         payload,
-        size_bytes,
     }))
 }
 
@@ -409,16 +401,16 @@ fn parse_hpub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
     let args_bytes = &buf[5..line_end];
     let (args, argc) = split_args::<4>(args_bytes);
 
-    let (subject, respond, hdr_len, total_len, total_size_arg) = match argc {
+    let (subject, respond, hdr_len, total_len) = match argc {
         3 => {
             let h = parse_size(args[1])?;
             let t = parse_size(args[2])?;
-            (args[0], None, h, t, args[2])
+            (args[0], None, h, t)
         }
         4 => {
             let h = parse_size(args[2])?;
             let t = parse_size(args[3])?;
-            (args[0], Some(args[1]), h, t, args[3])
+            (args[0], Some(args[1]), h, t)
         }
         _ => return proto_err(buf, "invalid HPUB arguments"),
     };
@@ -431,8 +423,6 @@ fn parse_hpub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
     let buf_ptr = buf.as_ptr() as usize;
     let subj_off = subject.as_ptr() as usize - buf_ptr;
     let subj_len = subject.len();
-    let size_off = total_size_arg.as_ptr() as usize - buf_ptr;
-    let size_len = total_size_arg.len();
     let respond_range = respond.map(|r| {
         let off = r.as_ptr() as usize - buf_ptr;
         off..off + r.len()
@@ -440,7 +430,6 @@ fn parse_hpub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
 
     let header_line = buf.split_and_consume(nl + 1).freeze();
     let subject = header_line.slice(subj_off..subj_off + subj_len);
-    let size_bytes = header_line.slice(size_off..size_off + size_len);
     let respond = respond_range.map(|r| header_line.slice(r));
 
     let hdr_data = buf.split_and_consume(hdr_len);
@@ -454,7 +443,6 @@ fn parse_hpub(buf: &mut AdaptiveBuf) -> io::Result<Option<ClientOp>> {
         respond,
         headers: Some(headers),
         payload,
-        size_bytes,
     }))
 }
 
@@ -1205,13 +1193,11 @@ mod tests {
                 respond,
                 payload,
                 headers,
-                size_bytes,
             } => {
                 assert_eq!(&subject[..], b"test.subject");
                 assert!(respond.is_none());
                 assert_eq!(&payload[..], b"hello");
                 assert!(headers.is_none());
-                assert_eq!(&size_bytes[..], b"5");
             }
             _ => panic!("expected Publish"),
         }

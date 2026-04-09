@@ -473,7 +473,12 @@ pub(crate) fn forward_to_upstream(
     }
     if any_failed {
         // At least one writer thread gone — refresh from global state (may have reconnected)
-        *upstream_txs = state.leaf.upstream_txs.read().unwrap().clone();
+        *upstream_txs = state
+            .leaf
+            .upstream_txs
+            .read()
+            .expect("upstream_txs read lock")
+            .clone();
     }
 }
 
@@ -512,7 +517,7 @@ pub(crate) fn handle_expired_subs(
             account_id,
         )
         .write()
-        .unwrap();
+        .expect("subs write lock");
     for (exp_conn_id, exp_sid) in expired {
         if let Some(removed) = subs.remove(*exp_conn_id, *exp_sid) {
             if let Some(client) = conns.get_mut(exp_conn_id) {
@@ -520,7 +525,7 @@ pub(crate) fn handle_expired_subs(
             }
 
             {
-                let mut upstreams = state.leaf.upstreams.write().unwrap();
+                let mut upstreams = state.leaf.upstreams.write().expect("upstreams write lock");
                 for up in upstreams.iter_mut() {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }
@@ -560,10 +565,10 @@ pub(crate) fn handle_expired_subs_upstream(
             account_id,
         )
         .write()
-        .unwrap();
+        .expect("subs write lock");
     for (conn_id, sid) in expired {
         if let Some(removed) = subs.remove(*conn_id, *sid) {
-            let mut upstreams = state.leaf.upstreams.write().unwrap();
+            let mut upstreams = state.leaf.upstreams.write().expect("upstreams write lock");
             for up in upstreams.iter_mut() {
                 up.remove_interest(&removed.subject, removed.queue.as_deref());
             }
@@ -584,7 +589,12 @@ pub(crate) fn forward_to_optimistic_gateways(
 ) {
     use crate::core::server::GatewayInterestMode;
 
-    let gi = wctx.state.gateway.interest.read().unwrap();
+    let gi = wctx
+        .state
+        .gateway
+        .interest
+        .read()
+        .expect("gateway interest read lock");
     if gi.is_empty() {
         return;
     }
@@ -669,7 +679,11 @@ pub(crate) fn deliver_cross_account(
             msg.payload.clone(),
         );
 
-        let subs = wctx.state.get_subs(route.dst_account_id).read().unwrap();
+        let subs = wctx
+            .state
+            .get_subs(route.dst_account_id)
+            .read()
+            .expect("subs read lock");
         let (_count, expired) = subs.for_each_match(
             &dst_subject_str,
             |_| true,
@@ -738,7 +752,10 @@ pub(crate) fn deliver_cross_account_upstream(
             msg.payload.clone(),
         );
 
-        let subs = state.get_subs(route.dst_account_id).read().unwrap();
+        let subs = state
+            .get_subs(route.dst_account_id)
+            .read()
+            .expect("subs read lock");
         let (_count, expired) = subs.for_each_match(
             &dst_subject_str,
             |_| true,
