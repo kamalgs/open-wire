@@ -23,6 +23,7 @@ use crate::handler::{
 };
 use crate::nats_proto::{self, MsgBuilder, RouteOp};
 use crate::sub_list::{MsgWriter, SubKind, Subscription};
+use crate::util::{LockExt, RwLockExt};
 
 /// Virtual connection ID range for outbound route connections.
 /// Uses high IDs to avoid collision with inbound connection IDs.
@@ -49,7 +50,7 @@ impl RouteConnManager {
 
         let (coord_tx, coord_rx) = std::sync::mpsc::channel::<String>();
         {
-            let mut tx_lock = state.cluster.connect_tx.lock().expect("connect_tx lock");
+            let mut tx_lock = state.cluster.connect_tx.lock_or_poison();
             *tx_lock = Some(coord_tx);
         }
 
@@ -176,8 +177,8 @@ fn parse_route_url(url: &str) -> String {
 /// Process `connect_urls` from a peer's INFO, adding new URLs to
 /// `known_urls` and sending them to the coordinator channel.
 pub(crate) fn process_gossip_urls(state: &ServerState, connect_urls: &[String]) {
-    let mut peers = state.cluster.route_peers.lock().expect("route_peers lock");
-    let tx = state.cluster.connect_tx.lock().expect("connect_tx lock");
+    let mut peers = state.cluster.route_peers.lock_or_poison();
+    let tx = state.cluster.connect_tx.lock_or_poison();
     for url in connect_urls {
         let normalized = normalize_route_url(url);
         if peers.known_urls.insert(normalized.clone()) {
@@ -227,7 +228,7 @@ fn connect_route(
     let peer_server_id = peer_info.server_id.clone();
     let use_binary = peer_info.open_wire == Some(1);
     {
-        let peers = state.cluster.route_peers.lock().expect("route_peers lock");
+        let peers = state.cluster.route_peers.lock_or_poison();
         if peers.connected.contains_key(&peer_server_id) {
             debug!(
                 peer_id = %peer_server_id,
@@ -274,7 +275,7 @@ fn connect_route(
     }
 
     {
-        let mut peers = state.cluster.route_peers.lock().expect("route_peers lock");
+        let mut peers = state.cluster.route_peers.lock_or_poison();
         if peers.connected.contains_key(&peer_server_id) {
             debug!(
                 peer_id = %peer_server_id,
@@ -292,11 +293,7 @@ fn connect_route(
     };
 
     {
-        let mut writers = state
-            .cluster
-            .route_writers
-            .write()
-            .expect("route_writers write lock");
+        let mut writers = state.cluster.route_writers.write_or_poison();
         writers.insert(conn_id, direct_writer.clone());
     }
 
@@ -307,8 +304,7 @@ fn connect_route(
                 #[cfg(feature = "accounts")]
                 0,
             )
-            .read()
-            .expect("subs read lock");
+            .read_or_poison();
         if use_binary {
             // Binary mode: encode initial sub sync as binary Sub frames.
             let mut bin_buf = BytesMut::new();
@@ -377,36 +373,32 @@ fn connect_route(
         #[cfg(feature = "accounts")]
         {
             for account_subs in &state.account_subs {
-                let mut subs = account_subs.write().expect("subs write lock");
+                let mut subs = account_subs.write_or_poison();
                 subs.remove_conn(conn_id);
             }
             state.has_subs.store(
                 state
                     .account_subs
                     .iter()
-                    .any(|s| !s.read().expect("subs read lock").is_empty()),
+                    .any(|s| !s.read_or_poison().is_empty()),
                 Ordering::Release,
             );
         }
         #[cfg(not(feature = "accounts"))]
         {
-            let mut subs = state.subs.write().expect("subs write lock");
+            let mut subs = state.subs.write_or_poison();
             subs.remove_conn(conn_id);
             state.has_subs.store(!subs.is_empty(), Ordering::Release);
         }
     }
 
     {
-        let mut writers = state
-            .cluster
-            .route_writers
-            .write()
-            .expect("route_writers write lock");
+        let mut writers = state.cluster.route_writers.write_or_poison();
         writers.remove(&conn_id);
     }
 
     {
-        let mut peers = state.cluster.route_peers.lock().expect("route_peers lock");
+        let mut peers = state.cluster.route_peers.lock_or_poison();
         peers.connected.remove(&peer_server_id);
     }
 
@@ -605,8 +597,7 @@ fn handle_route_op(
                     #[cfg(feature = "accounts")]
                     0,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             subs.insert(sub);
             state.has_subs.store(true, Ordering::Release);
 
@@ -620,8 +611,7 @@ fn handle_route_op(
                         #[cfg(feature = "accounts")]
                         0,
                     )
-                    .write()
-                    .expect("subs write lock");
+                    .write_or_poison();
                 subs.remove(conn_id, sid);
                 state.has_subs.store(!subs.is_empty(), Ordering::Release);
             }
@@ -728,8 +718,7 @@ fn handle_bin_frame(
                     #[cfg(feature = "accounts")]
                     0,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             subs.insert(sub);
             state.has_subs.store(true, Ordering::Release);
 
@@ -743,8 +732,7 @@ fn handle_bin_frame(
                         #[cfg(feature = "accounts")]
                         0,
                     )
-                    .write()
-                    .expect("subs write lock");
+                    .write_or_poison();
                 subs.remove(conn_id, sid);
                 state.has_subs.store(!subs.is_empty(), Ordering::Release);
             }
@@ -830,7 +818,7 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
     let cluster_port = state.cluster.port.unwrap_or(0);
 
     let connect_urls = {
-        let peers = state.cluster.route_peers.lock().expect("route_peers lock");
+        let peers = state.cluster.route_peers.lock_or_poison();
         let urls: Vec<&str> = peers.known_urls.iter().map(|s| s.as_str()).collect();
         if urls.is_empty() {
             String::new()
@@ -872,11 +860,7 @@ fn build_route_connect(state: &ServerState) -> String {
 pub(crate) fn broadcast_route_info(state: &ServerState) {
     let info_line = build_route_info(state);
     let info_bytes = info_line.as_bytes();
-    let writers = state
-        .cluster
-        .route_writers
-        .read()
-        .expect("route_writers read lock");
+    let writers = state.cluster.route_writers.read_or_poison();
     for writer in writers.values() {
         // Binary-mode connections don't use text INFO gossip.
         if writer.is_binary() {

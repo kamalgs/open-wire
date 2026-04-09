@@ -6,6 +6,7 @@
 use crate::core::server::ServerState;
 use crate::nats_proto;
 use crate::sub_list::MsgWriter;
+use crate::util::RwLockExt;
 
 use std::cell::RefCell;
 
@@ -18,11 +19,7 @@ pub(crate) fn propagate_leaf_interest(
     queue: Option<&[u8]>,
     is_sub: bool,
 ) {
-    let writers = state
-        .leaf
-        .inbound_writers
-        .read()
-        .expect("inbound_writers read lock");
+    let writers = state.leaf.inbound_writers.read_or_poison();
     if writers.is_empty() {
         return;
     }
@@ -64,7 +61,7 @@ pub(crate) fn send_existing_subs(
     #[cfg(feature = "accounts")]
     {
         for account_sub in &state.account_subs {
-            let subs = account_sub.read().expect("subs read lock");
+            let subs = account_sub.read_or_poison();
             for (subject, queue) in subs.client_interests() {
                 if let Some(ref p) = leaf_perms {
                     if !p.publish.is_allowed(subject) {
@@ -82,7 +79,7 @@ pub(crate) fn send_existing_subs(
     }
     #[cfg(not(feature = "accounts"))]
     {
-        let subs = state.subs.read().expect("subs read lock");
+        let subs = state.subs.read_or_poison();
         for (subject, queue) in subs.client_interests() {
             if let Some(ref p) = leaf_perms {
                 if !p.publish.is_allowed(subject) {
@@ -108,11 +105,7 @@ pub(crate) fn propagate_route_interest(
     is_sub: bool,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
-    let writers = state
-        .cluster
-        .route_writers
-        .read()
-        .expect("route_writers read lock");
+    let writers = state.cluster.route_writers.read_or_poison();
     if writers.is_empty() {
         return;
     }
@@ -148,7 +141,7 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
             let acct = state
                 .account_name(idx as crate::core::server::AccountId)
                 .as_bytes();
-            let subs = account_sub.read().expect("subs read lock");
+            let subs = account_sub.read_or_poison();
             for (subject, queue) in subs.local_interests() {
                 writer.write_route_sub(subject.as_bytes(), queue.map(|q| q.as_bytes()), acct);
             }
@@ -156,7 +149,7 @@ pub(crate) fn send_existing_route_subs(state: &ServerState, writer: &MsgWriter) 
     }
     #[cfg(not(feature = "accounts"))]
     {
-        let subs = state.subs.read().expect("subs read lock");
+        let subs = state.subs.read_or_poison();
         for (subject, queue) in subs.local_interests() {
             writer.write_route_sub(subject.as_bytes(), queue.map(|q| q.as_bytes()));
         }
@@ -180,20 +173,12 @@ pub(crate) fn propagate_gateway_interest(
 ) {
     use crate::core::server::GatewayInterestMode;
 
-    let writers = state
-        .gateway
-        .writers
-        .read()
-        .expect("gateway writers read lock");
+    let writers = state.gateway.writers.read_or_poison();
     if writers.is_empty() {
         return;
     }
 
-    let gi = state
-        .gateway
-        .interest
-        .read()
-        .expect("gateway interest read lock");
+    let gi = state.gateway.interest.read_or_poison();
 
     GW_BUILDER.with(|cell| {
         let mut builder = cell.borrow_mut();
