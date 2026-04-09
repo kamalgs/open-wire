@@ -716,6 +716,9 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
             let a2 = parse_size(args[2]);
             match (a1, a2) {
                 (Result::Ok(hdr_size), Result::Ok(total_size)) => {
+                    if hdr_size > total_size {
+                        return leaf_proto_err(buf, "LMSG header size exceeds total");
+                    }
                     let total_needed = nl + 1 + total_size + 2;
                     if buf.len() < total_needed {
                         return Ok(None);
@@ -760,6 +763,9 @@ fn parse_lmsg(buf: &mut BytesMut) -> io::Result<Option<LeafOp>> {
         4 => {
             let hdr_size = parse_size(args[2])?;
             let total_size = parse_size(args[3])?;
+            if hdr_size > total_size {
+                return leaf_proto_err(buf, "LMSG header size exceeds total");
+            }
             let total_needed = nl + 1 + total_size + 2;
             if buf.len() < total_needed {
                 return Ok(None);
@@ -1019,6 +1025,9 @@ fn parse_rmsg(buf: &mut BytesMut) -> io::Result<Option<RouteOp>> {
             let reply_len = args[2].len();
             let hdr_size = parse_size(args[3])?;
             let total_size = parse_size(args[4])?;
+            if hdr_size > total_size {
+                return route_proto_err(buf, "RMSG header size exceeds total");
+            }
             let total = nl + 1 + total_size + 2;
             if buf.len() < total {
                 return Ok(None);

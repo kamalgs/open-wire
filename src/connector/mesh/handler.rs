@@ -17,6 +17,7 @@ use crate::handler::{
 };
 use crate::nats_proto;
 use crate::sub_list::{SubKind, Subscription};
+use crate::util::{LockExt, RwLockExt};
 
 /// Handles route protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct RouteHandler;
@@ -108,18 +109,8 @@ impl ConnectionHandler for RouteHandler {
             }
             RouteOp::Info(info) => {
                 if !info.connect_urls.is_empty() {
-                    let mut peers = wctx
-                        .state
-                        .cluster
-                        .route_peers
-                        .lock()
-                        .expect("route_peers lock");
-                    let tx = wctx
-                        .state
-                        .cluster
-                        .connect_tx
-                        .lock()
-                        .expect("connect_tx lock");
+                    let mut peers = wctx.state.cluster.route_peers.lock_or_poison();
+                    let tx = wctx.state.cluster.connect_tx.lock_or_poison();
                     for url in &info.connect_urls {
                         let normalized = crate::connector::mesh::normalize_route_url(url);
                         if peers.known_urls.insert(normalized.clone()) {
@@ -166,8 +157,7 @@ impl RouteHandler {
                     #[cfg(feature = "accounts")]
                     account_id,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Release);
         }
@@ -228,8 +218,7 @@ impl RouteHandler {
                     #[cfg(feature = "accounts")]
                     account_id,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs

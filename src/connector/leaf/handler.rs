@@ -18,6 +18,7 @@ use crate::handler::{
 };
 use crate::nats_proto;
 use crate::sub_list::{SubKind, Subscription};
+use crate::util::RwLockExt;
 
 /// Handles leaf node protocol operations (LS+, LS-, LMSG, PING, PONG).
 pub(crate) struct LeafHandler;
@@ -111,19 +112,13 @@ impl LeafHandler {
                     #[cfg(feature = "accounts")]
                     conn.account_id,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Release);
         }
 
         {
-            let mut upstreams = wctx
-                .state
-                .leaf
-                .upstreams
-                .write()
-                .expect("upstreams write lock");
+            let mut upstreams = wctx.state.leaf.upstreams.write_or_poison();
             for up in upstreams.iter_mut() {
                 if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue.clone()) {
                     warn!(error = %e, "failed to add upstream interest for leaf sub");
@@ -181,8 +176,7 @@ impl LeafHandler {
                     #[cfg(feature = "accounts")]
                     conn.account_id,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs
@@ -194,12 +188,7 @@ impl LeafHandler {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
 
             {
-                let mut upstreams = wctx
-                    .state
-                    .leaf
-                    .upstreams
-                    .write()
-                    .expect("upstreams write lock");
+                let mut upstreams = wctx.state.leaf.upstreams.write_or_poison();
                 for up in upstreams.iter_mut() {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }

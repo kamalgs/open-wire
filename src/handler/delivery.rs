@@ -23,6 +23,7 @@ use crate::connector::leaf::UpstreamCmd;
 use crate::core::server::ServerState;
 use crate::sub_list::MsgWriter;
 use crate::types::HeaderMap;
+use crate::util::RwLockExt;
 
 /// Worker-level context for delivery and notification.
 pub(crate) struct MessageDeliveryHub<'a> {
@@ -355,8 +356,7 @@ pub(crate) fn deliver_to_subs(
             #[cfg(feature = "accounts")]
             account_id,
         )
-        .read()
-        .expect("subs read lock");
+        .read_or_poison();
 
     let (delivered, expired) = deliver_to_subs_core(
         &subs,
@@ -425,8 +425,7 @@ pub(crate) fn deliver_to_subs_upstream_inner(
             #[cfg(feature = "accounts")]
             account_id,
         )
-        .read()
-        .expect("subs read lock");
+        .read_or_poison();
     let (delivered, expired) = deliver_to_subs_core(
         &subs,
         msg,
@@ -472,12 +471,7 @@ pub(crate) fn forward_to_upstream(
     }
     if any_failed {
         // At least one writer thread gone — refresh from global state (may have reconnected)
-        *upstream_txs = state
-            .leaf
-            .upstream_txs
-            .read()
-            .expect("upstream_txs read lock")
-            .clone();
+        *upstream_txs = state.leaf.upstream_txs.read_or_poison().clone();
     }
 }
 
@@ -515,8 +509,7 @@ pub(crate) fn handle_expired_subs(
             #[cfg(feature = "accounts")]
             account_id,
         )
-        .write()
-        .expect("subs write lock");
+        .write_or_poison();
     for (exp_conn_id, exp_sid) in expired {
         if let Some(removed) = subs.remove(*exp_conn_id, *exp_sid) {
             if let Some(client) = conns.get_mut(exp_conn_id) {
@@ -524,7 +517,7 @@ pub(crate) fn handle_expired_subs(
             }
 
             {
-                let mut upstreams = state.leaf.upstreams.write().expect("upstreams write lock");
+                let mut upstreams = state.leaf.upstreams.write_or_poison();
                 for up in upstreams.iter_mut() {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }
@@ -563,11 +556,10 @@ pub(crate) fn handle_expired_subs_upstream(
             #[cfg(feature = "accounts")]
             account_id,
         )
-        .write()
-        .expect("subs write lock");
+        .write_or_poison();
     for (conn_id, sid) in expired {
         if let Some(removed) = subs.remove(*conn_id, *sid) {
-            let mut upstreams = state.leaf.upstreams.write().expect("upstreams write lock");
+            let mut upstreams = state.leaf.upstreams.write_or_poison();
             for up in upstreams.iter_mut() {
                 up.remove_interest(&removed.subject, removed.queue.as_deref());
             }
@@ -588,12 +580,7 @@ pub(crate) fn forward_to_optimistic_gateways(
 ) {
     use crate::core::server::GatewayInterestMode;
 
-    let gi = wctx
-        .state
-        .gateway
-        .interest
-        .read()
-        .expect("gateway interest read lock");
+    let gi = wctx.state.gateway.interest.read_or_poison();
     if gi.is_empty() {
         return;
     }
@@ -678,11 +665,7 @@ pub(crate) fn deliver_cross_account(
             msg.payload.clone(),
         );
 
-        let subs = wctx
-            .state
-            .get_subs(route.dst_account_id)
-            .read()
-            .expect("subs read lock");
+        let subs = wctx.state.get_subs(route.dst_account_id).read_or_poison();
         let (_count, expired) = subs.for_each_match(
             &dst_subject_str,
             |_| true,
@@ -751,10 +734,7 @@ pub(crate) fn deliver_cross_account_upstream(
             msg.payload.clone(),
         );
 
-        let subs = state
-            .get_subs(route.dst_account_id)
-            .read()
-            .expect("subs read lock");
+        let subs = state.get_subs(route.dst_account_id).read_or_poison();
         let (_count, expired) = subs.for_each_match(
             &dst_subject_str,
             |_| true,

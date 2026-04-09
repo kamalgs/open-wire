@@ -19,6 +19,7 @@ use crate::handler::{
 use crate::nats_proto;
 use crate::nats_proto::GatewayOp;
 use crate::sub_list::{SubKind, Subscription};
+use crate::util::{LockExt, RwLockExt};
 
 /// Handles gateway protocol operations (RS+, RS-, RMSG, PING, PONG).
 pub(crate) struct GatewayHandler;
@@ -61,14 +62,8 @@ impl ConnectionHandler for GatewayHandler {
 
                 if let Some(ref urls) = info.gateway_urls {
                     if !urls.is_empty() {
-                        let tx = wctx
-                            .state
-                            .gateway
-                            .connect_tx
-                            .lock()
-                            .expect("gateway connect_tx lock");
-                        let mut peers =
-                            wctx.state.gateway.peers.lock().expect("gateway peers lock");
+                        let tx = wctx.state.gateway.connect_tx.lock_or_poison();
+                        let mut peers = wctx.state.gateway.peers.lock_or_poison();
                         let mut changed = false;
                         for url in urls {
                             if peers.known_urls.insert(url.clone()) {
@@ -137,8 +132,7 @@ impl GatewayHandler {
                     #[cfg(feature = "accounts")]
                     conn.account_id,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Release);
         }
@@ -192,8 +186,7 @@ impl GatewayHandler {
                     #[cfg(feature = "accounts")]
                     conn.account_id,
                 )
-                .write()
-                .expect("subs write lock");
+                .write_or_poison();
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs

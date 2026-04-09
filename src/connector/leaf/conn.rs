@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::buf::AdaptiveBuf;
 use crate::nats_proto::{self, LeafOp, MsgBuilder};
 use crate::types::HeaderMap;
+use crate::util::LockExt;
 
 /// Resolved credentials to include in a leaf CONNECT message to the hub.
 #[derive(Debug, Default)]
@@ -40,7 +41,7 @@ impl Read for HubStream {
         match self {
             HubStream::Plain(s) => s.read(buf),
             HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().expect("tls lock");
+                let mut conn = tls.lock_or_poison();
                 match conn.read_tls(tcp) {
                     Ok(0) => return Ok(0),
                     Ok(_) => {}
@@ -64,7 +65,7 @@ impl Write for HubStream {
         match self {
             HubStream::Plain(s) => s.write(buf),
             HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().expect("tls lock");
+                let mut conn = tls.lock_or_poison();
                 let n = conn.writer().write(buf)?;
                 conn.write_tls(tcp)?;
                 Ok(n)
@@ -76,7 +77,7 @@ impl Write for HubStream {
         match self {
             HubStream::Plain(s) => s.flush(),
             HubStream::Tls { tls, tcp } => {
-                let mut conn = tls.lock().expect("tls lock");
+                let mut conn = tls.lock_or_poison();
                 conn.writer().flush()?;
                 conn.write_tls(tcp)?;
                 tcp.flush()

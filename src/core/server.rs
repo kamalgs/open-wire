@@ -18,6 +18,7 @@ use tracing::{error, info, warn};
 use crate::types::{ConnectInfo, ServerInfo};
 
 use crate::buf::BufConfig;
+use crate::util::RwLockExt;
 
 use crate::connector::leaf::{Upstream, UpstreamCmd};
 use crate::core::worker::{Worker, WorkerHandle};
@@ -754,12 +755,12 @@ fn handle_monitoring_request(stream: &mut TcpStream, state: &ServerState) -> io:
                     state
                         .account_subs
                         .iter()
-                        .map(|s| s.read().expect("subs read lock").unique_subjects().len())
+                        .map(|s| s.read_or_poison().unique_subjects().len())
                         .sum::<usize>()
                 }
                 #[cfg(not(feature = "accounts"))]
                 {
-                    let subs = state.subs.read().expect("subs read lock");
+                    let subs = state.subs.read_or_poison();
                     subs.unique_subjects().len()
                 }
             };
@@ -1487,18 +1488,8 @@ impl Server {
             ) {
                 Ok(upstream) => {
                     let sender = upstream.sender();
-                    self.state
-                        .leaf
-                        .upstreams
-                        .write()
-                        .expect("upstreams write lock")
-                        .push(upstream);
-                    self.state
-                        .leaf
-                        .upstream_txs
-                        .write()
-                        .expect("upstream_txs write lock")
-                        .push(sender);
+                    self.state.leaf.upstreams.write_or_poison().push(upstream);
+                    self.state.leaf.upstream_txs.write_or_poison().push(sender);
                     info!(idx, "connected to upstream hub");
                 }
                 Err(e) => {
@@ -1512,18 +1503,8 @@ impl Server {
                         build_pipeline,
                     );
                     let sender = upstream.sender();
-                    self.state
-                        .leaf
-                        .upstreams
-                        .write()
-                        .expect("upstreams write lock")
-                        .push(upstream);
-                    self.state
-                        .leaf
-                        .upstream_txs
-                        .write()
-                        .expect("upstream_txs write lock")
-                        .push(sender);
+                    self.state.leaf.upstreams.write_or_poison().push(upstream);
+                    self.state.leaf.upstream_txs.write_or_poison().push(sender);
                 }
             }
         }
@@ -2103,30 +2084,20 @@ impl Server {
             #[cfg(feature = "accounts")]
             {
                 for account_subs in &self.state.account_subs {
-                    let mut subs = account_subs.write().expect("subs write lock");
+                    let mut subs = account_subs.write_or_poison();
                     *subs = SubscriptionManager::new();
                 }
             }
             #[cfg(not(feature = "accounts"))]
             {
-                let mut subs = self.state.subs.write().expect("subs write lock");
+                let mut subs = self.state.subs.write_or_poison();
                 *subs = SubscriptionManager::new();
             }
         }
 
         {
-            self.state
-                .leaf
-                .upstream_txs
-                .write()
-                .expect("upstream_txs write lock")
-                .clear();
-            self.state
-                .leaf
-                .upstreams
-                .write()
-                .expect("upstreams write lock")
-                .clear();
+            self.state.leaf.upstream_txs.write_or_poison().clear();
+            self.state.leaf.upstreams.write_or_poison().clear();
         }
 
         Ok(())

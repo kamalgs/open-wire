@@ -76,7 +76,10 @@ pub(crate) fn try_decode(buf: &mut BytesMut) -> Option<BinFrame> {
     let subj_len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
     let repl_len = u16::from_le_bytes([buf[3], buf[4]]) as usize;
     let pay_len = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
-    let total = HEADER_LEN + subj_len + repl_len + pay_len;
+    let total = HEADER_LEN
+        .checked_add(subj_len)
+        .and_then(|s| s.checked_add(repl_len))
+        .and_then(|s| s.checked_add(pay_len))?;
     if buf.len() < total {
         return None;
     }

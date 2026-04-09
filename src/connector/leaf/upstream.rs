@@ -19,6 +19,7 @@ use crate::buf::LeafOp;
 use crate::connector::leaf::{LeafConn, LeafReader, LeafWriter, UpstreamConnectCreds};
 use crate::core::server::{HubCredentials, ServerState};
 use crate::sub_list::MsgWriter;
+use crate::util::RwLockExt;
 
 /// Commands sent from the Upstream handle to the background writer thread.
 #[derive(Debug)]
@@ -276,8 +277,7 @@ fn connect_and_run(
                     #[cfg(feature = "accounts")]
                     0,
                 )
-                .read()
-                .expect("subs read lock");
+                .read_or_poison();
             subs.unique_interests()
                 .into_iter()
                 .map(|(s, q)| (s.to_string(), q.map(|q| q.to_string())))
@@ -352,11 +352,7 @@ fn run_supervisor(
                 info!("connected to upstream hub");
 
                 {
-                    let mut txs = state
-                        .leaf
-                        .upstream_txs
-                        .write()
-                        .expect("upstream_txs write lock");
+                    let mut txs = state.leaf.upstream_txs.write_or_poison();
                     if idx < txs.len() {
                         txs[idx] = cmd_tx.clone();
                     }

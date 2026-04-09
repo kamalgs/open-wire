@@ -17,6 +17,7 @@ pub(crate) mod handler;
 pub(crate) mod io;
 pub mod protocol;
 pub mod pubsub;
+pub(crate) mod util;
 
 pub(crate) use io::buf;
 pub(crate) use io::msg_writer;
