@@ -802,7 +802,7 @@ impl Worker {
                     .cluster
                     .route_writers
                     .write()
-                    .unwrap()
+                    .expect("route_writers write lock")
                     .remove(&conn_id);
                 if let ConnExt::Route {
                     peer_server_id: Some(ref sid),
@@ -813,20 +813,25 @@ impl Worker {
                         .cluster
                         .route_peers
                         .lock()
-                        .unwrap()
+                        .expect("route_peers lock")
                         .connected
                         .remove(sid);
                 }
             }
 
             if client.ext.is_gateway() {
-                self.state.gateway.writers.write().unwrap().remove(&conn_id);
+                self.state
+                    .gateway
+                    .writers
+                    .write()
+                    .expect("gateway writers write lock")
+                    .remove(&conn_id);
                 if let ConnExt::Gateway {
                     peer_gateway_name: Some(ref name),
                     ..
                 } = client.ext
                 {
-                    let mut peers = self.state.gateway.peers.lock().unwrap();
+                    let mut peers = self.state.gateway.peers.lock().expect("gateway peers lock");
                     if let Some(ids) = peers.connected.get_mut(name) {
                         ids.remove(&conn_id);
                         if ids.is_empty() {
@@ -868,7 +873,7 @@ impl Worker {
                 Segs { segs: Vec<BinSeg>, total_len: usize },
             }
             let drained = {
-                let mut dbuf = client.direct_buf.lock().unwrap();
+                let mut dbuf = client.direct_buf.lock().expect("direct_buf lock");
                 if dbuf.is_empty() {
                     DrainResult::Empty
                 } else if matches!(client.transport, Transport::Raw) {
@@ -1433,7 +1438,7 @@ impl Worker {
             if let Some(client) = self.conns.get_mut(&conn_id) {
                 client.phase = ConnPhase::Draining;
                 {
-                    let mut dbuf = client.direct_buf.lock().unwrap();
+                    let mut dbuf = client.direct_buf.lock().expect("direct_buf lock");
                     if !dbuf.is_empty() {
                         match &mut *dbuf {
                             DirectBuf::Text(b) => {
@@ -2077,7 +2082,12 @@ impl Worker {
                         // bidirectional seed configs from creating two route connections
                         // per pair, which would double-deliver every routed message.
                         let is_duplicate = {
-                            let mut peers = self.state.cluster.route_peers.lock().unwrap();
+                            let mut peers = self
+                                .state
+                                .cluster
+                                .route_peers
+                                .lock()
+                                .expect("route_peers lock");
                             if peers.connected.contains_key(sid.as_str()) {
                                 true
                             } else {
@@ -2106,7 +2116,13 @@ impl Worker {
                     client.echo = false;
 
                     {
-                        client.upstream_txs = self.state.leaf.upstream_txs.read().unwrap().clone();
+                        client.upstream_txs = self
+                            .state
+                            .leaf
+                            .upstream_txs
+                            .read()
+                            .expect("upstream_txs read lock")
+                            .clone();
                     }
                     // Always respond with text PONG — the handshake stays in text.
                     // Binary framing only activates for Active-phase data frames.
@@ -2129,7 +2145,7 @@ impl Worker {
                     // the direct_writer with a binary-mode writer sharing the same Arcs.
                     if use_binary {
                         {
-                            let mut dbuf = client.direct_buf.lock().unwrap();
+                            let mut dbuf = client.direct_buf.lock().expect("direct_buf lock");
                             *dbuf = DirectBuf::Binary(BinSegBuf::new());
                         }
                         let binary_dw = crate::sub_list::MsgWriter::new_binary_shared(
@@ -2145,7 +2161,7 @@ impl Worker {
                         .cluster
                         .route_writers
                         .write()
-                        .unwrap()
+                        .expect("route_writers write lock")
                         .insert(conn_id, dw);
 
                     send_existing_route_subs(&self.state, &client.direct_writer);
@@ -2194,8 +2210,14 @@ impl Worker {
                 Some(nats_proto::GatewayOp::Info(peer_info)) => {
                     if let Some(ref urls) = peer_info.gateway_urls {
                         if !urls.is_empty() {
-                            let tx = self.state.gateway.connect_tx.lock().unwrap();
-                            let mut peers = self.state.gateway.peers.lock().unwrap();
+                            let tx = self
+                                .state
+                                .gateway
+                                .connect_tx
+                                .lock()
+                                .expect("gateway connect_tx lock");
+                            let mut peers =
+                                self.state.gateway.peers.lock().expect("gateway peers lock");
                             for url in urls {
                                 if peers.known_urls.insert(url.clone()) {
                                     if let Some(ref sender) = *tx {
@@ -2216,7 +2238,13 @@ impl Worker {
                     client.echo = false;
 
                     {
-                        client.upstream_txs = self.state.leaf.upstream_txs.read().unwrap().clone();
+                        client.upstream_txs = self
+                            .state
+                            .leaf
+                            .upstream_txs
+                            .read()
+                            .expect("upstream_txs read lock")
+                            .clone();
                     }
                     client.write_buf.extend_from_slice(b"PONG\r\n");
 
@@ -2233,11 +2261,12 @@ impl Worker {
                         .gateway
                         .writers
                         .write()
-                        .unwrap()
+                        .expect("gateway writers write lock")
                         .insert(conn_id, dw);
 
                     if let Some(ref name) = peer_gw_name {
-                        let mut peers = self.state.gateway.peers.lock().unwrap();
+                        let mut peers =
+                            self.state.gateway.peers.lock().expect("gateway peers lock");
                         peers
                             .connected
                             .entry(name.clone())
@@ -2320,8 +2349,13 @@ impl Worker {
                         client.permissions = leaf_perms.as_ref().map(|p| p.as_ref().clone());
 
                         {
-                            client.upstream_txs =
-                                self.state.leaf.upstream_txs.read().unwrap().clone();
+                            client.upstream_txs = self
+                                .state
+                                .leaf
+                                .upstream_txs
+                                .read()
+                                .expect("upstream_txs read lock")
+                                .clone();
                         }
                         client.write_buf.extend_from_slice(b"PING\r\n");
 
@@ -2330,7 +2364,7 @@ impl Worker {
                             .leaf
                             .inbound_writers
                             .write()
-                            .unwrap()
+                            .expect("inbound_writers write lock")
                             .insert(conn_id, (dw, leaf_perms.clone()));
 
                         send_existing_subs(&self.state, &client.direct_writer, &leaf_perms);
@@ -2372,7 +2406,13 @@ impl Worker {
                     }
 
                     {
-                        client.upstream_txs = self.state.leaf.upstream_txs.read().unwrap().clone();
+                        client.upstream_txs = self
+                            .state
+                            .leaf
+                            .upstream_txs
+                            .read()
+                            .expect("upstream_txs read lock")
+                            .clone();
                     }
                     info!(conn_id, "client connected");
                 }
@@ -2950,21 +2990,21 @@ fn cleanup_conn(id: u64, state: &ServerState) {
         {
             let mut all_removed = Vec::new();
             for account_sub in &state.account_subs {
-                let mut subs = account_sub.write().unwrap();
+                let mut subs = account_sub.write().expect("subs write lock");
                 all_removed.extend(subs.remove_conn(id));
             }
             state.has_subs.store(
                 state
                     .account_subs
                     .iter()
-                    .any(|s| !s.read().unwrap().is_empty()),
+                    .any(|s| !s.read().expect("subs read lock").is_empty()),
                 std::sync::atomic::Ordering::Relaxed,
             );
             all_removed
         }
         #[cfg(not(feature = "accounts"))]
         {
-            let mut subs = state.subs.write().unwrap();
+            let mut subs = state.subs.write().expect("subs write lock");
             let r = subs.remove_conn(id);
             state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
             r
@@ -2972,7 +3012,7 @@ fn cleanup_conn(id: u64, state: &ServerState) {
     };
 
     if !removed.is_empty() {
-        let mut upstreams = state.leaf.upstreams.write().unwrap();
+        let mut upstreams = state.leaf.upstreams.write().expect("upstreams write lock");
         for up in upstreams.iter_mut() {
             for sub in &removed {
                 up.remove_interest(&sub.subject, sub.queue.as_deref());

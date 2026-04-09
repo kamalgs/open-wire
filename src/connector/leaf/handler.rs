@@ -129,13 +129,18 @@ impl LeafHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
 
         {
-            let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
+            let mut upstreams = wctx
+                .state
+                .leaf
+                .upstreams
+                .write()
+                .expect("upstreams write lock");
             for up in upstreams.iter_mut() {
                 if let Err(e) = up.add_interest(subject_str.to_string(), upstream_queue.clone()) {
                     warn!(error = %e, "failed to add upstream interest for leaf sub");
@@ -194,7 +199,7 @@ impl LeafHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs
@@ -206,7 +211,12 @@ impl LeafHandler {
             *conn.sub_count = conn.sub_count.saturating_sub(1);
 
             {
-                let mut upstreams = wctx.state.leaf.upstreams.write().unwrap();
+                let mut upstreams = wctx
+                    .state
+                    .leaf
+                    .upstreams
+                    .write()
+                    .expect("upstreams write lock");
                 for up in upstreams.iter_mut() {
                     up.remove_interest(&removed.subject, removed.queue.as_deref());
                 }

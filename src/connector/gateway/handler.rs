@@ -61,8 +61,14 @@ impl ConnectionHandler for GatewayHandler {
 
                 if let Some(ref urls) = info.gateway_urls {
                     if !urls.is_empty() {
-                        let tx = wctx.state.gateway.connect_tx.lock().unwrap();
-                        let mut peers = wctx.state.gateway.peers.lock().unwrap();
+                        let tx = wctx
+                            .state
+                            .gateway
+                            .connect_tx
+                            .lock()
+                            .expect("gateway connect_tx lock");
+                        let mut peers =
+                            wctx.state.gateway.peers.lock().expect("gateway peers lock");
                         let mut changed = false;
                         for url in urls {
                             if peers.known_urls.insert(url.clone()) {
@@ -139,7 +145,7 @@ impl GatewayHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -194,7 +200,7 @@ impl GatewayHandler {
                     conn.account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs

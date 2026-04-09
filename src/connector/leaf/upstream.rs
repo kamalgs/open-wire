@@ -352,7 +352,11 @@ fn run_supervisor(
                 info!("connected to upstream hub");
 
                 {
-                    let mut txs = state.leaf.upstream_txs.write().unwrap();
+                    let mut txs = state
+                        .leaf
+                        .upstream_txs
+                        .write()
+                        .expect("upstream_txs write lock");
                     if idx < txs.len() {
                         txs[idx] = cmd_tx.clone();
                     }

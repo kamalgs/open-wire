@@ -49,7 +49,7 @@ impl RouteConnManager {
 
         let (coord_tx, coord_rx) = std::sync::mpsc::channel::<String>();
         {
-            let mut tx_lock = state.cluster.connect_tx.lock().unwrap();
+            let mut tx_lock = state.cluster.connect_tx.lock().expect("connect_tx lock");
             *tx_lock = Some(coord_tx);
         }
 
@@ -176,8 +176,8 @@ fn parse_route_url(url: &str) -> String {
 /// Process `connect_urls` from a peer's INFO, adding new URLs to
 /// `known_urls` and sending them to the coordinator channel.
 pub(crate) fn process_gossip_urls(state: &ServerState, connect_urls: &[String]) {
-    let mut peers = state.cluster.route_peers.lock().unwrap();
-    let tx = state.cluster.connect_tx.lock().unwrap();
+    let mut peers = state.cluster.route_peers.lock().expect("route_peers lock");
+    let tx = state.cluster.connect_tx.lock().expect("connect_tx lock");
     for url in connect_urls {
         let normalized = normalize_route_url(url);
         if peers.known_urls.insert(normalized.clone()) {
@@ -227,7 +227,7 @@ fn connect_route(
     let peer_server_id = peer_info.server_id.clone();
     let use_binary = peer_info.open_wire == Some(1);
     {
-        let peers = state.cluster.route_peers.lock().unwrap();
+        let peers = state.cluster.route_peers.lock().expect("route_peers lock");
         if peers.connected.contains_key(&peer_server_id) {
             debug!(
                 peer_id = %peer_server_id,
@@ -274,7 +274,7 @@ fn connect_route(
     }
 
     {
-        let mut peers = state.cluster.route_peers.lock().unwrap();
+        let mut peers = state.cluster.route_peers.lock().expect("route_peers lock");
         if peers.connected.contains_key(&peer_server_id) {
             debug!(
                 peer_id = %peer_server_id,
@@ -292,7 +292,11 @@ fn connect_route(
     };
 
     {
-        let mut writers = state.cluster.route_writers.write().unwrap();
+        let mut writers = state
+            .cluster
+            .route_writers
+            .write()
+            .expect("route_writers write lock");
         writers.insert(conn_id, direct_writer.clone());
     }
 
@@ -304,7 +308,7 @@ fn connect_route(
                 0,
             )
             .read()
-            .unwrap();
+            .expect("subs read lock");
         if use_binary {
             // Binary mode: encode initial sub sync as binary Sub frames.
             let mut bin_buf = BytesMut::new();
@@ -373,32 +377,36 @@ fn connect_route(
         #[cfg(feature = "accounts")]
         {
             for account_subs in &state.account_subs {
-                let mut subs = account_subs.write().unwrap();
+                let mut subs = account_subs.write().expect("subs write lock");
                 subs.remove_conn(conn_id);
             }
             state.has_subs.store(
                 state
                     .account_subs
                     .iter()
-                    .any(|s| !s.read().unwrap().is_empty()),
+                    .any(|s| !s.read().expect("subs read lock").is_empty()),
                 Ordering::Relaxed,
             );
         }
         #[cfg(not(feature = "accounts"))]
         {
-            let mut subs = state.subs.write().unwrap();
+            let mut subs = state.subs.write().expect("subs write lock");
             subs.remove_conn(conn_id);
             state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
         }
     }
 
     {
-        let mut writers = state.cluster.route_writers.write().unwrap();
+        let mut writers = state
+            .cluster
+            .route_writers
+            .write()
+            .expect("route_writers write lock");
         writers.remove(&conn_id);
     }
 
     {
-        let mut peers = state.cluster.route_peers.lock().unwrap();
+        let mut peers = state.cluster.route_peers.lock().expect("route_peers lock");
         peers.connected.remove(&peer_server_id);
     }
 
@@ -598,7 +606,7 @@ fn handle_route_op(
                     0,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             state.has_subs.store(true, Ordering::Relaxed);
 
@@ -613,7 +621,7 @@ fn handle_route_op(
                         0,
                     )
                     .write()
-                    .unwrap();
+                    .expect("subs write lock");
                 subs.remove(conn_id, sid);
                 state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
             }
@@ -721,7 +729,7 @@ fn handle_bin_frame(
                     0,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             state.has_subs.store(true, Ordering::Relaxed);
 
@@ -736,7 +744,7 @@ fn handle_bin_frame(
                         0,
                     )
                     .write()
-                    .unwrap();
+                    .expect("subs write lock");
                 subs.remove(conn_id, sid);
                 state.has_subs.store(!subs.is_empty(), Ordering::Relaxed);
             }
@@ -822,7 +830,7 @@ pub(crate) fn build_route_info(state: &ServerState) -> String {
     let cluster_port = state.cluster.port.unwrap_or(0);
 
     let connect_urls = {
-        let peers = state.cluster.route_peers.lock().unwrap();
+        let peers = state.cluster.route_peers.lock().expect("route_peers lock");
         let urls: Vec<&str> = peers.known_urls.iter().map(|s| s.as_str()).collect();
         if urls.is_empty() {
             String::new()
@@ -864,7 +872,11 @@ fn build_route_connect(state: &ServerState) -> String {
 pub(crate) fn broadcast_route_info(state: &ServerState) {
     let info_line = build_route_info(state);
     let info_bytes = info_line.as_bytes();
-    let writers = state.cluster.route_writers.read().unwrap();
+    let writers = state
+        .cluster
+        .route_writers
+        .read()
+        .expect("route_writers read lock");
     for writer in writers.values() {
         // Binary-mode connections don't use text INFO gossip.
         if writer.is_binary() {

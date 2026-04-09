@@ -108,8 +108,18 @@ impl ConnectionHandler for RouteHandler {
             }
             RouteOp::Info(info) => {
                 if !info.connect_urls.is_empty() {
-                    let mut peers = wctx.state.cluster.route_peers.lock().unwrap();
-                    let tx = wctx.state.cluster.connect_tx.lock().unwrap();
+                    let mut peers = wctx
+                        .state
+                        .cluster
+                        .route_peers
+                        .lock()
+                        .expect("route_peers lock");
+                    let tx = wctx
+                        .state
+                        .cluster
+                        .connect_tx
+                        .lock()
+                        .expect("connect_tx lock");
                     for url in &info.connect_urls {
                         let normalized = crate::connector::mesh::normalize_route_url(url);
                         if peers.known_urls.insert(normalized.clone()) {
@@ -170,7 +180,7 @@ impl RouteHandler {
                     account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             subs.insert(sub);
             wctx.state.has_subs.store(true, Ordering::Relaxed);
         }
@@ -229,7 +239,7 @@ impl RouteHandler {
                     account_id,
                 )
                 .write()
-                .unwrap();
+                .expect("subs write lock");
             let r = subs.remove(conn.conn_id, sid);
             wctx.state
                 .has_subs

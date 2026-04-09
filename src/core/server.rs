@@ -754,12 +754,12 @@ fn handle_monitoring_request(stream: &mut TcpStream, state: &ServerState) -> io:
                     state
                         .account_subs
                         .iter()
-                        .map(|s| s.read().unwrap().unique_subjects().len())
+                        .map(|s| s.read().expect("subs read lock").unique_subjects().len())
                         .sum::<usize>()
                 }
                 #[cfg(not(feature = "accounts"))]
                 {
-                    let subs = state.subs.read().unwrap();
+                    let subs = state.subs.read().expect("subs read lock");
                     subs.unique_subjects().len()
                 }
             };
@@ -1487,8 +1487,18 @@ impl Server {
             ) {
                 Ok(upstream) => {
                     let sender = upstream.sender();
-                    self.state.leaf.upstreams.write().unwrap().push(upstream);
-                    self.state.leaf.upstream_txs.write().unwrap().push(sender);
+                    self.state
+                        .leaf
+                        .upstreams
+                        .write()
+                        .expect("upstreams write lock")
+                        .push(upstream);
+                    self.state
+                        .leaf
+                        .upstream_txs
+                        .write()
+                        .expect("upstream_txs write lock")
+                        .push(sender);
                     info!(idx, "connected to upstream hub");
                 }
                 Err(e) => {
@@ -1502,8 +1512,18 @@ impl Server {
                         build_pipeline,
                     );
                     let sender = upstream.sender();
-                    self.state.leaf.upstreams.write().unwrap().push(upstream);
-                    self.state.leaf.upstream_txs.write().unwrap().push(sender);
+                    self.state
+                        .leaf
+                        .upstreams
+                        .write()
+                        .expect("upstreams write lock")
+                        .push(upstream);
+                    self.state
+                        .leaf
+                        .upstream_txs
+                        .write()
+                        .expect("upstream_txs write lock")
+                        .push(sender);
                 }
             }
         }
@@ -2083,20 +2103,30 @@ impl Server {
             #[cfg(feature = "accounts")]
             {
                 for account_subs in &self.state.account_subs {
-                    let mut subs = account_subs.write().unwrap();
+                    let mut subs = account_subs.write().expect("subs write lock");
                     *subs = SubscriptionManager::new();
                 }
             }
             #[cfg(not(feature = "accounts"))]
             {
-                let mut subs = self.state.subs.write().unwrap();
+                let mut subs = self.state.subs.write().expect("subs write lock");
                 *subs = SubscriptionManager::new();
             }
         }
 
         {
-            self.state.leaf.upstream_txs.write().unwrap().clear();
-            self.state.leaf.upstreams.write().unwrap().clear();
+            self.state
+                .leaf
+                .upstream_txs
+                .write()
+                .expect("upstream_txs write lock")
+                .clear();
+            self.state
+                .leaf
+                .upstreams
+                .write()
+                .expect("upstreams write lock")
+                .clear();
         }
 
         Ok(())
