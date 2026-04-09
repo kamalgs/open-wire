@@ -620,6 +620,11 @@ impl SubscriptionManager {
     /// `pre_filter`: called before a subscription is considered for delivery or
     /// added to a queue group. Returning `false` excludes it entirely — including
     /// from the queue-group round-robin pool, so it never "steals" a slot.
+    /// Maximum number of subscriptions delivered per single publish.
+    /// Prevents a single PUB from blocking a worker thread for seconds
+    /// when millions of subscriptions match (e.g., wildcard `>`).
+    const MAX_FANOUT: usize = 100_000;
+
     pub fn for_each_match(
         &self,
         subject: &str,
@@ -685,12 +690,20 @@ impl SubscriptionManager {
 
         if let Some(subs) = self.exact.get(subject) {
             for sub in subs.iter() {
+                if count >= Self::MAX_FANOUT {
+                    break;
+                }
                 route_sub!(sub);
             }
         }
-        self.wild.for_each_match(subject, |sub| {
-            route_sub!(sub);
-        });
+        if count < Self::MAX_FANOUT {
+            self.wild.for_each_match(subject, |sub| {
+                if count >= Self::MAX_FANOUT {
+                    return;
+                }
+                route_sub!(sub);
+            });
+        }
 
         // Deliver to exactly one member per queue group (round-robin)
         if !queue_groups.is_empty() {

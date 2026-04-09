@@ -1540,6 +1540,20 @@ impl Server {
             .collect()
     }
 
+    /// Reject the connection if the global connection limit is reached.
+    fn over_max_connections(&self, addr: std::net::SocketAddr) -> bool {
+        let max = self.state.max_connections.load(Ordering::Relaxed);
+        if max > 0 {
+            let current = self.state.active_connections.load(Ordering::Relaxed);
+            if current >= max as u64 {
+                warn!(addr = %addr, max_connections = max, "maximum connections exceeded, rejecting");
+                counter!("connections_rejected_total").increment(1);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Distribute a new TCP connection to the next worker (round-robin).
     fn accept_tcp(
         &self,
@@ -1549,15 +1563,8 @@ impl Server {
         next_worker: &mut usize,
         is_websocket: bool,
     ) {
-        let max = self.state.max_connections.load(Ordering::Relaxed);
-        if max > 0 {
-            let current = self.state.active_connections.load(Ordering::Relaxed);
-            if current >= max as u64 {
-                warn!(addr = %addr, max_connections = max, "maximum connections exceeded, rejecting");
-                counter!("connections_rejected_total").increment(1);
-                drop(tcp_stream);
-                return;
-            }
+        if self.over_max_connections(addr) {
+            return;
         }
         self.state
             .active_connections
@@ -1581,6 +1588,9 @@ impl Server {
         workers: &[WorkerHandle],
         next_worker: &mut usize,
     ) {
+        if self.over_max_connections(addr) {
+            return;
+        }
         self.state
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -1598,6 +1608,9 @@ impl Server {
         workers: &[WorkerHandle],
         next_worker: &mut usize,
     ) {
+        if self.over_max_connections(addr) {
+            return;
+        }
         self.state
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -1614,6 +1627,9 @@ impl Server {
         workers: &[WorkerHandle],
         next_worker: &mut usize,
     ) {
+        if self.over_max_connections(addr) {
+            return;
+        }
         self.state
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
@@ -1630,6 +1646,9 @@ impl Server {
         workers: &[WorkerHandle],
         next_worker: &mut usize,
     ) {
+        if self.over_max_connections(addr) {
+            return;
+        }
         self.state
             .active_connections
             .fetch_add(1, Ordering::Relaxed);
