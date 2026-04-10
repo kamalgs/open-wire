@@ -1,15 +1,15 @@
-//! N-worker epoll event loop.
+//! N-worker reactor event loop.
 //!
-//! Each worker owns one epoll instance multiplexing many client connections.
-//! MsgWriter notifies the *worker's* single eventfd, so fan-out to 100
-//! connections on the same worker costs 1 eventfd write, not 100.
+//! Each worker owns one reactor instance (epoll or io_uring) multiplexing many
+//! client connections. MsgWriter notifies the *worker's* single eventfd, so
+//! fan-out to 100 connections on the same worker costs 1 eventfd write, not 100.
 
 use std::collections::HashMap;
 
 use rustc_hash::FxHashMap;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,7 @@ use crate::handler::{
     MessageDeliveryHub,
 };
 use crate::nats_proto;
+use crate::reactor::{EpollReactor, Reactor, ERROR, READABLE, WRITABLE};
 use crate::sub_list::{create_eventfd, DirectBuf, MsgWriter};
 use crate::util::{LockExt, RwLockExt};
 
@@ -185,8 +186,8 @@ impl WorkerHandle {
 
 // --- Worker ---
 
-pub(crate) struct Worker {
-    epoll_fd: OwnedFd,
+pub(crate) struct Worker<R: Reactor> {
+    reactor: R,
     event_fd: Arc<OwnedFd>,
     conns: FxHashMap<u64, ClientState>,
     fd_to_conn: FxHashMap<RawFd, u64>,
@@ -315,8 +316,8 @@ impl ClientState {
     }
 }
 
-impl Worker {
-    /// Spawn a worker thread. Returns a handle for sending commands.
+impl Worker<EpollReactor> {
+    /// Spawn a worker thread using the epoll reactor. Returns a handle for sending commands.
     pub(crate) fn spawn(index: usize, state: Arc<ServerState>) -> WorkerHandle {
         let (tx, rx) = mpsc::channel();
         let event_fd = Arc::new(create_eventfd());
@@ -344,26 +345,13 @@ impl Worker {
         let join_handle = std::thread::Builder::new()
             .name(format!("worker-{index}"))
             .spawn(move || {
-                let epoll_fd = unsafe { libc::epoll_create1(0) };
-                assert!(epoll_fd >= 0, "epoll_create1 failed");
-                let epoll_fd = unsafe { OwnedFd::from_raw_fd(epoll_fd) };
-
-                let mut ev = libc::epoll_event {
-                    events: libc::EPOLLIN as u32,
-                    u64: EVENT_FD_KEY,
-                };
-                let ret = unsafe {
-                    libc::epoll_ctl(
-                        epoll_fd.as_raw_fd(),
-                        libc::EPOLL_CTL_ADD,
-                        event_fd.as_raw_fd(),
-                        &mut ev,
-                    )
-                };
-                assert!(ret == 0, "epoll_ctl ADD eventfd failed");
+                let mut reactor = EpollReactor::new().expect("failed to create epoll instance");
+                reactor
+                    .register(event_fd.as_raw_fd(), EVENT_FD_KEY)
+                    .expect("failed to register eventfd");
 
                 let mut worker = Worker {
-                    epoll_fd,
+                    reactor,
                     event_fd,
                     conns: FxHashMap::default(),
                     fd_to_conn: FxHashMap::default(),
@@ -393,16 +381,82 @@ impl Worker {
             join_handle: Some(join_handle),
         }
     }
+}
 
+#[cfg(feature = "io-uring")]
+impl Worker<crate::reactor::IoUringReactor> {
+    /// Spawn a worker thread using the io_uring reactor. Returns a handle for sending commands.
+    pub(crate) fn spawn_uring(index: usize, state: Arc<ServerState>) -> WorkerHandle {
+        let (tx, rx) = mpsc::channel();
+        let event_fd = Arc::new(create_eventfd());
+        let info_json =
+            serde_json::to_string(&state.info).expect("failed to serialize server info");
+        let info_line = format!("INFO {info_json}\r\n").into_bytes();
+
+        let hub_info_line = if let Some(lp) = state.leaf.port {
+            let mut leaf_info = state.info.clone();
+            leaf_info.port = lp;
+            leaf_info.client_id = 1;
+            leaf_info.leafnode_urls = Some(vec![format!("{}:{}", leaf_info.host, lp)]);
+            let json = serde_json::to_string(&leaf_info).expect("failed to serialize leaf info");
+            format!("INFO {json}\r\n").into_bytes()
+        } else {
+            info_line.clone()
+        };
+
+        let event_fd_clone = Arc::clone(&event_fd);
+        let join_handle = std::thread::Builder::new()
+            .name(format!("worker-{index}"))
+            .spawn(move || {
+                let mut reactor = crate::reactor::IoUringReactor::new()
+                    .expect("failed to create io_uring instance");
+                reactor
+                    .register(event_fd.as_raw_fd(), EVENT_FD_KEY)
+                    .expect("failed to register eventfd");
+
+                let mut worker = Worker {
+                    reactor,
+                    event_fd,
+                    conns: FxHashMap::default(),
+                    fd_to_conn: FxHashMap::default(),
+                    rx,
+                    state,
+                    info_line,
+
+                    hub_info_line,
+                    shutdown: false,
+                    pending_notify: [-1; 16],
+                    pending_notify_count: 0,
+                    worker_label: index.to_string(),
+                    msgs_received: 0,
+                    msgs_received_bytes: 0,
+                    msgs_delivered: 0,
+                    msgs_delivered_bytes: 0,
+                    #[cfg(feature = "worker-affinity")]
+                    worker_index: index,
+                };
+                worker.run();
+            })
+            .expect("failed to spawn worker thread");
+
+        WorkerHandle {
+            tx,
+            event_fd: event_fd_clone,
+            join_handle: Some(join_handle),
+        }
+    }
+}
+
+impl<R: Reactor> Worker<R> {
     fn run(&mut self) {
-        let mut events = vec![libc::epoll_event { events: 0, u64: 0 }; 256];
+        let mut events = vec![(0u64, 0u32); 256];
 
-        // Compute epoll timeout for periodic keepalive and auth timeout checks.
+        // Compute reactor timeout for periodic keepalive and auth timeout checks.
         // Use half the ping interval (capped at 30s) so we check reasonably often.
         // If auth timeout is enabled, ensure we wake up often enough to enforce it.
         let ping_interval_ms = self.state.ping_interval_ms.load(Ordering::Relaxed);
         let auth_timeout_ms = self.state.auth_timeout_ms.load(Ordering::Relaxed);
-        let epoll_timeout_ms = {
+        let reactor_timeout_ms = {
             let ping_half = if ping_interval_ms == 0 {
                 u64::MAX
             } else {
@@ -424,39 +478,30 @@ impl Worker {
         };
 
         loop {
-            let n = unsafe {
-                libc::epoll_wait(
-                    self.epoll_fd.as_raw_fd(),
-                    events.as_mut_ptr(),
-                    events.len() as i32,
-                    epoll_timeout_ms,
-                )
-            };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
+            let n = match self.reactor.wait(&mut events, reactor_timeout_ms) {
+                Ok(n) => n,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    warn!(error = %err, "reactor wait failed");
+                    break;
                 }
-                warn!(error = %err, "epoll_wait failed");
-                break;
-            }
+            };
 
-            for ev in events.iter().take(n as usize) {
-                let ev = *ev;
-                let key = ev.u64;
-
-                if key == EVENT_FD_KEY {
+            for &(token, revents) in events.iter().take(n) {
+                if token == EVENT_FD_KEY {
                     self.handle_eventfd();
                 } else {
-                    let conn_id = key;
-                    if ev.events & libc::EPOLLERR as u32 != 0 {
+                    let conn_id = token;
+                    if revents & ERROR != 0 {
                         self.remove_conn(conn_id);
                         continue;
                     }
-                    if ev.events & libc::EPOLLIN as u32 != 0 {
+                    if revents & READABLE != 0 {
                         self.handle_read(conn_id);
                     }
-                    if ev.events & libc::EPOLLOUT as u32 != 0 {
+                    if revents & WRITABLE != 0 {
                         self.handle_write(conn_id);
                     }
                 }
@@ -469,7 +514,7 @@ impl Worker {
 
             self.flush_metrics();
 
-            if epoll_timeout_ms > 0 {
+            if reactor_timeout_ms > 0 {
                 self.check_pings();
                 self.check_auth_timeout();
             }
@@ -542,14 +587,8 @@ impl Worker {
         stream.set_nodelay(true).ok();
         let fd = stream.as_raw_fd();
 
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: id,
-        };
-        let ret =
-            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
-        if ret != 0 {
-            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed");
+        if let Err(e) = self.reactor.register(fd, id) {
+            warn!(id, error = %e, "reactor register failed");
             return;
         }
 
@@ -648,14 +687,8 @@ impl Worker {
         stream.set_nodelay(true).ok();
         let fd = stream.as_raw_fd();
 
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: id,
-        };
-        let ret =
-            unsafe { libc::epoll_ctl(self.epoll_fd.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut ev) };
-        if ret != 0 {
-            warn!(id, error = %io::Error::last_os_error(), "epoll_ctl ADD failed for {kind} conn");
+        if let Err(e) = self.reactor.register(fd, id) {
+            warn!(id, error = %e, "reactor register failed for {kind} conn");
             return;
         }
 
@@ -778,14 +811,7 @@ impl Worker {
 
     fn remove_conn(&mut self, conn_id: u64) {
         if let Some(client) = self.conns.remove(&conn_id) {
-            unsafe {
-                libc::epoll_ctl(
-                    self.epoll_fd.as_raw_fd(),
-                    libc::EPOLL_CTL_DEL,
-                    client.fd,
-                    std::ptr::null_mut(),
-                );
-            }
+            self.reactor.deregister(client.fd, conn_id);
             self.fd_to_conn.remove(&client.fd);
             self.state
                 .active_connections
@@ -850,7 +876,6 @@ impl Worker {
     /// Scan all connections for pending MsgWriter data, drain into write_buf,
     /// and try to flush to socket.
     fn flush_pending(&mut self) {
-        let epoll_fd = self.epoll_fd.as_raw_fd();
         let mut to_remove: Vec<u64> = Vec::new();
         // Tracks the highest congestion level seen this pass (0.0 = at HWM, 1.0 = at max_pending).
         // Used to apply graduated backpressure after the scan loop.
@@ -1109,7 +1134,7 @@ impl Worker {
                                     }
                                 }
                                 if !client.epoll_has_out {
-                                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                    self.reactor.modify(client.fd, *conn_id, true);
                                     client.epoll_has_out = true;
                                 }
                             } else {
@@ -1138,7 +1163,7 @@ impl Worker {
                                 all.advance(written);
                                 client.write_buf = all;
                                 if !client.epoll_has_out {
-                                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                    self.reactor.modify(client.fd, *conn_id, true);
                                     client.epoll_has_out = true;
                                 }
                             }
@@ -1196,7 +1221,7 @@ impl Worker {
                         let err = io::Error::last_os_error();
                         if err.kind() == io::ErrorKind::WouldBlock {
                             if !client.epoll_has_out {
-                                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                self.reactor.modify(client.fd, *conn_id, true);
                                 client.epoll_has_out = true;
                             }
                             break;
@@ -1245,7 +1270,7 @@ impl Worker {
                         let err = io::Error::last_os_error();
                         if err.kind() == io::ErrorKind::WouldBlock {
                             if !client.epoll_has_out {
-                                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                                self.reactor.modify(client.fd, *conn_id, true);
                                 client.epoll_has_out = true;
                             }
                             break;
@@ -1273,7 +1298,7 @@ impl Worker {
                 Transport::Tls(ref tls) => tls.enc_out.is_empty(),
             };
             if is_empty && client.epoll_has_out {
-                epoll_mod(epoll_fd, client.fd, *conn_id, false);
+                self.reactor.modify(client.fd, *conn_id, false);
                 client.epoll_has_out = false;
             }
         }
@@ -1342,7 +1367,6 @@ impl Worker {
         let interval_ms = self.state.ping_interval_ms.load(Ordering::Relaxed);
         let interval = std::time::Duration::from_millis(interval_ms);
         let max_pings = self.state.max_pings_outstanding.load(Ordering::Relaxed);
-        let epoll_fd = self.epoll_fd.as_raw_fd();
         let mut to_remove: Vec<u64> = Vec::new();
 
         for (conn_id, client) in &mut self.conns {
@@ -1362,7 +1386,7 @@ impl Worker {
             client.pings_outstanding += 1;
             client.last_activity = now;
             if !client.epoll_has_out {
-                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                self.reactor.modify(client.fd, *conn_id, true);
                 client.epoll_has_out = true;
             }
         }
@@ -1381,7 +1405,6 @@ impl Worker {
         }
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let now = Instant::now();
-        let epoll_fd = self.epoll_fd.as_raw_fd();
         let mut to_remove: Vec<u64> = Vec::new();
 
         for (conn_id, client) in &mut self.conns {
@@ -1395,7 +1418,7 @@ impl Worker {
                     .write_buf
                     .extend_from_slice(b"-ERR 'Authentication Timeout'\r\n");
                 if !client.epoll_has_out {
-                    epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                    self.reactor.modify(client.fd, *conn_id, true);
                     client.epoll_has_out = true;
                 }
                 to_remove.push(*conn_id);
@@ -1410,14 +1433,13 @@ impl Worker {
 
     /// Broadcast INFO with ldm:true to all active connections.
     fn handle_lame_duck(&mut self, info_line: &[u8]) {
-        let epoll_fd = self.epoll_fd.as_raw_fd();
         for (conn_id, client) in &mut self.conns {
             if !matches!(client.phase, ConnPhase::Active) {
                 continue;
             }
             client.write_buf.extend_from_slice(info_line);
             if !client.epoll_has_out {
-                epoll_mod(epoll_fd, client.fd, *conn_id, true);
+                self.reactor.modify(client.fd, *conn_id, true);
                 client.epoll_has_out = true;
             }
         }
@@ -1480,8 +1502,6 @@ impl Worker {
             return;
         }
 
-        let epoll_fd = self.epoll_fd.as_raw_fd();
-
         let client = match self.conns.get_mut(&conn_id) {
             Some(c) => c,
             None => return,
@@ -1519,9 +1539,16 @@ impl Worker {
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::WouldBlock {
-                    if !client.epoll_has_out {
-                        epoll_mod(epoll_fd, client.fd, conn_id, true);
-                        client.epoll_has_out = true;
+                    // Drop the borrow on `buf`/`client` before calling reactor.modify.
+                    let (fd, has_out) = {
+                        let c = self.conns.get(&conn_id).expect("conn disappeared");
+                        (c.fd, c.epoll_has_out)
+                    };
+                    if !has_out {
+                        self.reactor.modify(fd, conn_id, true);
+                        if let Some(c) = self.conns.get_mut(&conn_id) {
+                            c.epoll_has_out = true;
+                        }
                     }
                     return;
                 }
@@ -1533,14 +1560,26 @@ impl Worker {
             buf.advance(n as usize);
         }
 
-        // All data flushed
-        if client.epoll_has_out {
-            epoll_mod(epoll_fd, client.fd, conn_id, false);
-            client.epoll_has_out = false;
+        // All data flushed — drop borrow before calling reactor.modify
+        let (fd, has_out, is_send_info) = {
+            let c = self.conns.get(&conn_id).expect("conn disappeared");
+            (
+                c.fd,
+                c.epoll_has_out,
+                matches!(c.phase, ConnPhase::SendInfo),
+            )
+        };
+        if has_out {
+            self.reactor.modify(fd, conn_id, false);
+            if let Some(c) = self.conns.get_mut(&conn_id) {
+                c.epoll_has_out = false;
+            }
         }
 
-        if matches!(client.phase, ConnPhase::SendInfo) {
-            client.phase = ConnPhase::WaitConnect;
+        if is_send_info {
+            if let Some(c) = self.conns.get_mut(&conn_id) {
+                c.phase = ConnPhase::WaitConnect;
+            }
         }
     }
 
@@ -1813,57 +1852,71 @@ impl Worker {
 
     /// Encrypt pending write_buf data via TLS and flush encrypted output to socket.
     fn tls_flush_encrypted(&mut self, conn_id: u64) {
-        let epoll_fd = self.epoll_fd.as_raw_fd();
-        let client = match self.conns.get_mut(&conn_id) {
-            Some(c) => c,
-            None => return,
-        };
+        // Tracks whether we need to modify the reactor after the TLS work.
+        // 0 = no change needed, 1 = enable EPOLLOUT, 2 = disable EPOLLOUT.
+        let mut modify_action: u8 = 0;
+        let mut modify_fd: RawFd = -1;
 
-        if let Transport::Tls(ref mut tls) = client.transport {
-            if !client.write_buf.is_empty() {
-                if let Err(e) = tls.tls_conn.writer().write_all(&client.write_buf) {
-                    warn!(conn_id, error = %e, "TLS write error");
-                }
-                client.write_buf.clear();
-            }
+        {
+            let client = match self.conns.get_mut(&conn_id) {
+                Some(c) => c,
+                None => return,
+            };
 
-            loop {
-                let mut tmp = [0u8; 8192];
-                match tls.tls_conn.write_tls(&mut io::Cursor::new(&mut tmp[..])) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        tls.enc_out.extend_from_slice(&tmp[..n]);
+            if let Transport::Tls(ref mut tls) = client.transport {
+                if !client.write_buf.is_empty() {
+                    if let Err(e) = tls.tls_conn.writer().write_all(&client.write_buf) {
+                        warn!(conn_id, error = %e, "TLS write error");
                     }
-                    Err(_) => break,
+                    client.write_buf.clear();
                 }
-            }
 
-            while !tls.enc_out.is_empty() {
-                let n = unsafe {
-                    libc::write(
-                        client.fd,
-                        tls.enc_out.as_ptr() as *const libc::c_void,
-                        tls.enc_out.len(),
-                    )
-                };
-                if n < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        if !client.epoll_has_out {
-                            epoll_mod(epoll_fd, client.fd, conn_id, true);
-                            client.epoll_has_out = true;
+                loop {
+                    let mut tmp = [0u8; 8192];
+                    match tls.tls_conn.write_tls(&mut io::Cursor::new(&mut tmp[..])) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            tls.enc_out.extend_from_slice(&tmp[..n]);
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                while !tls.enc_out.is_empty() {
+                    let n = unsafe {
+                        libc::write(
+                            client.fd,
+                            tls.enc_out.as_ptr() as *const libc::c_void,
+                            tls.enc_out.len(),
+                        )
+                    };
+                    if n < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::WouldBlock {
+                            if !client.epoll_has_out {
+                                modify_fd = client.fd;
+                                modify_action = 1;
+                                client.epoll_has_out = true;
+                            }
+                            break;
                         }
                         return;
                     }
-                    return;
+                    tls.enc_out.advance(n as usize);
                 }
-                tls.enc_out.advance(n as usize);
-            }
 
-            if tls.enc_out.is_empty() && client.epoll_has_out {
-                epoll_mod(epoll_fd, client.fd, conn_id, false);
-                client.epoll_has_out = false;
+                if modify_action == 0 && tls.enc_out.is_empty() && client.epoll_has_out {
+                    modify_fd = client.fd;
+                    modify_action = 2;
+                    client.epoll_has_out = false;
+                }
             }
+        }
+
+        match modify_action {
+            1 => self.reactor.modify(modify_fd, conn_id, true),
+            2 => self.reactor.modify(modify_fd, conn_id, false),
+            _ => {}
         }
     }
 
@@ -2961,22 +3014,6 @@ fn bin_frame_to_route_op(frame: crate::protocol::bin_proto::BinFrame) -> Option<
             subject: frame.subject,
         }),
         BinOp::Ping | BinOp::Pong => None, // handled in-place
-    }
-}
-
-/// Modify epoll registration for a client socket.
-fn epoll_mod(epoll_fd: RawFd, client_fd: RawFd, conn_id: u64, enable_out: bool) {
-    let events = if enable_out {
-        libc::EPOLLIN as u32 | libc::EPOLLOUT as u32
-    } else {
-        libc::EPOLLIN as u32
-    };
-    let mut ev = libc::epoll_event {
-        events,
-        u64: conn_id,
-    };
-    unsafe {
-        libc::epoll_ctl(epoll_fd, libc::EPOLL_CTL_MOD, client_fd, &mut ev);
     }
 }
 

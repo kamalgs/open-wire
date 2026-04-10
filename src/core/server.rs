@@ -155,6 +155,9 @@ pub struct ServerConfig {
     pub accounts: Vec<AccountConfig>,
     /// Port for binary-protocol client connections (`binary-client` feature).
     pub binary_port: Option<u16>,
+    /// Use io_uring reactor instead of epoll (requires `io-uring` feature).
+    #[cfg(feature = "io-uring")]
+    pub use_io_uring: bool,
 }
 
 impl Default for ServerConfig {
@@ -194,6 +197,8 @@ impl Default for ServerConfig {
             accounts: Vec::new(),
 
             binary_port: None,
+            #[cfg(feature = "io-uring")]
+            use_io_uring: false,
         }
     }
 }
@@ -1536,7 +1541,13 @@ impl Server {
         let n = self.config.workers.max(1);
         info!(workers = n, "spawning worker threads");
         (0..n)
-            .map(|i| Worker::spawn(i, Arc::clone(&self.state)))
+            .map(|i| {
+                #[cfg(feature = "io-uring")]
+                if self.config.use_io_uring {
+                    return Worker::spawn_uring(i, Arc::clone(&self.state));
+                }
+                Worker::spawn(i, Arc::clone(&self.state))
+            })
             .collect()
     }
 

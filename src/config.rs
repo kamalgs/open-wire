@@ -34,7 +34,7 @@ Usage: open-wire [--config FILE] [--port PORT] [--host HOST] \
 [--max-payload BYTES] [--max-connections N] \
 [--max-control-line BYTES] [--max-subscriptions N] \
 [--pid-file PATH] [--log-file PATH] [--monitoring-port PORT] \
-[--auth-timeout SECS]";
+[--auth-timeout SECS] [--reactor epoll|uring]";
 
 /// Parse CLI arguments into a [`ServerConfig`].
 ///
@@ -199,6 +199,26 @@ pub fn from_args() -> Result<(ServerConfig, Option<String>), Box<dyn std::error:
                         });
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "io-uring")]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--reactor")? {
+        if v == "uring" || v == "io-uring" || v == "io_uring" {
+            config.use_io_uring = true;
+        } else if v != "epoll" {
+            eprintln!("Unknown reactor type: {v} (expected: epoll or uring)");
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(feature = "io-uring"))]
+    if let Some(v) = args.opt_value_from_str::<_, String>("--reactor")? {
+        if v != "epoll" {
+            eprintln!(
+                "Reactor '{v}' requires the io-uring feature. \
+                 Build with: cargo build --features io-uring"
+            );
+            std::process::exit(1);
         }
     }
 

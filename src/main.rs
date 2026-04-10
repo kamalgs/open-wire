@@ -57,6 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(monitoring_port) = config.monitoring_port {
         info!(monitoring_port, "monitoring port");
     }
+    #[cfg(feature = "io-uring")]
+    if config.use_io_uring {
+        info!("using io_uring reactor");
+    }
 
     let (shutdown, reload) = signals::setup();
     let pid_file = config.pid_file.clone();
