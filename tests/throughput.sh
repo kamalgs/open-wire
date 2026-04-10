@@ -157,13 +157,7 @@ echo ""
 
 # --- Build Rust leaf server ---
 echo "Building open-wire server + bench client (release)..."
-if [[ "$MODE" == "full" ]]; then
-  cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --release --features mesh,gateway,binary-client 2>&1 | tail -1
-else
-  cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --release --features binary-client 2>&1 | tail -1
-fi
+cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --release 2>&1 | tail -1
 RUST_BIN="$REPO_ROOT/target/release/open-wire"
 BENCH_BIN="$REPO_ROOT/target/release/bench"
 echo ""
