@@ -598,6 +598,7 @@ impl<R: Reactor> Worker<R> {
             Arc::clone(&direct_buf),
             Arc::clone(&has_pending),
             Arc::clone(&self.event_fd),
+            self.state.buf_config.max_pending,
         );
 
         let (phase, transport, write_buf) = if is_websocket {
@@ -701,6 +702,7 @@ impl<R: Reactor> Worker<R> {
             Arc::clone(&direct_buf),
             Arc::clone(&has_pending),
             Arc::clone(&self.event_fd),
+            self.state.buf_config.max_pending,
         );
 
         let mut write_buf = BytesMut::with_capacity(4096);
@@ -804,6 +806,7 @@ impl<R: Reactor> Worker<R> {
                 Arc::clone(&direct_buf),
                 Arc::clone(&has_pending),
                 Arc::clone(&self.event_fd),
+                self.state.buf_config.max_pending,
             );
             client.direct_buf = direct_buf;
             client.has_pending = has_pending;
@@ -2211,6 +2214,7 @@ impl<R: Reactor> Worker<R> {
                             Arc::clone(&client.direct_buf),
                             Arc::clone(&client.has_pending),
                             Arc::clone(&self.event_fd),
+                            self.state.buf_config.max_pending,
                         );
                         client.direct_writer = binary_dw;
                     }

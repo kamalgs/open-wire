@@ -153,23 +153,32 @@ pub(crate) struct MsgWriter {
     /// flush_pending), read by publishers before writing.
     /// 0 = clear, 1 = soft (25-75%), 2 = hard (>75%).
     congestion: Arc<AtomicU8>,
+    /// Slow-consumer disconnect threshold for this connection (from BufConfig).
+    /// `backpressure_check` uses `max_pending / 2` as the soft HWM so that
+    /// the proportional sleep always engages before the hard-disconnect limit.
+    max_pending: usize,
 }
 
 impl MsgWriter {
     /// Create a MsgWriter with an externally-owned shared `DirectBuf` (used by worker).
+    ///
+    /// `max_pending` is the slow-consumer disconnect threshold for this connection;
+    /// `backpressure_check` applies a proportional sleep at `max_pending / 2` so the
+    /// soft throttle always engages before the hard-disconnect limit.
     pub(crate) fn new(
         buf: Arc<Mutex<DirectBuf>>,
         has_pending: Arc<AtomicBool>,
         event_fd: Arc<OwnedFd>,
+        max_pending: usize,
     ) -> Self {
         Self {
             buf,
             has_pending,
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
-
             binary: false,
             congestion: Arc::new(AtomicU8::new(0)),
+            max_pending,
         }
     }
 
@@ -183,9 +192,9 @@ impl MsgWriter {
             has_pending,
             event_fd,
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
-
             binary: false,
             congestion: Arc::new(AtomicU8::new(0)),
+            max_pending: 64 * 1024 * 1024,
         }
     }
 
@@ -201,6 +210,7 @@ impl MsgWriter {
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
             binary: true,
             congestion: Arc::new(AtomicU8::new(0)),
+            max_pending: 64 * 1024 * 1024,
         }
     }
 
@@ -217,6 +227,7 @@ impl MsgWriter {
         buf: Arc<Mutex<DirectBuf>>,
         has_pending: Arc<AtomicBool>,
         event_fd: Arc<OwnedFd>,
+        max_pending: usize,
     ) -> Self {
         Self {
             buf,
@@ -225,21 +236,25 @@ impl MsgWriter {
             msg_builder: Arc::new(Mutex::new(MsgBuilder::new())),
             binary: true,
             congestion: Arc::new(AtomicU8::new(0)),
+            max_pending,
         }
     }
 
     /// Proportional backpressure for client/leaf connections: if buffer is above
-    /// the soft HWM, sleep briefly on the caller's thread.
+    /// `max_pending / 2`, sleep briefly on the caller's thread.
+    ///
+    /// The HWM is derived from the configured `max_pending` so that the soft
+    /// throttle always engages at half the hard-disconnect limit, regardless of
+    /// whether `max_pending` is the default 64 MB or a larger benchmark value.
     ///
     /// Route connections use a different mechanism (per-connection read budget via
     /// the `congestion` atomic) so this is only called from `write_msg`/`write_lmsg`.
     #[inline]
     fn backpressure_check(&self) {
-        const HWM: usize = 32 * 1024 * 1024;
-        const MAX: usize = 64 * 1024 * 1024;
+        let hwm = self.max_pending / 2;
         let len = self.buf.lock_or_poison().len();
-        if len > HWM {
-            let congestion = ((len - HWM) as f64 / (MAX - HWM) as f64).min(1.0);
+        if len > hwm {
+            let congestion = ((len - hwm) as f64 / hwm as f64).min(1.0);
             let sleep_us = 1 + (congestion * 500.0) as u64;
             std::thread::sleep(std::time::Duration::from_micros(sleep_us));
         }
