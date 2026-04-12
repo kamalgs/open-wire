@@ -1121,6 +1121,13 @@ pub(crate) struct LeafState {
     pub inbound_writers: std::sync::RwLock<FxHashMap<u64, (MsgWriter, Option<Arc<Permissions>>)>>,
     /// Inbound leaf node authentication configuration.
     pub inbound_auth: LeafAuth,
+    /// Fast flag: true when the upstream hub has expressed interest in at least one subject.
+    /// Allows workers to skip `forward_to_upstream` with a single atomic load when hub has
+    /// no remote subscribers — the common case for gateway-local pub/sub.
+    pub has_remote_interests: AtomicBool,
+    /// Subjects (or wildcard patterns) the upstream hub wants forwarded, from hub LS+/LS- ops.
+    /// Written by the leaf-reader thread; read by worker threads on each publish.
+    pub remote_interests: std::sync::RwLock<rustc_hash::FxHashSet<String>>,
 }
 
 pub(crate) struct ServerState {
@@ -1284,6 +1291,8 @@ impl ServerState {
             port: leafnode_port,
             inbound_writers: std::sync::RwLock::new(FxHashMap::default()),
             inbound_auth: inbound_leaf_auth,
+            has_remote_interests: AtomicBool::new(false),
+            remote_interests: std::sync::RwLock::new(rustc_hash::FxHashSet::default()),
         };
 
         Self {

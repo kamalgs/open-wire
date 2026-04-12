@@ -366,6 +366,8 @@ mod tests {
                 port: None,
                 inbound_writers: std::sync::RwLock::new(FxHashMap::default()),
                 inbound_auth: Default::default(),
+                has_remote_interests: std::sync::atomic::AtomicBool::new(false),
+                remote_interests: std::sync::RwLock::new(rustc_hash::FxHashSet::default()),
             },
             cluster: crate::core::server::ClusterState {
                 route_writers: std::sync::RwLock::new(FxHashMap::default()),

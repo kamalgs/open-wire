@@ -201,6 +201,16 @@ fn connect_and_run(
     state: &Arc<ServerState>,
     pipeline: &InterestPipeline,
 ) -> Result<(mpsc::Sender<UpstreamCmd>, TcpStream), Box<dyn std::error::Error>> {
+    // Clear remote interests from any previous connection; hub will resend LS+ for active subs.
+    {
+        let mut ri = state.leaf.remote_interests.write().expect("remote_interests poisoned");
+        ri.clear();
+    }
+    state
+        .leaf
+        .has_remote_interests
+        .store(false, std::sync::atomic::Ordering::Release);
+
     let parsed = parse_hub_url(hub_url)?;
     let tcp = TcpStream::connect(&parsed.addr)?;
     tcp.set_nodelay(true)?;
@@ -256,7 +266,12 @@ fn connect_and_run(
                 leaf.send_pong()?;
                 leaf.flush()?;
             }
-            Some(LeafOp::LeafSub { .. }) | Some(LeafOp::LeafUnsub { .. }) => {}
+            Some(LeafOp::LeafSub { subject, .. }) => {
+                apply_remote_interest(state, &subject, true);
+            }
+            Some(LeafOp::LeafUnsub { subject, .. }) => {
+                apply_remote_interest(state, &subject, false);
+            }
             Some(LeafOp::Err(msg)) => {
                 return Err(format!("hub error during handshake: {msg}").into());
             }
@@ -564,7 +579,12 @@ fn handle_hub_op(
             let _ = cmd_tx.send(UpstreamCmd::Pong);
         }
         LeafOp::Pong | LeafOp::Ok => {}
-        LeafOp::LeafSub { .. } | LeafOp::LeafUnsub { .. } => {}
+        LeafOp::LeafSub { subject, .. } => {
+            apply_remote_interest(state, &subject, true);
+        }
+        LeafOp::LeafUnsub { subject, .. } => {
+            apply_remote_interest(state, &subject, false);
+        }
         LeafOp::Info(_) => {
             debug!("received updated INFO from hub");
         }
@@ -573,6 +593,38 @@ fn handle_hub_op(
         }
     }
     Ok(())
+}
+
+/// Update the server's remote interest set from a hub LS+/LS- operation.
+///
+/// Called from the leaf-reader thread and from the connection handshake loop.
+/// `subscribe=true` for LS+ (hub wants subject forwarded), `false` for LS-.
+fn apply_remote_interest(state: &ServerState, subject: &bytes::Bytes, subscribe: bool) {
+    use std::sync::atomic::Ordering;
+    let subject_str = match std::str::from_utf8(subject.as_ref()) {
+        Ok(s) => s.to_string(),
+        Err(_) => return,
+    };
+    let mut interests = state
+        .leaf
+        .remote_interests
+        .write()
+        .expect("remote_interests poisoned");
+    if subscribe {
+        interests.insert(subject_str);
+        state
+            .leaf
+            .has_remote_interests
+            .store(true, Ordering::Release);
+    } else {
+        interests.remove(&subject_str);
+        if interests.is_empty() {
+            state
+                .leaf
+                .has_remote_interests
+                .store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Parsed hub URL components.

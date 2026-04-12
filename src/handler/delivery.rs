@@ -455,6 +455,28 @@ pub(crate) fn forward_to_upstream(
     if upstream_txs.is_empty() {
         return;
     }
+
+    // Skip forwarding when hub has expressed no interest in any subject.
+    // This is the common case for gateway-local pub/sub (all subscribers on this node),
+    // eliminating unnecessary mpsc sends and leaf-writer TCP writes to the hub.
+    if !state.leaf.has_remote_interests.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // Hub has remote interests — check if this specific subject matches any of them.
+    {
+        let subject_str = match std::str::from_utf8(subject.as_ref()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let interests = state.leaf.remote_interests.read().expect("remote_interests poisoned");
+        let matches = interests
+            .iter()
+            .any(|pattern| crate::sub_list::subject_matches(pattern, subject_str));
+        if !matches {
+            return;
+        }
+    }
     let mut any_failed = false;
     for tx in upstream_txs.iter() {
         if tx
@@ -803,6 +825,8 @@ mod tests {
                 port: None,
                 inbound_writers: std::sync::RwLock::new(FxHashMap::default()),
                 inbound_auth: Default::default(),
+                has_remote_interests: AtomicBool::new(false),
+                remote_interests: std::sync::RwLock::new(rustc_hash::FxHashSet::default()),
             },
             cluster: crate::core::server::ClusterState {
                 route_writers: std::sync::RwLock::new(FxHashMap::default()),
