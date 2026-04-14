@@ -448,8 +448,29 @@ impl Worker<crate::reactor::IoUringReactor> {
 }
 
 impl<R: Reactor> Worker<R> {
+    /// Read the current thread's CPU time in microseconds via
+    /// CLOCK_THREAD_CPUTIME_ID. Cheap vDSO-backed syscall; used to measure
+    /// per-worker busy time for Prometheus accounting.
+    #[inline]
+    fn thread_cpu_us() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe {
+            libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts);
+        }
+        (ts.tv_sec as u64) * 1_000_000 + (ts.tv_nsec as u64) / 1_000
+    }
+
     fn run(&mut self) {
         let mut events = vec![(0u64, 0u32); 256];
+        // CPU-time accounting: we sample thread CPU time around each epoll
+        // wait cycle and export busy/wait time as Prometheus counters. This
+        // exposes per-worker load directly so we can see if one worker is
+        // saturated while others sit idle.
+        let mut cpu_before_wait = Self::thread_cpu_us();
+        let cpu_counter_busy =
+            counter!("worker_cpu_busy_microseconds_total", "worker" => self.worker_label.clone());
+        let cpu_counter_wait =
+            counter!("worker_cpu_wait_microseconds_total", "worker" => self.worker_label.clone());
 
         // Compute reactor timeout for periodic keepalive and auth timeout checks.
         // Use half the ping interval (capped at 30s) so we check reasonably often.
@@ -489,6 +510,11 @@ impl<R: Reactor> Worker<R> {
                 }
             };
 
+            // CPU time accrued during reactor.wait() is "wait time" — we were
+            // blocked in the kernel, not doing work. Mark the transition.
+            let cpu_after_wait = Self::thread_cpu_us();
+            cpu_counter_wait.increment(cpu_after_wait.saturating_sub(cpu_before_wait));
+
             for &(token, revents) in events.iter().take(n) {
                 if token == EVENT_FD_KEY {
                     self.handle_eventfd();
@@ -518,6 +544,13 @@ impl<R: Reactor> Worker<R> {
                 self.check_pings();
                 self.check_auth_timeout();
             }
+
+            // Everything between cpu_after_wait and now is busy time: handling
+            // events, flushing pending writes, flushing metrics, running
+            // periodic checks. Record and reset.
+            let cpu_after_work = Self::thread_cpu_us();
+            cpu_counter_busy.increment(cpu_after_work.saturating_sub(cpu_after_wait));
+            cpu_before_wait = cpu_after_work;
 
             if self.shutdown {
                 break;
