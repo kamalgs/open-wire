@@ -838,6 +838,7 @@ mod tests {
                     known_urls: std::collections::HashSet::new(),
                 }),
                 connect_tx: std::sync::Mutex::new(None),
+                local_sub_counts: std::sync::RwLock::new(FxHashMap::default()),
             },
             gateway: crate::core::server::GatewayState {
                 writers: std::sync::RwLock::new(FxHashMap::default()),

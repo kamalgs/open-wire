@@ -98,6 +98,15 @@ pub(crate) fn send_existing_subs(
 }
 
 /// Propagate RS+ (`is_sub=true`) or RS- (`is_sub=false`) to all inbound route connections.
+///
+/// Refcounts local subs per (subject, queue): RS+ is only sent to routes on the
+/// first local sub (0→1 transition) and RS- only on the last (1→0). Subsequent
+/// subs to the same subject do not emit wire traffic, matching NATS semantics.
+///
+/// Without this dedup, every client SUB would send a separate RS+, causing the
+/// receiving peer to register N distinct route subscriptions for the same
+/// subject — each PUB on the sending peer then writes N RMSGs, resulting in
+/// N²× over-delivery across the route. This is the mini-cluster binary bug.
 pub(crate) fn propagate_route_interest(
     state: &ServerState,
     subject: &[u8],
@@ -105,6 +114,40 @@ pub(crate) fn propagate_route_interest(
     is_sub: bool,
     #[cfg(feature = "accounts")] account: &[u8],
 ) {
+    // Fast exit: no routes connected. Still track the count so that a later
+    // route connection's initial sync (send_existing_route_subs) reflects
+    // accurate local interest.
+    let key = (
+        bytes::Bytes::copy_from_slice(subject),
+        queue.map(bytes::Bytes::copy_from_slice),
+    );
+    let should_emit = {
+        let mut counts = state.cluster.local_sub_counts.write_or_poison();
+        if is_sub {
+            let c = counts.entry(key).or_insert(0);
+            *c += 1;
+            *c == 1
+        } else {
+            match counts.get_mut(&key) {
+                Some(c) => {
+                    if *c > 0 {
+                        *c -= 1;
+                    }
+                    if *c == 0 {
+                        counts.remove(&key);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            }
+        }
+    };
+    if !should_emit {
+        return;
+    }
+
     let writers = state.cluster.route_writers.read_or_poison();
     if writers.is_empty() {
         return;
@@ -379,6 +422,7 @@ mod tests {
                     known_urls: std::collections::HashSet::new(),
                 }),
                 connect_tx: std::sync::Mutex::new(None),
+                local_sub_counts: std::sync::RwLock::new(FxHashMap::default()),
             },
             gateway: crate::core::server::GatewayState {
                 writers: std::sync::RwLock::new(FxHashMap::default()),

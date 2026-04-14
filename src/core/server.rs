@@ -1074,6 +1074,13 @@ pub(crate) struct ClusterState {
     /// Channel sender for the route coordinator thread. New gossip-discovered URLs
     /// are sent here to trigger outbound connections.
     pub connect_tx: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+    /// Refcount of local subscriptions (clients + leafs) per (subject, queue).
+    /// Used to propagate RS+ only on the first local sub and RS- only on the
+    /// last, matching NATS semantics. Without this, every client SUB would
+    /// send an RS+, causing the receiving route to register N distinct route
+    /// subs for the same subject → N× over-delivery on the return path.
+    pub local_sub_counts:
+        std::sync::RwLock<FxHashMap<(bytes::Bytes, Option<bytes::Bytes>), u64>>,
 }
 
 /// Runtime state for gateway inter-cluster connections.
@@ -1267,6 +1274,7 @@ impl ServerState {
             },
             connect_tx: Mutex::new(None),
             seeds: cluster_seeds,
+            local_sub_counts: std::sync::RwLock::new(FxHashMap::default()),
         };
 
         let gateway = GatewayState {
