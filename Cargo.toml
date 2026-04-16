@@ -17,7 +17,6 @@ accounts = []  # Multi-tenant per-account subject isolation
 io-uring = ["dep:io-uring"]  # io_uring reactor (Linux 5.6+, readiness via POLL_ADD)
 
 [dependencies]
-crossbeam-channel = "0.5"
 bytes = "1.4.0"
 libc = "0.2"
 memchr = "2.4"

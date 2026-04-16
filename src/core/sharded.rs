@@ -72,10 +72,10 @@ impl ShardedServer {
         info!(shards = n, "starting sharded server");
 
         // Create per-shard inbox channels.
-        let mut senders: Vec<crossbeam_channel::Sender<crate::handler::ShardMsg>> = Vec::with_capacity(n);
-        let mut receivers: Vec<Option<crossbeam_channel::Receiver<crate::handler::ShardMsg>>> = Vec::with_capacity(n);
+        let mut senders: Vec<mpsc::Sender<crate::handler::ShardMsg>> = Vec::with_capacity(n);
+        let mut receivers: Vec<Option<mpsc::Receiver<crate::handler::ShardMsg>>> = Vec::with_capacity(n);
         for _ in 0..n {
-            let (tx, rx) = crossbeam_channel::bounded(65536);
+            let (tx, rx) = mpsc::channel();
             senders.push(tx);
             receivers.push(Some(rx));
         }

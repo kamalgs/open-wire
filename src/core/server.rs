@@ -1202,7 +1202,7 @@ pub(crate) struct ServerState {
 
     /// Slot for the shard inbox receiver. The worker takes it once on
     /// its first eventfd wake. Only used in sharded mode.
-    pub shard_inbox_slot: std::sync::Mutex<Option<crossbeam_channel::Receiver<crate::handler::ShardMsg>>>,
+    pub shard_inbox_slot: std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::handler::ShardMsg>>>,
 }
 
 /// In-process cross-shard dispatch channels, set by ShardedServer.
@@ -1212,7 +1212,7 @@ pub struct ShardDispatch {
     pub shard_index: usize,
     /// Per-shard inbox senders. Index matches the bit position in
     /// WorkerInterest masks.
-    pub inboxes: Vec<crossbeam_channel::Sender<crate::handler::ShardMsg>>,
+    pub inboxes: Vec<std::sync::mpsc::Sender<crate::handler::ShardMsg>>,
     /// Per-shard worker eventfds for waking the target worker after
     /// pushing to its inbox. Same indexing.
     pub eventfds: Vec<std::sync::Arc<std::os::fd::OwnedFd>>,
