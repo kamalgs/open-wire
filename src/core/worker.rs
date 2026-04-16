@@ -214,7 +214,7 @@ pub(crate) struct Worker<R: Reactor> {
     worker_index: usize,
     /// Cross-shard inbox receiver. When set, the worker drains this on
     /// every eventfd wake and delivers received messages to its local subs.
-    shard_inbox: Option<std::sync::mpsc::Receiver<crate::handler::ShardMsg>>,
+    shard_inbox: Option<crossbeam_channel::Receiver<crate::handler::ShardMsg>>,
 }
 
 // --- Connection state machine ---

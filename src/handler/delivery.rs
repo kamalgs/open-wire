@@ -241,7 +241,7 @@ impl MessageDeliveryHub<'_> {
                     let i = m.trailing_zeros() as usize;
                     m &= m - 1;
                     if let Some(tx) = shard_ctx.inboxes.get(i) {
-                        let _ = tx.send(owned.clone());
+                        let _ = tx.try_send(owned.clone());
                     }
                     if let Some(fd) = shard_ctx.eventfds.get(i) {
                         self.queue_notify(fd.as_raw_fd());
