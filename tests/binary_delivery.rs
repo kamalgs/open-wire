@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use open_wire::core::sharded::ShardedServer;
-use open_wire::{Server, ServerConfig};
+use open_wire::{ClusterConfig, Server, ServerConfig};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -235,6 +235,136 @@ fn spawn_sharded(n_shards: usize) -> (u16, u16) {
     (port, binary_port)
 }
 
+/// Spawn a mesh pair: two sharded servers with cluster ports, B has A as a seed.
+/// Returns (a_port, a_binary_port, b_port, b_binary_port).
+fn spawn_mesh_pair(shards_per_hub: usize) -> (u16, u16, u16, u16) {
+    let a_port = free_port();
+    let a_binary = free_port();
+    let a_cluster = free_port();
+    let b_port = free_port();
+    let b_binary = free_port();
+    let b_cluster = free_port();
+
+    let cluster_name = format!("test-mesh-{}", a_port);
+
+    let a_cfg = ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: a_port,
+        binary_port: Some(a_binary),
+        workers: 1,
+        server_name: format!("mesh-a-{}", a_port),
+        cluster: ClusterConfig {
+            port: Some(a_cluster),
+            name: Some(cluster_name.clone()),
+            seeds: vec![], // A is the seed — no outbound
+        },
+        ..Default::default()
+    };
+    let b_cfg = ServerConfig {
+        host: "127.0.0.1".to_string(),
+        port: b_port,
+        binary_port: Some(b_binary),
+        workers: 1,
+        server_name: format!("mesh-b-{}", b_port),
+        cluster: ClusterConfig {
+            port: Some(b_cluster),
+            name: Some(cluster_name),
+            seeds: vec![format!("127.0.0.1:{}", a_cluster)], // B connects to A
+        },
+        ..Default::default()
+    };
+
+    std::thread::spawn(move || {
+        let sharded = ShardedServer::new(a_cfg, shards_per_hub);
+        let _ = sharded.run();
+    });
+    wait_for_port(a_port);
+    wait_for_port(a_binary);
+    wait_for_port(a_cluster);
+    // Give A a moment before B tries to connect.
+    std::thread::sleep(Duration::from_millis(300));
+
+    std::thread::spawn(move || {
+        let sharded = ShardedServer::new(b_cfg, shards_per_hub);
+        let _ = sharded.run();
+    });
+    wait_for_port(b_port);
+    wait_for_port(b_binary);
+    wait_for_port(b_cluster);
+    // Mesh handshake takes a moment to complete.
+    std::thread::sleep(Duration::from_millis(1000));
+
+    (a_port, a_binary, b_port, b_binary)
+}
+
+/// Mesh pair, 2 shards each. Sub on A, pub on B. Cross-hub, single
+/// delivery expected via mesh route.
+#[tokio::test]
+async fn binary_sub_mesh_2hub_cross_hub() {
+    init_tracing();
+    let (a_port, a_binary, b_port, _b_binary) = spawn_mesh_pair(2);
+
+    let mut sub = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+    sub.write_all(&sub_frame(b"test.sub", 1)).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let nats = async_nats::connect(format!("127.0.0.1:{}", b_port))
+        .await
+        .unwrap();
+    nats.publish("test.sub", "hello".into()).await.unwrap();
+    nats.flush().await.unwrap();
+    let _ = a_port; // silence unused
+
+    let count = count_msg_frames(&mut sub, Duration::from_secs(1));
+    assert_eq!(count, 1, "mesh cross-hub: got {} msg frames, expected 1", count);
+}
+
+/// Mesh pair, 2 shards each. Sub on A, pub ALSO on A (same hub). This
+/// is the bench's main scenario — all traffic on the same hub, mesh is
+/// present but shouldn't cause double-delivery.
+#[tokio::test]
+async fn binary_sub_mesh_2hub_same_hub_pub() {
+    init_tracing();
+    let (a_port, a_binary, _b_port, _b_binary) = spawn_mesh_pair(2);
+
+    let mut sub = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+    sub.write_all(&sub_frame(b"test.sub", 1)).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let nats = async_nats::connect(format!("127.0.0.1:{}", a_port))
+        .await
+        .unwrap();
+    nats.publish("test.sub", "hello".into()).await.unwrap();
+    nats.flush().await.unwrap();
+
+    let count = count_msg_frames(&mut sub, Duration::from_secs(1));
+    assert_eq!(count, 1, "mesh same-hub: got {} msg frames, expected 1", count);
+}
+
+/// Mesh pair, pub on A burst. Sub on A. Checks no double-delivery at
+/// scale.
+#[tokio::test]
+async fn binary_sub_mesh_2hub_same_hub_burst() {
+    init_tracing();
+    let (a_port, a_binary, _b_port, _b_binary) = spawn_mesh_pair(2);
+
+    let mut sub = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+    sub.write_all(&sub_frame(b"test.sub", 1)).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let nats = async_nats::connect(format!("127.0.0.1:{}", a_port))
+        .await
+        .unwrap();
+    const N: usize = 50;
+    for _ in 0..N {
+        nats.publish("test.sub", "x".into()).await.unwrap();
+    }
+    nats.flush().await.unwrap();
+
+    let count = count_msg_frames(&mut sub, Duration::from_secs(1));
+    assert_eq!(count, N, "mesh same-hub burst: got {}, expected {}", count, N);
+}
+
 /// ShardedServer with 2 shards. This matches the bench's `OW_SHARDS=2`
 /// configuration. If double-delivery is a shard-dispatch bug, this
 /// test should fail (count == 2).
@@ -368,6 +498,89 @@ async fn binary_client_sharded_2_burst() {
         "sharded(2) burst: binary sub received {} msg frames, expected exactly {}",
         count, N
     );
+}
+
+/// Binary sub subscribes to a WILDCARD. NATS pub sends a single exact
+/// message on a matching subject. With shard broadcast-when-no-exact-match,
+/// the fear is that multiple shards each walk their SubList, each finding
+/// the wildcard sub, leading to N deliveries.
+#[tokio::test]
+async fn binary_wildcard_sub_sharded_2_no_dup() {
+    init_tracing();
+    let (port, binary_port) = spawn_sharded(2);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut sub = TcpStream::connect(("127.0.0.1", binary_port)).unwrap();
+    sub.write_all(&sub_frame(b"test.>", 1)).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let nats = async_nats::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+    nats.publish("test.sub", "hello".into()).await.unwrap();
+    nats.flush().await.unwrap();
+
+    let count = count_msg_frames(&mut sub, Duration::from_millis(500));
+    assert_eq!(
+        count, 1,
+        "wildcard sub on sharded(2): got {} msg frames, expected exactly 1",
+        count
+    );
+}
+
+/// Binary wildcard sub + burst publish. Any per-message double-delivery
+/// shows up clearly as count == 2*N.
+#[tokio::test]
+async fn binary_wildcard_sub_sharded_2_burst() {
+    init_tracing();
+    let (port, binary_port) = spawn_sharded(2);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut sub = TcpStream::connect(("127.0.0.1", binary_port)).unwrap();
+    sub.write_all(&sub_frame(b"test.>", 1)).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let nats = async_nats::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+    const N: usize = 50;
+    for i in 0..N {
+        nats.publish(format!("test.sub.{}", i), "x".into()).await.unwrap();
+    }
+    nats.flush().await.unwrap();
+
+    let count = count_msg_frames(&mut sub, Duration::from_millis(750));
+    assert_eq!(
+        count, N,
+        "wildcard sub burst sharded(2): got {} msg frames, expected exactly {}",
+        count, N
+    );
+}
+
+/// TWO binary subs for the same exact subject on sharded. One message
+/// should produce exactly 2 deliveries (one per sub), not 4 or more.
+#[tokio::test]
+async fn binary_two_subs_same_subject_sharded_2() {
+    init_tracing();
+    let (port, binary_port) = spawn_sharded(2);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut sub_a = TcpStream::connect(("127.0.0.1", binary_port)).unwrap();
+    sub_a.write_all(&sub_frame(b"test.sub", 1)).unwrap();
+    let mut sub_b = TcpStream::connect(("127.0.0.1", binary_port)).unwrap();
+    sub_b.write_all(&sub_frame(b"test.sub", 1)).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let nats = async_nats::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+    nats.publish("test.sub", "hello".into()).await.unwrap();
+    nats.flush().await.unwrap();
+
+    let count_a = count_msg_frames(&mut sub_a, Duration::from_millis(500));
+    let count_b = count_msg_frames(&mut sub_b, Duration::from_millis(500));
+    assert_eq!(count_a, 1, "sub_a: got {}, expected 1", count_a);
+    assert_eq!(count_b, 1, "sub_b: got {}, expected 1", count_b);
 }
 
 /// Like `binary_client_multi_worker_no_dup` but publishes many messages
