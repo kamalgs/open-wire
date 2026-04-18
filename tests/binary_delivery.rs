@@ -356,6 +356,105 @@ async fn binary_3hub_mesh_sharded_binary_pub_no_dup() {
     );
 }
 
+/// Variant of `spawn_mesh_triple` that returns the `Arc<ShardedServer>`
+/// handle for each hub so tests can call introspection methods like
+/// `route_peer_count()` after the mesh has formed.
+fn spawn_mesh_triple_with_handles(shards_per_hub: usize) -> Vec<Arc<ShardedServer>> {
+    let cluster_name = format!("test-mesh3h-{}", free_port());
+    let mut hubs: Vec<(u16, u16, u16)> = Vec::with_capacity(3);
+    for _ in 0..3 {
+        hubs.push((free_port(), free_port(), free_port()));
+    }
+    let seed_cluster = hubs[0].2;
+    let mut handles: Vec<Arc<ShardedServer>> = Vec::with_capacity(3);
+    for (i, (port, binary_port, cluster_port)) in hubs.iter().copied().enumerate() {
+        let cn = cluster_name.clone();
+        let seeds = if i == 0 {
+            vec![]
+        } else {
+            vec![format!("127.0.0.1:{}", seed_cluster)]
+        };
+        let cfg = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            binary_port: Some(binary_port),
+            workers: 1,
+            server_name: format!("mesh3h-{}-{}", i, port),
+            cluster: ClusterConfig {
+                port: Some(cluster_port),
+                name: Some(cn),
+                seeds,
+            },
+            ..Default::default()
+        };
+        let sharded = Arc::new(ShardedServer::new(cfg, shards_per_hub));
+        let s = Arc::clone(&sharded);
+        std::thread::spawn(move || {
+            let _ = s.run();
+        });
+        wait_for_port(port);
+        wait_for_port(binary_port);
+        wait_for_port(cluster_port);
+        std::thread::sleep(Duration::from_millis(300));
+        handles.push(sharded);
+    }
+    // Mesh handshake takes a moment to settle (gossip-discovered peers).
+    std::thread::sleep(Duration::from_millis(2000));
+    handles
+}
+
+/// REGRESSION GUARD for fix/sharded-mesh-route-dedup (PR #59).
+///
+/// Each hub in a 3-hub full mesh must converge to exactly 2 unique route
+/// peers. Before the fix each shard generated its own random `server_id`,
+/// so dedup-by-server_id let multiple route conns survive per peer-pair
+/// (one conn per (local-shard, remote-shard) combo). Recurrence of any
+/// duplicate-route-conn bug — same root cause or different — should make
+/// this assertion fail.
+#[tokio::test]
+async fn mesh_3hub_sharded_one_route_conn_per_peer() {
+    init_tracing();
+    let hubs = spawn_mesh_triple_with_handles(2);
+    for (i, hub) in hubs.iter().enumerate() {
+        let count = hub.route_peer_count();
+        assert_eq!(
+            count, 2,
+            "hub {i}: expected exactly 2 route peers (full 3-hub mesh), got {count}",
+        );
+    }
+}
+
+/// Same assertion, sharded(4) — exercises a higher shard count where the
+/// pre-fix bug amplified to up to 4×4 = 16 conns per peer-pair.
+#[tokio::test]
+async fn mesh_3hub_sharded4_one_route_conn_per_peer() {
+    init_tracing();
+    let hubs = spawn_mesh_triple_with_handles(4);
+    for (i, hub) in hubs.iter().enumerate() {
+        let count = hub.route_peer_count();
+        assert_eq!(
+            count, 2,
+            "hub {i}: expected exactly 2 route peers (full 3-hub mesh, 4 shards), got {count}",
+        );
+    }
+}
+
+/// Single-shard control. Should also be exactly 2 peers per hub. Pre-fix
+/// this PASSED (random server_id matters only when N>1 shards), so seeing
+/// it stay green confirms the fix didn't regress the unsharded case.
+#[tokio::test]
+async fn mesh_3hub_unsharded_one_route_conn_per_peer() {
+    init_tracing();
+    let hubs = spawn_mesh_triple_with_handles(1);
+    for (i, hub) in hubs.iter().enumerate() {
+        let count = hub.route_peer_count();
+        assert_eq!(
+            count, 2,
+            "hub {i}: expected exactly 2 route peers (full 3-hub mesh, unsharded), got {count}",
+        );
+    }
+}
+
 /// 3-hub mesh, sharded(2). N binary subs spread across hub-A and hub-C.
 /// Two binary publishers — one on hub-A, one on hub-B — publish DISJOINT
 /// subjects. Verifies sub-side per-subject seqs are monotonic (no dup).

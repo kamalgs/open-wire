@@ -88,6 +88,21 @@ impl ShardedServer {
         }
     }
 
+    /// Number of mesh route peers currently connected, deduped by `server_id`.
+    /// Reads the shared `route_peers` map (held on shard 0's cluster state) so
+    /// the count reflects the cluster-wide unique-peer view, not per-shard
+    /// route conn counts. Intended for tests + observability — a healthy full
+    /// mesh has `route_peer_count() == hub_count - 1` on every node.
+    pub fn route_peer_count(&self) -> usize {
+        self.shards[0]
+            .state()
+            .cluster_state()
+            .route_peers
+            .lock()
+            .map(|p| p.connected.len())
+            .unwrap_or(0)
+    }
+
     /// Start all shards + one external accept loop. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         let n = self.shards.len();

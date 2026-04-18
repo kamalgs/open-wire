@@ -1750,6 +1750,12 @@ impl Server {
         workers[idx].send_binary_conn(cid, tcp_stream, addr);
     }
 
+    /// Crate-internal accessor so `ShardedServer` can introspect a shard's
+    /// state without forcing `state` to be public on the Server struct.
+    pub(crate) fn state(&self) -> &Arc<ServerState> {
+        &self.state
+    }
+
     /// Run the leaf server. Listens for connections and optionally
     /// connects to the upstream hub. Blocks forever.
     pub fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
