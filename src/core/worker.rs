@@ -2064,9 +2064,18 @@ impl<R: Reactor> Worker<R> {
                         (ConnPhase::Active | ConnPhase::Draining, ConnKind::Client)
                     ) && {
                         let has_gw = self.state.gateway.has_interest.load(Ordering::Acquire);
+                        // In sharded mode, OTHER shards may have subs even
+                        // when this shard's has_subs is false. The fast-skip
+                        // path drops the PUB entirely (never calls publish()),
+                        // which would bypass shard_dispatch. Disable the skip
+                        // whenever shard_dispatch is wired — the per-subject
+                        // interest check in publish() is fast enough that we
+                        // lose little by always dispatching.
+                        let sharded = self.state.shard_dispatch.get().is_some();
                         c.upstream_txs.is_empty()
                             && !self.state.has_subs.load(Ordering::Acquire)
                             && !has_gw
+                            && !sharded
                     };
                     (phase, kind, can_skip)
                 }
