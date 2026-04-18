@@ -121,6 +121,20 @@ fn sub_frame(subject: &[u8], sid: u32) -> Vec<u8> {
     out
 }
 
+/// Binary MSG (PUB) frame.
+fn msg_frame(subject: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + subject.len() + payload.len());
+    out.extend_from_slice(&encode_header(
+        0x03,
+        subject.len() as u16,
+        0,
+        payload.len() as u32,
+    ));
+    out.extend_from_slice(subject);
+    out.extend_from_slice(payload);
+    out
+}
+
 /// Read Msg/HMsg frames from `stream` until `timeout` elapses with no
 /// new frame arriving. Returns the count of 0x03/0x04 frames seen.
 fn count_msg_frames(stream: &mut TcpStream, quiet_timeout: Duration) -> usize {
@@ -240,6 +254,424 @@ fn spawn_sharded(n_shards: usize) -> (u16, u16) {
 
 /// Spawn a mesh pair: two sharded servers with cluster ports, B has A as a seed.
 /// Returns (a_port, a_binary_port, b_port, b_binary_port).
+/// 3-hub full mesh, sharded. Returns (a, b, c) tuples of (port, binary_port).
+/// All three hubs peer with the seed (A). After spawn, mesh handshake settled.
+fn spawn_mesh_triple(shards_per_hub: usize) -> [(u16, u16); 3] {
+    let cluster_name = format!("test-mesh3-{}", free_port());
+    let mut hubs: Vec<(u16, u16, u16)> = Vec::with_capacity(3);
+    for _ in 0..3 {
+        hubs.push((free_port(), free_port(), free_port()));
+    }
+    let seed_cluster = hubs[0].2;
+    for (i, (port, binary_port, cluster_port)) in hubs.iter().copied().enumerate() {
+        let cn = cluster_name.clone();
+        let seeds = if i == 0 {
+            vec![]
+        } else {
+            vec![format!("127.0.0.1:{}", seed_cluster)]
+        };
+        let cfg = ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            binary_port: Some(binary_port),
+            workers: 1,
+            server_name: format!("mesh3-{}-{}", i, port),
+            cluster: ClusterConfig {
+                port: Some(cluster_port),
+                name: Some(cn),
+                seeds,
+            },
+            ..Default::default()
+        };
+        std::thread::spawn(move || {
+            let sharded = ShardedServer::new(cfg, shards_per_hub);
+            let _ = sharded.run();
+        });
+        wait_for_port(port);
+        wait_for_port(binary_port);
+        wait_for_port(cluster_port);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    // Mesh handshake takes a moment to fully settle.
+    std::thread::sleep(Duration::from_millis(1500));
+    [
+        (hubs[0].0, hubs[0].1),
+        (hubs[1].0, hubs[1].1),
+        (hubs[2].0, hubs[2].1),
+    ]
+}
+
+/// 3-hub mesh, sharded(2). Binary PUB on hub-A, many binary subs on hub-B
+/// across multiple subjects. Mirrors the bench: pub-side and sub-side both
+/// use the binary protocol. Asserts each (sub, subject) pair receives exactly
+/// the expected count — no dup, no loss.
+#[tokio::test]
+async fn binary_3hub_mesh_sharded_binary_pub_no_dup() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(2);
+    let (_a_port, a_binary) = hubs[0];
+    let (_b_port, b_binary) = hubs[1];
+
+    const N_SUBS: usize = 16;
+    const N_SUBJECTS: usize = 4;
+    const N_PUBS_PER_SUBJ: usize = 50;
+
+    // Each sub on hub-B subscribes to ALL subjects (so each sub should get
+    // N_SUBJECTS * N_PUBS_PER_SUBJ messages total).
+    let subjects: Vec<String> = (0..N_SUBJECTS).map(|i| format!("evt.{i}")).collect();
+    let mut subs: Vec<TcpStream> = Vec::with_capacity(N_SUBS);
+    for i in 0..N_SUBS {
+        let mut s = TcpStream::connect(("127.0.0.1", b_binary)).unwrap();
+        for (j, subj) in subjects.iter().enumerate() {
+            let sid = ((i * N_SUBJECTS) + j + 1) as u32;
+            s.write_all(&sub_frame(subj.as_bytes(), sid)).unwrap();
+        }
+        subs.push(s);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Binary publisher on hub-A.
+    let mut pub_conn = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+    for subj in &subjects {
+        for _ in 0..N_PUBS_PER_SUBJ {
+            pub_conn
+                .write_all(&msg_frame(subj.as_bytes(), b"x"))
+                .unwrap();
+        }
+    }
+    pub_conn.flush().unwrap();
+
+    let expected = N_SUBJECTS * N_PUBS_PER_SUBJ;
+    let mut failures = Vec::new();
+    for (i, mut s) in subs.into_iter().enumerate() {
+        let count = count_msg_frames(&mut s, Duration::from_secs(2));
+        if count != expected {
+            failures.push(format!("sub#{i}: got {count}, expected {expected}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "3hub mesh sharded(2) binary-pub delivered wrong counts:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// 3-hub mesh, sharded(2). N binary subs spread across hub-A and hub-C.
+/// Two binary publishers — one on hub-A, one on hub-B — publish DISJOINT
+/// subjects. Verifies sub-side per-subject seqs are monotonic (no dup).
+/// Mirrors bench topology where pub processes on different hubs publish
+/// disjoint symbol shards.
+#[tokio::test]
+async fn binary_3hub_mesh_sharded_two_pubs_disjoint_subjects() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(2);
+    let (_a_port, a_binary) = hubs[0];
+    let (_b_port, b_binary) = hubs[1];
+    let (_c_port, c_binary) = hubs[2];
+
+    const N_SUBS: usize = 32;
+    const N_PUBS: usize = 200;
+
+    // Subs spread: half on hub-A, half on hub-C. Each subscribes to BOTH
+    // subjects ("evt.0" published on hub-A, "evt.1" on hub-B).
+    let mut subs: Vec<TcpStream> = Vec::with_capacity(N_SUBS);
+    for i in 0..N_SUBS {
+        let port = if i % 2 == 0 { a_binary } else { c_binary };
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(&sub_frame(b"evt.0", (i * 2 + 1) as u32))
+            .unwrap();
+        s.write_all(&sub_frame(b"evt.1", (i * 2 + 2) as u32))
+            .unwrap();
+        subs.push(s);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Two binary pub conns publishing disjoint subjects.
+    std::thread::spawn(move || {
+        let mut p = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+        for _ in 0..N_PUBS {
+            p.write_all(&msg_frame(b"evt.0", b"x")).unwrap();
+        }
+        p.flush().unwrap();
+    });
+    std::thread::spawn(move || {
+        let mut p = TcpStream::connect(("127.0.0.1", b_binary)).unwrap();
+        for _ in 0..N_PUBS {
+            p.write_all(&msg_frame(b"evt.1", b"x")).unwrap();
+        }
+        p.flush().unwrap();
+    });
+
+    let expected = N_PUBS * 2;
+    let mut failures = Vec::new();
+    for (i, mut s) in subs.into_iter().enumerate() {
+        let count = count_msg_frames(&mut s, Duration::from_secs(2));
+        if count != expected {
+            failures.push(format!("sub#{i}: got {count}, expected {expected}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "3hub mesh sharded(2) two-pubs-disjoint delivered wrong counts:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// 3-hub mesh, NON-sharded (1 worker per hub). Same scenario as the
+/// sharded variant. If this passes but the sharded variant fails, the
+/// duplication is shard-related.
+#[tokio::test]
+async fn binary_3hub_mesh_unsharded_two_pubs_one_sub_c() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(1);
+    let (_a_port, a_binary) = hubs[0];
+    let (_b_port, b_binary) = hubs[1];
+    let (_c_port, c_binary) = hubs[2];
+
+    let mut sub = TcpStream::connect(("127.0.0.1", c_binary)).unwrap();
+    sub.write_all(&sub_frame(b"evt.0", 1)).unwrap();
+    sub.write_all(&sub_frame(b"evt.1", 2)).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    const N: usize = 100;
+    std::thread::spawn(move || {
+        let mut p = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+        for _ in 0..N {
+            p.write_all(&msg_frame(b"evt.0", b"x")).unwrap();
+        }
+        p.flush().unwrap();
+    });
+    std::thread::spawn(move || {
+        let mut p = TcpStream::connect(("127.0.0.1", b_binary)).unwrap();
+        for _ in 0..N {
+            p.write_all(&msg_frame(b"evt.1", b"x")).unwrap();
+        }
+        p.flush().unwrap();
+    });
+
+    let total = count_msg_frames(&mut sub, Duration::from_secs(2));
+    assert_eq!(
+        total,
+        N * 2,
+        "unsharded 3hub: got {total}, expected {}",
+        N * 2
+    );
+}
+
+/// 3-hub sharded mesh. Two pubs on different hubs, ONE sub on hub-C
+/// listening to BOTH subjects. Counts per-subject deliveries.
+#[tokio::test]
+async fn binary_3hub_mesh_sharded_two_pubs_one_sub_c() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(2);
+    let (_a_port, a_binary) = hubs[0];
+    let (_b_port, b_binary) = hubs[1];
+    let (_c_port, c_binary) = hubs[2];
+
+    let mut sub = TcpStream::connect(("127.0.0.1", c_binary)).unwrap();
+    sub.write_all(&sub_frame(b"evt.0", 1)).unwrap();
+    sub.write_all(&sub_frame(b"evt.1", 2)).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    const N: usize = 100;
+    std::thread::spawn(move || {
+        let mut p = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+        for _ in 0..N {
+            p.write_all(&msg_frame(b"evt.0", b"x")).unwrap();
+        }
+        p.flush().unwrap();
+    });
+    std::thread::spawn(move || {
+        let mut p = TcpStream::connect(("127.0.0.1", b_binary)).unwrap();
+        for _ in 0..N {
+            p.write_all(&msg_frame(b"evt.1", b"x")).unwrap();
+        }
+        p.flush().unwrap();
+    });
+
+    // Count per-subject by reading SID from message frames.
+    sub.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let mut by_sid: std::collections::HashMap<u32, usize> = Default::default();
+    let mut hdr = [0u8; 9];
+    let mut buf = vec![0u8; 4096];
+    let mut last_rx = Instant::now();
+    loop {
+        match sub.read_exact(&mut hdr) {
+            Ok(()) => {
+                last_rx = Instant::now();
+                let sl = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
+                let rl = u16::from_le_bytes([hdr[3], hdr[4]]) as usize;
+                let pl = u32::from_le_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) as usize;
+                let body = sl + rl + pl;
+                if body > buf.len() {
+                    buf.resize(body + 256, 0);
+                }
+                if body > 0 {
+                    sub.read_exact(&mut buf[..body]).unwrap();
+                }
+                if hdr[0] == 0x03 {
+                    let subj = std::str::from_utf8(&buf[..sl]).unwrap();
+                    let sid = if subj == "evt.0" { 1 } else { 2 };
+                    *by_sid.entry(sid).or_insert(0) += 1;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if last_rx.elapsed() > Duration::from_secs(2) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    println!("counts: {:?}", by_sid);
+    assert_eq!(by_sid.get(&1).copied().unwrap_or(0), N, "evt.0");
+    assert_eq!(by_sid.get(&2).copied().unwrap_or(0), N, "evt.1");
+}
+
+/// 3-hub sharded mesh, single pub on B, single sub on C subscribed to ONE
+/// subject. If THIS dups, the bug isn't multi-subject related.
+#[tokio::test]
+async fn binary_3hub_mesh_sharded_pub_b_sub_c_single_subj() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(2);
+    let (_b_port, b_binary) = hubs[1];
+    let (_c_port, c_binary) = hubs[2];
+
+    let mut sub = TcpStream::connect(("127.0.0.1", c_binary)).unwrap();
+    sub.write_all(&sub_frame(b"only", 1)).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    const N: usize = 100;
+    let mut p = TcpStream::connect(("127.0.0.1", b_binary)).unwrap();
+    for _ in 0..N {
+        p.write_all(&msg_frame(b"only", b"x")).unwrap();
+    }
+    p.flush().unwrap();
+
+    let count = count_msg_frames(&mut sub, Duration::from_secs(2));
+    assert_eq!(
+        count, N,
+        "pub-on-B → sub-on-C single-subj: got {count}, expected {N}"
+    );
+}
+
+/// 3-hub sharded mesh: enumerate every (pub-hub, sub-hub) directional pair
+/// and assert single delivery per published message. Any 2x (or higher)
+/// reading reveals which path duplicates.
+#[tokio::test]
+async fn binary_3hub_mesh_sharded_directional_matrix() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(2);
+    let labels = ["A", "B", "C"];
+    const N: usize = 30;
+
+    let mut failures = Vec::new();
+    for sub_idx in 0..3 {
+        for pub_idx in 0..3 {
+            let (_p_port, p_binary) = hubs[pub_idx];
+            let (_s_port, s_binary) = hubs[sub_idx];
+            let subj = format!("e.{}.{}", labels[pub_idx], labels[sub_idx]);
+
+            let mut sub = TcpStream::connect(("127.0.0.1", s_binary)).unwrap();
+            sub.write_all(&sub_frame(subj.as_bytes(), 1)).unwrap();
+            // Allow RS+ to propagate across the mesh.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+
+            let mut p = TcpStream::connect(("127.0.0.1", p_binary)).unwrap();
+            for _ in 0..N {
+                p.write_all(&msg_frame(subj.as_bytes(), b"x")).unwrap();
+            }
+            p.flush().unwrap();
+
+            let count = count_msg_frames(&mut sub, Duration::from_millis(800));
+            if count != N {
+                failures.push(format!(
+                    "pub={} sub={} subj={}: got {count}, expected {N}",
+                    labels[pub_idx], labels[sub_idx], subj
+                ));
+            }
+            drop(sub);
+            drop(p);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "directional matrix has duplicates:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Isolate: 3-hub sharded mesh. Single pub on hub-A, single sub on hub-C.
+/// hub-B is the "transit" peer (no subs, no pub) — it should NOT cause dups.
+#[tokio::test]
+async fn binary_3hub_mesh_sharded_pub_a_sub_c() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(2);
+    let (_a_port, a_binary) = hubs[0];
+    let (_c_port, c_binary) = hubs[2];
+
+    let mut sub = TcpStream::connect(("127.0.0.1", c_binary)).unwrap();
+    sub.write_all(&sub_frame(b"evt", 1)).unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut p = TcpStream::connect(("127.0.0.1", a_binary)).unwrap();
+    const N: usize = 100;
+    for _ in 0..N {
+        p.write_all(&msg_frame(b"evt", b"x")).unwrap();
+    }
+    p.flush().unwrap();
+
+    let count = count_msg_frames(&mut sub, Duration::from_secs(2));
+    assert_eq!(count, N, "pub-on-A → sub-on-C: got {count}, expected {N}");
+}
+
+/// 3-hub mesh, sharded(2). N binary subs concentrated on hub-B; pub on hub-A.
+/// This mirrors the bench topology (4000 binary subs on one hub, pub on another,
+/// 3 hubs in mesh). Asserts each sub receives EXACTLY N messages — no dup.
+#[tokio::test]
+async fn binary_3hub_mesh_sharded_no_dup() {
+    init_tracing();
+    let hubs = spawn_mesh_triple(2);
+    let (a_port, _a_binary) = hubs[0];
+    let (_b_port, b_binary) = hubs[1];
+
+    const N_SUBS: usize = 8;
+    const N_PUBS: usize = 100;
+
+    // 8 binary subs on hub-B all listening to "trade.evt".
+    let mut subs: Vec<TcpStream> = Vec::with_capacity(N_SUBS);
+    for i in 0..N_SUBS {
+        let mut s = TcpStream::connect(("127.0.0.1", b_binary)).unwrap();
+        s.write_all(&sub_frame(b"trade.evt", (i + 1) as u32))
+            .unwrap();
+        subs.push(s);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Publish via NATS on hub-A.
+    let nats = async_nats::connect(format!("127.0.0.1:{}", a_port))
+        .await
+        .unwrap();
+    for _ in 0..N_PUBS {
+        nats.publish("trade.evt", "x".into()).await.unwrap();
+    }
+    nats.flush().await.unwrap();
+
+    let mut failures = Vec::new();
+    for (i, mut s) in subs.into_iter().enumerate() {
+        let count = count_msg_frames(&mut s, Duration::from_millis(800));
+        if count != N_PUBS {
+            failures.push(format!("sub#{i}: got {count}, expected {N_PUBS}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "3hub mesh sharded(2) delivered wrong counts:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
 fn spawn_mesh_pair(shards_per_hub: usize) -> (u16, u16, u16, u16) {
     let a_port = free_port();
     let a_binary = free_port();

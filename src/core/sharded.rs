@@ -53,11 +53,20 @@ impl ShardedServer {
         let port = base.port;
         let binary_port = base.binary_port;
         let cluster_port = base.cluster.port;
+        // Single server_id for the whole sharded server. Route peer dedup
+        // keys on server_id; per-shard random IDs would let one peer-pair
+        // form one conn per (local-shard, remote-shard) combo, multiplying
+        // route deliveries by N×M.
+        let shared_server_id = base
+            .server_id
+            .clone()
+            .unwrap_or_else(|| format!("LEAF_{}", rand::random::<u32>()));
         let mut shards = Vec::with_capacity(n);
         for i in 0..n {
             let mut cfg = base.clone();
             cfg.workers = 1;
             cfg.server_name = format!("{}-shard-{}", base.server_name, i);
+            cfg.server_id = Some(shared_server_id.clone());
             cfg.metrics_port = None;
             cfg.monitoring_port = None;
             // All shards get the cluster port + name so route handshake

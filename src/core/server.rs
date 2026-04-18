@@ -155,6 +155,11 @@ pub struct ServerConfig {
     pub accounts: Vec<AccountConfig>,
     /// Port for binary-protocol client connections (`binary-client` feature).
     pub binary_port: Option<u16>,
+    /// Override the random server_id used in route INFO. ShardedServer uses
+    /// this so every shard advertises the SAME server_id — peer dedup keys
+    /// on server_id, and per-shard random IDs let multiple route conns
+    /// per peer-pair survive (each treated as a different peer).
+    pub server_id: Option<String>,
     /// Use io_uring reactor instead of epoll (requires `io-uring` feature).
     #[cfg(feature = "io-uring")]
     pub use_io_uring: bool,
@@ -197,6 +202,7 @@ impl Default for ServerConfig {
             accounts: Vec::new(),
 
             binary_port: None,
+            server_id: None,
             #[cfg(feature = "io-uring")]
             use_io_uring: false,
         }
@@ -1474,7 +1480,10 @@ impl Server {
         };
 
         let info = ServerInfo {
-            server_id: format!("LEAF_{}", rand::random::<u32>()),
+            server_id: config
+                .server_id
+                .clone()
+                .unwrap_or_else(|| format!("LEAF_{}", rand::random::<u32>())),
             server_name: config.server_name.clone(),
             version: "0.5.0".to_string(),
             proto: 1,
