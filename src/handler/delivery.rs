@@ -463,10 +463,9 @@ pub(crate) fn deliver_to_subs(
         |sub| {
             wctx.record_delivery(payload_len);
             wctx.queue_notify(sub.writer.event_raw_fd());
-            // Signal sink congestion so the worker can reduce this client's read budget.
-            // Applies uniformly to client, leaf, and route subs — any slow consumer
-            // trips the publisher's TCP flow control via the same read_budget path.
-            if sub.writer.congestion() >= 1 {
+            // Only route-sub congestion triggers read_budget throttling.
+            // Client/leaf slow consumers are handled by slow-consumer disconnect.
+            if sub.is_route() && sub.writer.congestion() >= 1 {
                 wctx.route_congested = true;
             }
         },

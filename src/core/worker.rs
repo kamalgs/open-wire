@@ -2803,7 +2803,7 @@ impl<R: Reactor> Worker<R> {
                 if client.read_budget > 65536 {
                     client.read_budget = 65536;
                 } else {
-                    client.read_budget = (client.read_budget / 2).max(256);
+                    client.read_budget = (client.read_budget / 2).max(8192);
                 }
             } else if client.read_budget < usize::MAX {
                 // Double toward unlimited when congestion clears.
