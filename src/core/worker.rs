@@ -2806,8 +2806,10 @@ impl<R: Reactor> Worker<R> {
                     client.read_budget = (client.read_budget / 2).max(8192);
                 }
             } else if client.read_budget < usize::MAX {
-                // Double toward unlimited when congestion clears.
-                client.read_budget = client.read_budget.saturating_mul(2);
+                // Recover 16× per clear batch (7 steps to unlimited vs 51 with 2×),
+                // preventing the stuck-throttle where brief congestion spikes keep
+                // the budget pinned near the floor for dozens of batches.
+                client.read_budget = client.read_budget.saturating_mul(16);
             }
         }
     }

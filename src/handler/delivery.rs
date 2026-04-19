@@ -463,9 +463,10 @@ pub(crate) fn deliver_to_subs(
         |sub| {
             wctx.record_delivery(payload_len);
             wctx.queue_notify(sub.writer.event_raw_fd());
-            // Only route-sub congestion triggers read_budget throttling.
-            // Client/leaf slow consumers are handled by slow-consumer disconnect.
-            if sub.is_route() && sub.writer.congestion() >= 1 {
+            // Only hard route congestion (>75% buffer) triggers read_budget throttling.
+            // Soft congestion (25-75%) is informational; throttling all publishers on
+            // a 25%-full buffer causes thundering-herd over-correction at 10K+ users.
+            if sub.is_route() && sub.writer.congestion() >= 2 {
                 wctx.route_congested = true;
             }
         },
